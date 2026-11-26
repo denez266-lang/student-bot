@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """بوت الطالب الذكي - smart student bot backed by Gemini, with admin panel."""
-import os, io, re, json, base64, time, logging, asyncio, sqlite3, threading
+import os, io, re, json, base64, time, logging, asyncio, sqlite3, threading, hmac, hashlib
+from urllib.parse import parse_qsl
 
 import httpx
-from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile
+from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile, WebAppInfo
 from telegram.constants import ChatAction
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ContextTypes, filters)
@@ -256,22 +257,41 @@ def ago(ts):
 
 # ---------------- user menu ----------------
 
+# ---- one shared registry: add a tool here and it appears in the bot menu AND the Mini App ----
+# input: text = text only, both = text or file (image/PDF/txt), audio = voice file
+TOOLS = [
+    dict(id="explain",   icon="📷", name="اشرح صورة",           input="both",  group="main"),
+    dict(id="summary",   icon="📝", name="أنشئ ملخص",           input="both",  group="main"),
+    dict(id="questions", icon="📚", name="أنشئ أسئلة",          input="both",  group="main"),
+    dict(id="quiz",      icon="🧠", name="اختبرني",             input="text",  group="main", kind="quiz"),
+    dict(id="schedule",  icon="📅", name="جدول دراستي",         input="text",  group="main"),
+    dict(id="voice",     icon="🎤", name="حوّل صوتاً إلى نص",   input="audio", group="main"),
+    dict(id="pdf",       icon="📄", name="أنشئ PDF",            input="both",  group="main"),
+    dict(id="solve",     icon="🧮", name="حل المسائل",          input="both",  group="main"),
+    dict(id="simple",    icon="🧒", name="اشرحها ببساطة",       input="both",  group="more"),
+    dict(id="cards",     icon="🃏", name="بطاقات حفظ",          input="both",  group="more"),
+    dict(id="check",     icon="✅", name="صحّح إجابتي",         input="both",  group="more"),
+    dict(id="translate", icon="🌐", name="ترجمة",               input="both",  group="more"),
+    dict(id="formulas",  icon="📐", name="ورقة قوانين",         input="text",  group="more"),
+]
+
+def tool_buttons(group):
+    bs = [B(f"{t['icon']} {t['name']}", callback_data=f"m:{t['id']}") for t in TOOLS if t["group"] == group]
+    return [bs[i:i + 2] for i in range(0, len(bs), 2)]
+
 def menu_markup(adm=False):
     rows = ([[B("🎛 لوحة الأدمن", callback_data="a:main")]] if adm else [])
-    return M([
-        [B("📷 اشرح صورة", callback_data="m:explain"), B("📝 أنشئ ملخص", callback_data="m:summary")],
-        [B("📚 أنشئ أسئلة", callback_data="m:questions"), B("🧠 اختبرني", callback_data="m:quiz")],
-        [B("📅 جدول دراستي", callback_data="m:schedule"), B("🎤 حوّل صوتاً إلى نص", callback_data="m:voice")],
-        [B("📄 أنشئ PDF", callback_data="m:pdf"), B("🧮 حل المسائل", callback_data="m:solve")],
+    base = os.environ.get("RENDER_EXTERNAL_URL")
+    if base:
+        rows = [[B("🌐 افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app"))]] + rows
+    return M(tool_buttons("main") + [
         [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
     ] + rows)
 
 def more_markup():
-    return M([
-        [B("🧒 اشرحها ببساطة", callback_data="m:simple"), B("🃏 بطاقات حفظ", callback_data="m:cards")],
-        [B("✅ صحّح إجابتي", callback_data="m:check"), B("🌐 ترجمة", callback_data="m:translate")],
-        [B("📐 ورقة قوانين", callback_data="m:formulas"), B("⏱ مؤقت مذاكرة", callback_data="m:timer")],
+    return M(tool_buttons("more") + [
+        [B("⏱ مؤقت مذاكرة", callback_data="m:timer")],
         [B("🔙 القائمة الرئيسية", callback_data="m:menu")],
     ])
 
@@ -405,8 +425,8 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- quiz ----------------
 
-async def start_quiz(msg, ctx, topic, uid):
-    await msg.chat.send_action(ChatAction.TYPING)
+async def make_quiz(topic):
+    """Shared by bot and Mini App. Returns a list of questions or None."""
     raw = await gemini(
         [{"text": (
             f"أنشئ 5 أسئلة اختيار من متعدد لاختبار طالب في: «{topic}». "
@@ -415,7 +435,6 @@ async def start_quiz(msg, ctx, topic, uid):
             "\nanswer هو رقم الخيار الصحيح من 0 إلى 3."
         )}],
         temperature=0.6)
-    store.event(uid, "quiz")
     m = re.search(r"\[.*\]", raw, re.S)
     qs = None
     if m:
@@ -424,10 +443,18 @@ async def start_quiz(msg, ctx, topic, uid):
         except Exception:
             qs = None
     if not qs or not isinstance(qs, list) or not all(isinstance(x, dict) and "q" in x and "options" in x for x in qs):
+        return None
+    qs = [x for x in qs if isinstance(x.get("options"), list) and len(x["options"]) >= 2 and isinstance(x.get("answer"), int)][:8]
+    return qs or None
+
+async def start_quiz(msg, ctx, topic, uid):
+    await msg.chat.send_action(ChatAction.TYPING)
+    qs = await make_quiz(topic)
+    store.event(uid, "quiz")
+    if not qs:
         ctx.user_data.clear()
         await msg.reply_text("تعذر إنشاء الاختبار لهذا الموضوع، جرّب موضوعاً آخر.", reply_markup=back_markup())
         return
-    qs = [x for x in qs if isinstance(x.get("options"), list) and len(x["options"]) >= 2 and isinstance(x.get("answer"), int)][:8]
     ctx.user_data["quiz"] = {"qs": qs, "i": 0, "score": 0, "topic": topic}
     await msg.reply_text(f"🧠 اختبار: {topic}\nعدد الأسئلة: {len(qs)}. بالتوفيق!")
     await ask_quiz(msg, ctx)
@@ -555,6 +582,30 @@ async def fetch_file(ctx, file_id):
     await f.download_to_memory(out=out)
     return out.getvalue()
 
+def blob_parts(data, mime, fname=""):
+    """Shared by bot and Mini App: turn an uploaded file into Gemini parts. Returns (parts, error)."""
+    mime = (mime or "").lower()
+    fname = (fname or "").lower()
+    if mime.startswith("image/"):
+        return [img_part(data, mime)], None
+    if mime.startswith("audio/") or mime.startswith("video/") or fname.endswith((".ogg", ".mp3", ".m4a", ".wav", ".oga", ".opus")):
+        mm = mime if mime.startswith(("audio/", "video/")) else "audio/ogg"
+        return [{"inline_data": {"mime_type": mm, "data": base64.b64encode(data).decode()}}], None
+    if mime == "application/pdf" or fname.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages[:40])
+        except Exception:
+            text = ""
+        text = text.strip()[:30000]
+        if not text:
+            return None, "لم أستطع استخراج نص من هذا الملف (قد يكون صوراً ممسوحة). أرسل صور الصفحات بدلاً منه."
+        return [{"text": "محتوى ملف PDF التالي:\n" + text}], None
+    if mime.startswith("text/") or fname.endswith(".txt"):
+        return [{"text": data.decode("utf-8", "ignore")[:30000]}], None
+    return None, "هذا النوع من الملفات غير مدعوم. أرسل نصاً أو صورة أو PDF."
+
 async def content_parts(update, ctx):
     msg = update.message
     parts = []
@@ -566,23 +617,11 @@ async def content_parts(update, ctx):
         parts.append({"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}})
     if msg.document:
         doc = msg.document
-        if doc.mime_type == "application/pdf":
-            data = await fetch_file(ctx, doc.file_id)
-            try:
-                from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(data))
-                text = "\n".join((p.extract_text() or "") for p in reader.pages[:40])
-            except Exception:
-                text = ""
-            text = text.strip()[:30000]
-            if not text:
-                return None, "لم أستطع استخراج نص من هذا الملف (قد يكون صوراً ممسوحة). أرسل صور الصفحات بدلاً منه."
-            parts.append({"text": "محتوى ملف PDF التالي:\n" + text})
-        elif (doc.mime_type or "").startswith("text/") or (doc.file_name or "").lower().endswith(".txt"):
-            data = await fetch_file(ctx, doc.file_id)
-            parts.append({"text": data.decode("utf-8", "ignore")[:30000]})
-        else:
-            return None, "هذا النوع من الملفات غير مدعوم. أرسل نصاً أو صورة أو PDF."
+        data = await fetch_file(ctx, doc.file_id)
+        p, err = blob_parts(data, doc.mime_type, doc.file_name)
+        if err:
+            return None, err
+        parts += p
     cap = (msg.text or msg.caption or "").strip()
     if cap:
         parts.append({"text": cap})
@@ -605,11 +644,18 @@ MODE_ASKS = {
     "voice":     "انسخ هذا التسجيل الصوتي إلى نص مكتوب بدقة، باللغة التي يتحدث بها. اكتب النص فقط دون تعليق.",
 }
 
+async def run_ai(mode, parts):
+    """Shared AI call for a tool mode (bot and Mini App)."""
+    ask = MODE_ASKS.get(mode)
+    if mode == "solve":
+        return await gemini(parts + [{"text": ask}], system=SOLVE_SYS, temperature=0.2, max_tokens=16384)
+    return await gemini(parts + ([{"text": ask}] if ask else []))
+
 FEAT_NAMES = {
     "join": "انضمام", "chat": "سؤال مباشر", "explain": "شرح صورة", "summary": "ملخص",
     "questions": "أسئلة", "quiz": "اختبار", "schedule": "جدول", "voice": "صوت إلى نص",
     "pdf": "PDF", "solve": "حل المسائل", "simple": "شرح مبسّط", "cards": "بطاقات حفظ",
-    "check": "تصحيح إجابة", "translate": "ترجمة", "formulas": "ورقة قوانين", "timer": "مؤقت", "handout": "تنزيل ملزمة",
+    "check": "تصحيح إجابة", "translate": "ترجمة", "formulas": "ورقة قوانين", "timer": "مؤقت", "handout": "تنزيل ملزمة", "webapp": "فتح التطبيق",
 }
 
 # ---------------- message flow ----------------
@@ -652,7 +698,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await msg.chat.send_action(ChatAction.TYPING)
     try:
-        result = await (gemini(parts + [{"text": ask}], system=SOLVE_SYS, temperature=0.2, max_tokens=16384) if mode == "solve" else gemini(parts + ([{"text": ask}] if ask else [])))
+        result = await run_ai(mode, parts) if ask else await gemini(parts)
     except RuntimeError as e:
         await msg.reply_text(str(e), reply_markup=back_markup() if ask else None)
         return
@@ -1166,12 +1212,171 @@ def build_app():
     app.add_error_handler(on_error)
     return app
 
-if __name__ == "__main__":
+# ---------------- web app (Telegram Mini App) ----------------
+
+import tornado.web
+
+WEBAPP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp.html")
+
+def check_init(raw):
+    """Validate Telegram WebApp initData. Returns user dict or None."""
+    try:
+        d = dict(parse_qsl(raw, keep_blank_values=True))
+        got = d.pop("hash", "")
+        dcs = "\n".join(f"{k}={d[k]}" for k in sorted(d))
+        secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(d.get("auth_date", "0")) > 86400:
+            return None
+        return json.loads(d["user"])
+    except Exception:
+        return None
+
+class PageH(tornado.web.RequestHandler):
+    def get(self):
+        with open(WEBAPP_FILE, "rb") as f:
+            body = f.read()
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.set_header("Cache-Control", "no-store")
+        self.write(body)
+
+class HealthH(tornado.web.RequestHandler):
+    def get(self):
+        self.write("ok")
+
+class WebhookH(tornado.web.RequestHandler):
+    async def post(self):
+        update = Update.de_json(json.loads(self.request.body), self.application.settings["tgapp"].bot)
+        await self.application.settings["tgapp"].update_queue.put(update)
+        self.write("ok")
+
+class ApiH(tornado.web.RequestHandler):
+    def fail(self, code, msg):
+        self.set_status(code)
+        self.write({"error": msg})
+
+    async def post(self, name):
+        tgapp = self.application.settings["tgapp"]
+        user = check_init(self.request.headers.get("X-Init-Data", ""))
+        if not user:
+            return self.fail(401, "افتح التطبيق من داخل البوت")
+        uid = user["id"]
+        adm = uid in ADMIN_IDS or (user.get("username") or "").lower() in ADMIN_USERNAMES
+        if not adm:
+            if store.is_banned(uid):
+                return self.fail(403, "تم حظرك من استخدام البوت")
+            if store.on("maintenance"):
+                return self.fail(503, "البوت في وضع الصيانة حالياً")
+        try:
+            body = json.loads(self.request.body or b"{}")
+        except Exception:
+            body = {}
+        if name == "library":
+            out = []
+            for sid, sname in store.q("SELECT id,name FROM h_stages ORDER BY id", fetch=True):
+                subs = []
+                for jid, jname in store.q("SELECT id,name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,), fetch=True):
+                    files = [{"id": f[0], "title": f[1]} for f in
+                             store.q("SELECT id,title FROM h_files WHERE subject_id=? ORDER BY id", (jid,), fetch=True)]
+                    subs.append({"id": jid, "name": jname, "files": files})
+                out.append({"id": sid, "name": sname, "subjects": subs})
+            store.event(uid, "webapp")
+            return self.write({"stages": out})
+        if name == "download":
+            r = store.q("SELECT title,file_id,kind FROM h_files WHERE id=?", (int(body.get("id", 0)),), fetch=True)
+            if not r:
+                return self.fail(404, "الملزمة غير متوفرة")
+            title, fid, kind = r[0]
+            try:
+                if kind == "photo":
+                    await tgapp.bot.send_photo(uid, fid, caption=f"📄 {title}")
+                else:
+                    await tgapp.bot.send_document(uid, fid, caption=f"📄 {title}")
+            except Exception:
+                log.exception("webapp send failed")
+                return self.fail(500, "تعذر الإرسال، اضغط /start في البوت أولاً")
+            store.q("UPDATE h_files SET downloads=downloads+1 WHERE id=?", (int(body.get("id")),))
+            store.event(uid, "handout")
+            return self.write({"ok": True})
+        if name == "timer":
+            mins = 45 if int(body.get("mins", 25)) >= 45 else 25
+            store.event(uid, "timer")
+            asyncio.create_task(run_timer(tgapp.bot, uid, mins, 5 if mins == 25 else 10))
+            return self.write({"ok": True})
+        if name == "tools":
+            return self.write({"tools": [dict(t, hint=MODE_PROMPTS.get(t["id"], "")) for t in TOOLS]})
+        if name == "run":
+            mode = body.get("mode")
+            tool = next((t for t in TOOLS if t["id"] == mode), None)
+            if not tool or mode not in MODE_ASKS:
+                return self.fail(400, "أداة غير معروفة")
+            parts = []
+            f = body.get("file")
+            if f:
+                try:
+                    data = base64.b64decode(f.get("b64", ""))
+                except Exception:
+                    return self.fail(400, "ملف غير صالح")
+                if len(data) > 15 * 1024 * 1024:
+                    return self.fail(413, "الملف كبير (الحد 15 ميغابايت)")
+                p, err = blob_parts(data, f.get("mime", ""), f.get("name", ""))
+                if err:
+                    return self.fail(400, err)
+                parts += p
+            text = (body.get("text") or "").strip()[:20000]
+            if text:
+                parts.append({"text": text})
+            if not parts:
+                return self.fail(400, "أرسل نصاً أو ملفاً أولاً")
+            try:
+                result = await run_ai(mode, parts)
+            except RuntimeError as e:
+                return self.fail(502, str(e))
+            store.event(uid, mode)
+            sent = False
+            if mode == "pdf":
+                try:
+                    pdf = build_pdf("ورقة مراجعة", result)
+                    await tgapp.bot.send_document(uid, document=pdf, filename="مراجعة.pdf", caption="📄 ورقة المراجعة جاهزة!")
+                    sent = True
+                except Exception:
+                    log.exception("webapp pdf failed")
+            return self.write({"text": result, "pdf_sent": sent})
+        if name == "quiz":
+            topic = (body.get("topic") or "").strip()[:200]
+            if not topic:
+                return self.fail(400, "اكتب اسم المادة أو الموضوع")
+            try:
+                qs = await make_quiz(topic)
+            except RuntimeError as e:
+                return self.fail(502, str(e))
+            store.event(uid, "quiz")
+            if not qs:
+                return self.fail(502, "تعذر إنشاء الاختبار، جرّب موضوعاً آخر")
+            return self.write({"questions": qs})
+        return self.fail(404, "not found")
+
+async def serve(url):
+    global store
     app = build_app()
+    await app.initialize()
+    await post_init(app)
+    await app.start()
+    await app.bot.set_webhook(url=f"{url.rstrip('/')}/{TOKEN}", allowed_updates=Update.ALL_TYPES)
+    web = tornado.web.Application([
+        (rf"/{re.escape(TOKEN)}", WebhookH),
+        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH),
+        (r"/api/(\w+)", ApiH),
+    ], tgapp=app)
+    web.listen(int(os.environ.get("PORT", "10000")), address="0.0.0.0")
+    log.info("web server + webhook up")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if url:
-        port = int(os.environ.get("PORT", "10000"))
-        app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN,
-                        webhook_url=f"{url}/{TOKEN}", drop_pending_updates=False)
+        asyncio.run(serve(url))
     else:
-        app.run_polling()
+        build_app().run_polling()
