@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>طالب AI</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#1a1a1a);
+  --hint:var(--tg-theme-hint-color,#7d8590);--link:var(--tg-theme-link-color,#2481cc);
+  --btn:var(--tg-theme-button-color,#2481cc);--btx:var(--tg-theme-button-text-color,#fff);
+  --sec:var(--tg-theme-secondary-bg-color,#f1f3f5);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,"Segoe UI",Tahoma,Arial,sans-serif;padding-bottom:78px}
+.hero{background:linear-gradient(135deg,var(--btn),#6c5ce7);color:#fff;padding:26px 18px 30px;border-radius:0 0 26px 26px}
+.hero h1{margin:0 0 4px;font-size:22px}.hero p{margin:0;opacity:.9;font-size:14px}
+.wrap{padding:16px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.card{background:var(--sec);border-radius:16px;padding:14px;margin-bottom:12px}
+.tile{background:var(--sec);border:0;color:var(--tx);border-radius:16px;padding:16px 8px;font-size:15px;font-family:inherit;text-align:center;cursor:pointer}
+.tile span{display:block;font-size:26px;margin-bottom:6px}
+.tile:active,.btn:active,.row:active{transform:scale(.97)}
+h2{font-size:17px;margin:4px 0 12px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--sec);border-radius:14px;padding:14px;margin-bottom:8px;cursor:pointer}
+.row small{color:var(--hint)}
+.btn{background:var(--btn);color:var(--btx);border:0;border-radius:12px;padding:12px 16px;font-size:15px;font-family:inherit;cursor:pointer}
+.btn.ghost{background:var(--sec);color:var(--tx)}
+.crumb{color:var(--link);font-size:14px;margin-bottom:10px;cursor:pointer}
+.empty{text-align:center;color:var(--hint);padding:30px 10px}
+.nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:var(--bg);border-top:1px solid var(--sec);padding:6px 4px calc(6px + env(safe-area-inset-bottom))}
+.nav button{flex:1;background:none;border:0;color:var(--hint);font-family:inherit;font-size:11px;padding:4px}
+.nav button span{display:block;font-size:20px}
+.nav button.on{color:var(--btn);font-weight:bold}
+.ring{width:190px;height:190px;border-radius:50%;margin:10px auto 16px;display:flex;align-items:center;justify-content:center;font-size:40px;font-weight:bold;direction:ltr;
+  background:conic-gradient(var(--btn) var(--p,0%),var(--sec) 0)}
+.ring i{width:158px;height:158px;border-radius:50%;background:var(--bg);display:flex;align-items:center;justify-content:center;font-style:normal}
+.center{text-align:center}
+.inp{width:100%;min-height:120px;border:1px solid var(--sec);background:var(--sec);color:var(--tx);border-radius:14px;padding:12px;font-family:inherit;font-size:15px;resize:vertical;margin-bottom:10px}
+.res{background:var(--sec);border-radius:14px;padding:14px;white-space:pre-wrap;line-height:1.9;font-size:15px;margin-top:12px;word-break:break-word}
+.file{display:block;margin-bottom:10px;font-size:14px;color:var(--hint)}
+.opt{display:block;width:100%;text-align:right;background:var(--sec);color:var(--tx);border:2px solid transparent;border-radius:12px;padding:12px;margin-bottom:8px;font-family:inherit;font-size:15px}
+.opt.ok{border-color:#2ecc71}.opt.bad{border-color:#e74c3c}
+.toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:.25s;pointer-events:none;z-index:9}
+.toast.on{opacity:1}
+</style>
+</head>
+<body>
+<div class="hero"><h1 id="hi">أهلاً بك 👋</h1><p>طالب AI: مساعدك الدراسي الذكي</p></div>
+<div class="wrap" id="view"></div>
+<div class="nav" id="nav"></div>
+<div class="toast" id="toast"></div>
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const INIT = tg ? tg.initData : "";
+let TOOLS = [], cur = null;
+let LIB = null, tab = "home", sel = {stage:null, subject:null};
+const $ = id => document.getElementById(id);
+function toast(t){const e=$("toast");e.textContent=t;e.classList.add("on");setTimeout(()=>e.classList.remove("on"),2200)}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+async function api(path, body){
+  const r = await fetch("/api/"+path,{method:"POST",headers:{"Content-Type":"application/json","X-Init-Data":INIT},body:JSON.stringify(body||{})});
+  const j = await r.json().catch(()=>({error:"خطأ"}));
+  if(!r.ok) throw new Error(j.error||"خطأ");
+  return j;
+}
+function nav(){
+  const items=[["home","🏠","الرئيسية"],["lib","📚","الملازم"],["timer","⏱","المؤقت"],["tools","🤖","الأدوات"]];
+  $("nav").innerHTML = items.map(i=>`<button class="${tab===i[0]?"on":""}" onclick="go('${i[0]}')"><span>${i[1]}</span>${i[2]}</button>`).join("");
+}
+function go(t){tab=t;if(t==="lib"){sel={stage:null,subject:null}}render()}
+function render(){
+  nav();
+  const v=$("view");
+  if(tab==="home"){
+    v.innerHTML=`<div class="grid">
+      <button class="tile" onclick="go('lib')"><span>📚</span>الملازم</button>
+      <button class="tile" onclick="go('timer')"><span>⏱</span>مؤقت المذاكرة</button>`+
+      TOOLS.filter(t=>t.group==="main").map(t=>`<button class="tile" onclick="openTool('${t.id}')"><span>${t.icon}</span>${esc(t.name)}</button>`).join("")+
+      `</div><div class="card" style="margin-top:14px"><div style="color:var(--hint);font-size:14px;line-height:1.8">كل ميزات البوت متاحة هنا. للمزيد افتح تبويب 🤖 الأدوات.</div></div>`;
+  } else if(tab==="lib"){ renderLib(v) }
+  else if(tab==="timer"){ renderTimer(v) }
+  else if(tab==="tools"){
+    v.innerHTML=`<h2>🤖 كل الأدوات</h2><div class="grid">`+TOOLS.map(t=>`<button class="tile" onclick="openTool('${t.id}')"><span>${t.icon}</span>${esc(t.name)}</button>`).join("")+`</div>`;
+  } else if(tab==="tool"){ renderTool(v) }
+}
+function openTool(id){cur=TOOLS.find(t=>t.id===id);tab="tool";QZ=null;render()}
+let FILE=null, QZ=null;
+function renderTool(v){
+  const t=cur;
+  const back=`<div class="crumb" onclick="go('tools')">› كل الأدوات</div><h2>${t.icon} ${esc(t.name)}</h2><div style="color:var(--hint);font-size:14px;margin-bottom:10px">${esc((t.hint||"").replace(/^\S+\s/,""))}</div>`;
+  if(t.kind==="quiz"){
+    if(QZ&&QZ.qs){return renderQuiz(v,back)}
+    v.innerHTML=back+`<textarea class="inp" id="txt" style="min-height:60px" placeholder="مثال: الفيزياء - الحرارة"></textarea><button class="btn" id="go" onclick="startQuiz()">ابدأ الاختبار</button><div id="out"></div>`;return}
+  FILE=null;
+  const wantFile=t.input==="both"||t.input==="audio";
+  v.innerHTML=back+(t.input==="audio"?"":`<textarea class="inp" id="txt" placeholder="اكتب هنا..."></textarea>`)+
+    (wantFile?`<label class="file">📎 ${t.input==="audio"?"اختر ملفاً صوتياً":"أرفق صورة أو PDF أو ملف نصي"}<input type="file" id="fl" accept="${t.input==="audio"?"audio/*":"image/*,application/pdf,text/plain"}" onchange="pickFile(this)" style="display:block;margin-top:6px"></label>`:"")+
+    `<button class="btn" id="go" onclick="runTool()">✨ نفّذ</button><div id="out"></div>`;
+}
+function pickFile(i){
+  const f=i.files[0];if(!f){FILE=null;return}
+  if(f.size>10*1024*1024){toast("الحد 10 ميغابايت");i.value="";return}
+  const r=new FileReader();r.onload=()=>{FILE={name:f.name,mime:f.type,b64:String(r.result).split(",")[1]}};r.readAsDataURL(f);
+}
+async function runTool(){
+  const t=cur,txt=$("txt")?$("txt").value:"";
+  const b=$("go");b.disabled=true;b.textContent="⏳ جاري المعالجة...";
+  try{
+    const j=await api("run",{mode:t.id,text:txt,file:FILE});
+    $("out").innerHTML='<div class="res">'+esc(j.text)+'</div>'+(j.pdf_sent?'<p class="center" style="color:var(--hint)">📄 أُرسل ملف PDF في محادثة البوت</p>':'')+'<div class="center" style="margin-top:10px"><button class="btn ghost" onclick="copyRes()">نسخ</button></div>';
+  }catch(e){$("out").innerHTML='<div class="res">❌ '+esc(e.message)+'</div>'}
+  b.disabled=false;b.textContent="✨ نفّذ";
+}
+function copyRes(){const t=document.querySelector(".res").textContent;navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast("تم النسخ"))}
+async function startQuiz(){
+  const b=$("go");b.disabled=true;b.textContent="⏳ جاري إنشاء الاختبار...";
+  try{const j=await api("quiz",{topic:$("txt").value});QZ={qs:j.questions,i:0,score:0,done:false};render()}
+  catch(e){$("out").innerHTML='<div class="res">❌ '+esc(e.message)+'</div>';b.disabled=false;b.textContent="ابدأ الاختبار"}
+}
+function renderQuiz(v,back){
+  if(QZ.i>=QZ.qs.length){const p=Math.round(100*QZ.score/QZ.qs.length);
+    v.innerHTML=back+`<div class="card center"><h2>🏁 انتهى الاختبار</h2><div style="font-size:30px">${QZ.score} / ${QZ.qs.length} (${p}%)</div><p>${p>=80?"ممتاز! 🌟":p>=50?"جيد، واصل 💪":"راجع الدرس وحاول مجدداً 📖"}</p><button class="btn" onclick="QZ=null;render()">اختبار جديد</button></div>`;return}
+  const q=QZ.qs[QZ.i],L=["أ","ب","ج","د","هـ","و"];
+  v.innerHTML=back+`<div class="card"><b>س${QZ.i+1}) ${esc(q.q)}</b></div>`+q.options.slice(0,6).map((o,n)=>`<button class="opt" onclick="ans(${n},this)">${L[n]}) ${esc(o)}</button>`).join("")+`<div id="why"></div>`;
+}
+function ans(n,btn){
+  const q=QZ.qs[QZ.i];if(QZ.done)return;QZ.done=true;
+  const bs=document.querySelectorAll(".opt");
+  bs.forEach((b,i)=>{if(i===q.answer)b.classList.add("ok")});
+  if(n===q.answer){QZ.score++}else{btn.classList.add("bad")}
+  $("why").innerHTML=(q.why?'<div class="res">💡 '+esc(q.why)+'</div>':"")+'<div class="center" style="margin-top:10px"><button class="btn" onclick="QZ.i++;QZ.done=false;render()">التالي ›</button></div>';
+}
+async function renderLib(v){
+  if(!LIB){ v.innerHTML='<div class="empty">جاري التحميل...</div>';
+    try{ LIB=(await api("library")).stages }catch(e){ v.innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return } }
+  if(!LIB.length){ v.innerHTML='<div class="empty">📭 لا توجد ملازم بعد، سنضيفها قريباً.</div>'; return }
+  if(sel.stage===null){
+    v.innerHTML='<h2>🎓 اختر المرحلة</h2>'+LIB.map((s,i)=>`<div class="row" onclick="pick(${i})"><b>${esc(s.name)}</b><small>${s.subjects.length} مادة ‹</small></div>`).join(""); return }
+  const st=LIB[sel.stage];
+  if(sel.subject===null){
+    v.innerHTML=`<div class="crumb" onclick="sel.stage=null;render()">› ${esc(st.name)}</div><h2>📖 اختر المادة</h2>`+
+      (st.subjects.length?st.subjects.map((j,i)=>`<div class="row" onclick="pickSub(${i})"><b>${esc(j.name)}</b><small>${j.files.length} ملزمة ‹</small></div>`).join(""):'<div class="empty">لا توجد مواد بعد.</div>'); return }
+  const sj=st.subjects[sel.subject];
+  v.innerHTML=`<div class="crumb" onclick="sel.subject=null;render()">› ${esc(st.name)} / ${esc(sj.name)}</div><h2>📄 الملازم</h2>`+
+    (sj.files.length?sj.files.map(f=>`<div class="row"><b>${esc(f.title)}</b><button class="btn" onclick="dl(${f.id},this)">⬇ تحميل</button></div>`).join(""):'<div class="empty">لا توجد ملازم بعد.</div>');
+}
+function pick(i){sel.stage=i;sel.subject=null;render()}
+function pickSub(i){sel.subject=i;render()}
+async function dl(id,b){
+  b.disabled=true;
+  try{await api("download",{id});toast("✅ أُرسلت الملزمة في محادثة البوت")}catch(e){toast("❌ "+e.message)}
+  b.disabled=false;
+}
+/* timer */
+let T={total:0,end:0,iv:null};
+function fmt(s){s=Math.max(0,s);return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0")}
+function renderTimer(v){
+  v.innerHTML=`<h2>⏱ مؤقت المذاكرة</h2><div class="ring" id="ring"><i id="tm">${fmt(T.total?Math.round((T.end-Date.now())/1000):25*60)}</i></div>
+  <div class="center"><div style="color:var(--hint);margin-bottom:12px" id="tmsg">${T.iv?"ركّز... 💪":"اختر مدة التركيز"}</div>
+  <button class="btn" onclick="startT(25)">🍅 25 دقيقة</button> <button class="btn" onclick="startT(45)">📚 45 دقيقة</button>
+  <div style="margin-top:10px"><button class="btn ghost" onclick="stopT()">إيقاف</button></div>
+  <p style="color:var(--hint);font-size:13px">سيرسل لك البوت تنبيهاً في المحادثة عند انتهاء التركيز وعند انتهاء الاستراحة.</p></div>`;
+  tick();
+}
+async function startT(m){
+  stopT(true);T.total=m*60;T.end=Date.now()+m*60000;
+  T.iv=setInterval(tick,500);
+  try{await api("timer",{mins:m});toast("بدأ المؤقت وسأنبهك في المحادثة")}catch(e){toast("❌ "+e.message)}
+  renderTimer($("view"));
+}
+function stopT(silent){if(T.iv){clearInterval(T.iv);T.iv=null}T.total=0;if(!silent&&tab==="timer")renderTimer($("view"))}
+function tick(){
+  if(!T.total){return}
+  const left=Math.round((T.end-Date.now())/1000);
+  const tm=$("tm"),ring=$("ring");
+  if(tm)tm.textContent=fmt(left);
+  if(ring)ring.style.setProperty("--p",((1-left/T.total)*100)+"%");
+  if(left<=0){clearInterval(T.iv);T.iv=null;T.total=0;toast("⏰ انتهى التركيز!");if(tg&&tg.HapticFeedback)tg.HapticFeedback.notificationOccurred("success");const m=$("tmsg");if(m)m.textContent="أحسنت! خذ استراحة 🎉"}
+}
+const u = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
+if(u) $("hi").textContent = "أهلاً " + (u.first_name||"") + " 👋";
+(async()=>{try{TOOLS=(await api('tools')).tools}catch(e){}render()})();
+</script>
+</body>
+</html>
