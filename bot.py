@@ -711,7 +711,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if msg.reply_to_message and await ing_reply(update, ctx):
             return
         d = msg.document
-        if d and not ctx.user_data.get("mode") and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+        is_pdf = bool(d and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")))
+        fwd = getattr(msg, "forward_origin", None)
+        from_chan = bool(fwd and getattr(fwd, "type", "") == "channel")
+        if from_chan and not ctx.user_data.get("mode"):
+            if is_pdf:
+                await bulk_add(update, ctx)
+            return   # forwarded channel posts that are not PDFs are skipped silently
+        if is_pdf and not ctx.user_data.get("mode"):
             await ingest_pdf(update, ctx)
             return
     if not await gate_ok(update, ctx):
@@ -1504,7 +1511,7 @@ def pdf_head(data, pages=3):
             small = buf.getvalue()
     return text[:3500], small
 
-async def analyze_pdf(ctx, doc, caption):
+async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
     existing = []
     for sid, sname in hq("SELECT id, name FROM h_stages ORDER BY id"):
         subs = [r[0] for r in hq("SELECT name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,))]
@@ -1523,10 +1530,13 @@ async def analyze_pdf(ctx, doc, caption):
         "لا تخمّن ولا تخترع: إذا لم تجد قيمة مكتوبة بوضوح (خصوصاً المدرّس والسنة) اتركها نصاً فارغاً.\n"
         'الصيغة: {"stage":"","subject":"","teacher":"","title":"","type":"","year":"","quality":""}'
     )
+    if bulk:
+        prompt += ("\nملاحظة: الوصف أعلاه هو نص منشور قناة عامة، وهو المصدر الأساسي للمرحلة والمادة والمدرّس والسنة. "
+                   "تجاهل الروابط والإعلانات وأسماء القنوات. اكتب المرحلة بصيغتها الكاملة مثل السادس الإعدادي العلمي حتى لو كُتبت مختصرة (مثل: سادس علمي).")
     parts = [{"text": prompt}]
     size = doc.file_size or 0
     text, small, scanned = "", None, False
-    if size and size <= MAX_DL:
+    if size and size <= MAX_DL and not no_file:
         data = await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
         try:
             text, small = await asyncio.wait_for(asyncio.to_thread(pdf_head, data), 20)
@@ -1689,6 +1699,157 @@ async def ingest_pdf(update, ctx):
         except Exception:
             pass
 
+
+# ---------------- bulk ingest of forwarded channel posts ----------------
+
+from collections import deque
+from types import SimpleNamespace as NS
+BULK = {}   # chat id -> state of the current/last bulk run (memory only)
+
+def bulk_text(st, final=False):
+    t = (f"✅ اكتملت المعالجة ({st['done']}/{st['total']})" if final else f"⏳ {st['done']}/{st['total']}")
+    t += f" · ✅ {st['ok']} · ⏭ {st['dup']} مكرر"
+    if st["review"]:
+        t += f" · ❓ {len(st['review'])} تحتاج مراجعة"
+    if st["fail"]:
+        t += f" · ❌ {st['fail']} فشلت"
+    if final and st["fail"]:
+        t += "\n(الفاشلة: أعد تحويلها لاحقاً)"
+    return t
+
+def bulk_kb(st):
+    if st["review"]:
+        return M([[hb(f"🔎 راجع المشكوك فيها ({len(st['review'])})", "i:n")], [hb("🗑 تجاهلها", "i:z")]])
+    return None
+
+async def bulk_edit(ctx, chat, st, final=False):
+    if not st["msg"]:
+        return
+    now = time.time()
+    if not final and (now < st["next"] or now - st["last"] < 3):
+        return
+    try:
+        await ctx.bot.edit_message_text(bulk_text(st, final), chat_id=chat, message_id=st["msg"].message_id,
+                                        reply_markup=bulk_kb(st) if final else None)
+        st["last"] = time.time()
+    except Exception as e:
+        ra = getattr(e, "retry_after", None)
+        if ra:
+            st["next"] = time.time() + float(getattr(ra, "total_seconds", lambda: ra)())  + 1
+        elif "not modified" not in str(e).lower():
+            log.warning("bulk edit: %r", e)
+
+async def bulk_save(rec):
+    sid = get_stage(rec["stage"])
+    jid = get_subject(sid, rec["subject"])
+    title = compose_title(rec["title"] or stem(rec["name"]), rec["teacher"])
+    dup = find_dup(rec["uid"], rec.get("fname", ""), rec.get("fsize", 0))
+    if not dup:
+        n = nrm(title)
+        same = [(i, t, fn, fs) for i, t, fn, fs in hq("SELECT id, title, fname, fsize FROM h_files WHERE subject_id=?", (jid,)) if nrm(t) == n]
+        if same:
+            fn, fs = rec.get("fname", ""), int(rec.get("fsize", 0) or 0)
+            if any(not (fn and f2 and (fn != f2 or fs != s2)) for _, _, f2, s2 in same):
+                dup = same[0]
+            else:   # same generic title but clearly a different file: keep it, make the title unique
+                title = f"{title} ({trim(stem(fn), 30)})"
+    if dup:
+        cleanup_empty(jid)
+        return "dup"
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
+        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title)), False)
+    backup_soon()
+    return "ok"
+
+async def bulk_one(item, st, ctx):
+    if find_dup(item["uid"], item["name"], item["size"]):
+        st["dup"] += 1
+        return
+    doc = NS(file_id=item["fid"], file_name=item["name"], file_size=item["size"], file_unique_id=item["uid"])
+    cap = item["cap"]
+    g = guess_from_name(item["name"], cap)
+    info = {k: "" for k in ("stage", "subject", "teacher", "title", "type", "year", "quality")}
+    async with ING_LOCK:
+        try:
+            info = await asyncio.wait_for(analyze_pdf(ctx, doc, cap, bulk=True, no_file=bool(g["stage"] and g["subject"])), 90)
+        except Exception as e:
+            log.warning("bulk analyze failed: %r", e)
+    for k in info:
+        if not info[k]:
+            info[k] = g[k]
+    rec = dict(info, fid=item["fid"], uid=item["uid"], name=item["name"] or "ملزمة", note="",
+               fname=item["name"], fsize=item["size"])
+    if not rec["stage"] or not rec["subject"]:
+        st["review"].append(rec)
+        return
+    r = await bulk_save(rec)
+    st["ok" if r == "ok" else "dup"] += 1
+
+async def bulk_worker(chat, st, ctx):
+    try:
+        while True:
+            while st["q"]:
+                item = st["q"].popleft()
+                try:
+                    await bulk_one(item, st, ctx)
+                except Exception:
+                    log.exception("bulk item failed")
+                    st["fail"] += 1
+                st["done"] += 1
+                if st["done"] % 4 == 0:
+                    await bulk_edit(ctx, chat, st)
+                await asyncio.sleep(0.3)
+            await asyncio.sleep(8)
+            if not st["q"]:
+                break
+    finally:
+        st["closed"] = True
+        st["running"] = False
+        await bulk_edit(ctx, chat, st, final=True)
+
+async def bulk_add(update, ctx):
+    msg = update.message
+    doc = msg.document
+    chat = msg.chat_id
+    item = {"fid": doc.file_id, "uid": doc.file_unique_id or "", "name": doc.file_name or "", "size": doc.file_size or 0,
+            "cap": (msg.caption or "").strip()[:1500]}
+    st = BULK.get(chat)
+    if not st or st["closed"]:
+        st = {"q": deque(), "total": 0, "done": 0, "ok": 0, "dup": 0, "fail": 0, "review": [], "msg": None,
+              "last": 0.0, "next": 0.0, "closed": False, "init": asyncio.Lock(), "running": False}
+        BULK[chat] = st
+    st["total"] += 1
+    st["q"].append(item)
+    async with st["init"]:
+        if st["msg"] is None:
+            st["msg"] = await ctx.bot.send_message(chat, "⏳ بدأت معالجة الملازم المحوّلة من القناة، سأحدّث هذه الرسالة فقط.")
+    if not st["running"]:
+        st["running"] = True
+        asyncio.create_task(bulk_worker(chat, st, ctx))
+
+async def bulk_review_cb(q, a, ctx):
+    st = BULK.get(q.message.chat_id)
+    if a == "z":
+        if st:
+            st["review"].clear()
+        await q.message.edit_text("🗑 تم تجاهل الملفات المشكوك فيها.")
+        return
+    if not st or not st["review"]:
+        await q.message.edit_text("لا توجد ملفات للمراجعة.")
+        return
+    rec = st["review"].pop(0)
+    status = await q.message.reply_text("⏳")
+    await ing_finalize(status, rec, ctx)
+    left = len(st["review"])
+    try:
+        if left:
+            await q.message.edit_reply_markup(bulk_kb(st))
+        else:
+            await q.message.edit_reply_markup(None)
+    except Exception:
+        pass
+
 async def ing_reply(update, ctx):
     msg = update.message
     rep = msg.reply_to_message
@@ -1707,6 +1868,9 @@ async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     a = parts[1]
     await q.answer()
+    if a in ("n", "z"):
+        await bulk_review_cb(q, a, ctx)
+        return
     if a == "p":
         rec = PENDING.get(q.message.message_id)
         need = rec.get("need") if rec else None
