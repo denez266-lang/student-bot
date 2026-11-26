@@ -256,7 +256,8 @@ def ago(ts):
 
 # ---------------- user menu ----------------
 
-def menu_markup():
+def menu_markup(adm=False):
+    rows = ([[B("🎛 لوحة الأدمن", callback_data="a:main")]] if adm else [])
     return M([
         [B("📷 اشرح صورة", callback_data="m:explain"), B("📝 أنشئ ملخص", callback_data="m:summary")],
         [B("📚 أنشئ أسئلة", callback_data="m:questions"), B("🧠 اختبرني", callback_data="m:quiz")],
@@ -264,7 +265,7 @@ def menu_markup():
         [B("📄 أنشئ PDF", callback_data="m:pdf"), B("🧮 حل المسائل", callback_data="m:solve")],
         [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
-    ])
+    ] + rows)
 
 def more_markup():
     return M([
@@ -341,7 +342,7 @@ async def verify_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok = False
     if ok:
         await q.answer("تم التحقق، أهلاً بك!")
-        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup())
+        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
     else:
         await q.answer("لم تشترك بعد. اشترك ثم اضغط تحقق.", show_alert=True)
 
@@ -361,7 +362,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate_ok(update, ctx):
         return
     ctx.user_data.clear()
-    await update.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup())
+    await update.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
 
 async def run_timer(bot, chat_id, mins, rest):
     try:
@@ -380,7 +381,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     if data == "m:menu":
         ctx.user_data.clear()
-        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup())
+        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
         return
     if data == "m:more":
         ctx.user_data.clear()
@@ -680,6 +681,7 @@ def screen(name):
             [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
             [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
             [B("📚 إدارة الملازم", callback_data="a:hm"), B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("🏠 قائمة الطالب", callback_data="m:menu")],
         ]
         return "🎛 لوحة الأدمن", M(rows)
     if name == "settings":
