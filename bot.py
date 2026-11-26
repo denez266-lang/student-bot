@@ -704,6 +704,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     u = update.effective_user
+    if W["uid"] and u and u.id == W["uid"]:
+        d = msg.document
+        fwd = getattr(msg, "forward_origin", None)
+        if d and fwd and getattr(fwd, "type", "") == "channel" and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+            await bulk_add(update, ctx)
+        return   # the watcher account is only used to forward channel PDFs
     store.upsert_user(u)
     if await admin_input(update, ctx):
         return
@@ -795,7 +801,8 @@ def screen(name):
             [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
             [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
             [B("📚 إدارة الملازم", callback_data="a:hm"), B("📝 كليشة الملازم", callback_data="a:cfoot")],
-            [B("🖼 ختم الملازم", callback_data="k:m"), B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("🖼 ختم الملازم", callback_data="k:m"), B("➕ قناة مصدر", callback_data="w:m")],
+            [B("💾 نسخة احتياطية", callback_data="a:backup")],
             [B("🏠 قائمة الطالب", callback_data="m:menu")],
         ]
         return "🎛 لوحة الأدمن", M(rows)
@@ -1216,6 +1223,8 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await ing_edit_input(update, ctx, act)
     if act.startswith("ks"):
         return await stamp_input(update, ctx, act)
+    if act.startswith("wa"):
+        return await watch_input(update, ctx, act)
     if act.startswith("h"):
         return await hadmin_input(update, ctx, act, msg, text)
     back = {"welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}
@@ -2024,7 +2033,10 @@ from types import SimpleNamespace as NS
 BULK = {}   # chat id -> state of the current/last bulk run (memory only)
 
 def bulk_text(st, final=False):
-    t = (f"✅ اكتملت المعالجة ({st['done']}/{st['total']})" if final else f"⏳ {st['done']}/{st['total']}")
+    tot = max(st["total"], st.get("found", 0))
+    t = (f"✅ اكتملت المعالجة ({st['done']}/{tot})" if final else f"⏳ {st['done']}/{tot}")
+    if st.get("found"):
+        t = "📥 الأرشيف " + t
     t += f" · ✅ {st['ok']} · ⏭ {st['dup']} مكرر"
     if st["stamped"]:
         t += f" · 🖼 {st['stamped']} مختومة"
@@ -2051,7 +2063,7 @@ async def bulk_edit(ctx, chat, st, final=False):
         return
     try:
         await ctx.bot.edit_message_text(bulk_text(st, final), chat_id=chat, message_id=st["msg"].message_id,
-                                        reply_markup=bulk_kb(st) if final else None)
+                                        reply_markup=bulk_kb(st) if final else (M([[hb("⏸ إيقاف مؤقت", "w:p"), hb("⛔ إلغاء", "w:s")]]) if st.get("bf") else None))
         st["last"] = time.time()
     except Exception as e:
         ra = getattr(e, "retry_after", None)
@@ -2092,9 +2104,11 @@ async def bulk_one(item, st, ctx):
     cap = item["cap"]
     g = guess_from_name(item["name"], cap)
     info = {k: "" for k in ("stage", "subject", "teacher", "title", "type", "year", "quality")}
+    lite = st.get("bf") and store.get("gem_lite", "1") == "1" and g["stage"] and g["subject"]
     async with ING_LOCK:
         try:
-            info = await asyncio.wait_for(analyze_pdf(ctx, doc, cap, bulk=True, no_file=bool(g["stage"] and g["subject"])), 90)
+            if not lite:
+                info = await asyncio.wait_for(analyze_pdf(ctx, doc, cap, bulk=True, no_file=bool(g["stage"] and g["subject"])), 90)
         except Exception as e:
             log.warning("bulk analyze failed: %r", e)
     for k in info:
@@ -2127,7 +2141,7 @@ async def bulk_worker(chat, st, ctx):
                 if st["done"] % 4 == 0:
                     await bulk_edit(ctx, chat, st)
                 await asyncio.sleep(0.3)
-            await asyncio.sleep(8)
+            await asyncio.sleep(st.get("grace", 8))
             if not st["q"]:
                 break
     finally:
@@ -2135,22 +2149,30 @@ async def bulk_worker(chat, st, ctx):
         st["running"] = False
         await bulk_edit(ctx, chat, st, final=True)
 
+def bulk_new_state():
+    return {"q": deque(), "total": 0, "done": 0, "ok": 0, "dup": 0, "fail": 0, "stamped": 0, "nostamp": 0, "review": [], "msg": None,
+            "last": 0.0, "next": 0.0, "closed": False, "init": asyncio.Lock(), "running": False, "found": 0, "bf": False, "grace": 8, "silent": False}
+
 async def bulk_add(update, ctx):
     msg = update.message
     doc = msg.document
-    chat = msg.chat_id
+    from_watch = bool(W["uid"] and update.effective_user and update.effective_user.id == W["uid"])
+    chat = ADMIN_BACKUP_CHAT if from_watch else msg.chat_id
     item = {"fid": doc.file_id, "uid": doc.file_unique_id or "", "name": doc.file_name or "", "size": doc.file_size or 0,
             "cap": (msg.caption or "").strip()[:1500]}
     st = BULK.get(chat)
     if not st or st["closed"]:
-        st = {"q": deque(), "total": 0, "done": 0, "ok": 0, "dup": 0, "fail": 0, "stamped": 0, "nostamp": 0, "review": [], "msg": None,
-              "last": 0.0, "next": 0.0, "closed": False, "init": asyncio.Lock(), "running": False}
+        st = bulk_new_state()
+        st["silent"] = bool(from_watch)
+        if from_watch:
+            st["grace"] = 120
         BULK[chat] = st
     st["total"] += 1
     st["q"].append(item)
     async with st["init"]:
         if st["msg"] is None:
-            st["msg"] = await ctx.bot.send_message(chat, "⏳ بدأت معالجة الملازم المحوّلة من القناة، سأحدّث هذه الرسالة فقط.")
+            st["msg"] = await ctx.bot.send_message(chat, "⏳ بدأت معالجة الملازم المحوّلة من القناة، سأحدّث هذه الرسالة فقط.",
+                                                   disable_notification=bool(st.get("silent")))
     if not st["running"]:
         st["running"] = True
         asyncio.create_task(bulk_worker(chat, st, ctx))
@@ -2176,6 +2198,483 @@ async def bulk_review_cb(q, a, ctx):
             await q.message.edit_reply_markup(None)
     except Exception:
         pass
+
+# ---------------- secondary-account watcher (Telethon) ----------------
+
+import secrets as _secrets
+import tornado.web
+W = {"client": None, "uid": 0, "uname": "", "chans": {}, "q": deque(), "task": None, "bf": None, "fwd_task": None, "bot_ent": None}
+LOGINS = {}          # one-time token -> login state (memory only)
+WATCH_ENABLED = True
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = base64.urlsafe_b64encode(hashlib.sha256(b"tgsess|" + TOKEN.encode()).digest())
+    return Fernet(key)
+
+def tg_save(cfg):
+    store.set("tg_cfg", _fernet().encrypt(json.dumps(cfg).encode()).decode() if cfg else "")
+
+def tg_load():
+    v = store.get("tg_cfg", "")
+    if not v:
+        return None
+    try:
+        return json.loads(_fernet().decrypt(v.encode()).decode())
+    except Exception:
+        log.warning("tg_cfg cannot be decrypted (bot token changed?)")
+        return None
+
+def src_list():
+    try:
+        return json.loads(store.get("src_list", "") or "[]")
+    except Exception:
+        return []
+
+def src_save(lst):
+    store.set("src_list", json.dumps(lst, ensure_ascii=False))
+
+def bf_get():
+    try:
+        return json.loads(store.get("bf_state", "") or "{}")
+    except Exception:
+        return {}
+
+def bf_put(d):
+    store.set("bf_state", json.dumps(d))
+
+def is_pdf_msg(m):
+    d = getattr(m, "document", None)
+    if not d:
+        return False
+    if (getattr(d, "mime_type", "") or "").lower() == "application/pdf":
+        return True
+    for a in getattr(d, "attributes", []) or []:
+        fn = getattr(a, "file_name", None)
+        if fn and fn.lower().endswith(".pdf"):
+            return True
+    return False
+
+async def watch_notify(text, kb=None):
+    try:
+        await APP.bot.send_message(ADMIN_BACKUP_CHAT, text, disable_notification=True, reply_markup=kb)
+    except Exception:
+        log.exception("watch notify")
+
+async def watch_start():
+    """Connect the saved session (if any). Never logs in by itself."""
+    if not WATCH_ENABLED or W["client"]:
+        return False
+    cfg = tg_load()
+    if not cfg:
+        return False
+    try:
+        from telethon import TelegramClient, events
+        from telethon.sessions import StringSession
+        c = TelegramClient(StringSession(cfg["session"]), int(cfg["api_id"]), cfg["api_hash"],
+                           flood_sleep_threshold=120, device_model="TalibBot", system_version="1.0", app_version="1.0")
+        await c.connect()
+        if not await c.is_user_authorized():
+            await c.disconnect()
+            await watch_notify("⚠️ جلسة الحساب المراقب لم تعد صالحة. اربط الحساب من جديد من لوحة «قناة مصدر».")
+            return False
+        me = await c.get_me()
+        W.update(client=c, uid=me.id, uname=me.username or me.first_name or str(me.id))
+        bu = (await APP.bot.get_me()).username
+        W["bot_ent"] = await c.get_entity(bu)
+        await watch_resolve()
+        c.add_event_handler(watch_on_new, events.NewMessage(incoming=True))
+        if not W["fwd_task"]:
+            W["fwd_task"] = asyncio.create_task(watch_forwarder())
+        bf = bf_get()
+        if bf.get("state") == "run":
+            W["task"] = asyncio.create_task(bf_run(bf["cid"], resume=True))
+        log.info("watcher connected as %s", W["uname"])
+        return True
+    except Exception:
+        log.exception("watch start failed")
+        W["client"] = None
+        return False
+
+async def watch_resolve():
+    c = W["client"]
+    W["chans"] = {}
+    for s in src_list():
+        try:
+            W["chans"][s["id"]] = s
+        except Exception:
+            pass
+
+async def watch_on_new(ev):
+    try:
+        m = ev.message
+        cid = ev.chat_id
+        s = W["chans"].get(cid)
+        if not s or s.get("paused") or not is_pdf_msg(m):
+            return
+        W["q"].append((cid, m.id))
+    except Exception:
+        log.exception("watch handler")
+
+async def watch_forward(cid, ids):
+    """Forward posts to the bot chat; returns False when forwards are blocked for this channel."""
+    from telethon import errors
+    c = W["client"]
+    for attempt in range(3):
+        try:
+            await c.forward_messages(W["bot_ent"], ids, from_peer=cid)
+            return True
+        except errors.FloodWaitError as e:
+            log.warning("flood wait %ss", e.seconds)
+            await asyncio.sleep(e.seconds + 5)
+        except errors.ChatForwardsRestrictedError:
+            return False
+        except Exception as e:
+            log.warning("forward failed: %r", e)
+            await asyncio.sleep(10)
+    return True
+
+def bot_queue_len():
+    st = BULK.get(ADMIN_BACKUP_CHAT)
+    return len(st["q"]) if st and not st["closed"] else 0
+
+async def watch_forwarder():
+    """Live posts: small batches, paced."""
+    while True:
+        await asyncio.sleep(6)
+        try:
+            if not W["client"] or not W["q"]:
+                continue
+            by = {}
+            while W["q"] and sum(len(v) for v in by.values()) < 10:
+                cid, mid = W["q"].popleft()
+                by.setdefault(cid, []).append(mid)
+            for cid, ids in by.items():
+                ok = await watch_forward(cid, ids)
+                if not ok:
+                    await watch_notify("⚠️ هذه القناة تمنع التحويل (حفظ المحتوى مقيّد)، لا يمكن نسخ منشوراتها.")
+                await asyncio.sleep(4)
+        except Exception:
+            log.exception("watch forwarder")
+
+async def bf_run(cid, resume=False):
+    """Archive copy: document posts only, resumable by saved cursor, throttled with backpressure."""
+    from telethon.tl.types import InputMessagesFilterDocument
+    bf = bf_get()
+    c = W["client"]
+    if not c:
+        return
+    try:
+        bf.update(cid=cid, state="run")
+        bf_put(bf)
+        ent = await c.get_entity(cid)
+        oldest_first = bf.get("dir", "old") == "old"
+        total = (await c.get_messages(ent, limit=0, filter=InputMessagesFilterDocument)).total
+        st = BULK.get(ADMIN_BACKUP_CHAT)
+        if not st or st["closed"]:
+            st = bulk_new_state()
+            BULK[ADMIN_BACKUP_CHAT] = st
+            st["silent"] = True
+        st["found"] = total
+        st["bf"] = True
+        st["grace"] = 120
+        cursor = int(bf.get("cursor", 0) or 0)
+        kw = {"reverse": True, "min_id": cursor} if oldest_first else ({"max_id": cursor} if cursor else {})
+        batch, last = [], cursor
+        async def flush():
+            nonlocal batch, last
+            if not batch:
+                return True
+            ok = await watch_forward(cid, batch)
+            if not ok:
+                bf.update(state="blocked")
+                bf_put(bf)
+                await watch_notify("⛔ القناة تمنع التحويل (حفظ المحتوى مقيّد). توقف النسخ.")
+                return False
+            last = batch[-1] if oldest_first else batch[-1]
+            bf["cursor"] = last
+            bf["sent"] = int(bf.get("sent", 0)) + len(batch)
+            bf_put(bf)
+            batch = []
+            await asyncio.sleep(25)
+            while bot_queue_len() > 25:
+                if bf_get().get("state") != "run":
+                    break
+                await asyncio.sleep(10)
+            return True
+        async for m in c.iter_messages(ent, filter=InputMessagesFilterDocument, wait_time=2, **kw):
+            if bf_get().get("state") != "run":
+                break
+            while bf_get().get("state") == "pause":
+                await asyncio.sleep(10)
+            if not is_pdf_msg(m):
+                continue
+            batch.append(m.id)
+            if len(batch) >= 15:
+                if not await flush():
+                    return
+        if bf_get().get("state") == "run":
+            await flush()
+            bf = bf_get()
+            bf.update(state="done")
+            bf_put(bf)
+            await watch_notify(f"✅ انتهى نسخ أرشيف القناة (أُرسل {bf.get('sent', 0)} منشور للمعالجة).")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("backfill failed")
+        bf = bf_get()
+        bf["state"] = "error"
+        bf_put(bf)
+        await watch_notify("⚠️ توقف نسخ الأرشيف بسبب خطأ. اضغط استئناف من لوحة «قناة مصدر».")
+    finally:
+        st = BULK.get(ADMIN_BACKUP_CHAT)
+        if st:
+            st["bf"] = False
+            st["found"] = 0
+
+# ---- web login ----
+
+LOGIN_CSS = ("<meta name=viewport content='width=device-width,initial-scale=1'><meta charset=utf-8>"
+             "<style>body{font-family:system-ui,'Noto Sans Arabic',sans-serif;background:#FFF6E5;direction:rtl;padding:20px;color:#2b2140}"
+             ".c{max-width:420px;margin:auto;background:#fff;border-radius:24px;padding:22px;box-shadow:0 6px 0 #D9D0FF}"
+             "h2{color:#7C5CFC;margin-top:0}input{width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0FF;border-radius:14px;font-size:16px;direction:ltr;text-align:left}"
+             "button{width:100%;padding:14px;border:0;border-radius:16px;background:#7C5CFC;color:#fff;font-size:17px;font-weight:700}"
+             ".e{background:#FFE3E3;padding:10px;border-radius:12px;margin-bottom:12px}small{color:#777}</style>")
+
+def login_page(body, err=""):
+    e = f"<div class=e>{html_esc(err)}</div>" if err else ""
+    return f"<!doctype html><html lang=ar>{LOGIN_CSS}<div class=c>{e}{body}</div></html>"
+
+def html_esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+def login_form(step):
+    if step == "start":
+        return ("<h2>🔑 ربط الحساب المراقب</h2><p><small>استعمل بيانات الحساب الثاني فقط. هذه الصفحة تعمل مرة واحدة ولا تُحفظ البيانات إلا مشفّرة.</small></p>"
+                "<form method=post><input type=hidden name=a value=start>api_id<input name=api_id inputmode=numeric required>"
+                "api_hash<input name=api_hash required autocomplete=off>رقم الهاتف مع المفتاح (+964...)<input name=phone required>"
+                "<button>إرسال الكود</button></form>")
+    if step == "code":
+        return ("<h2>📩 أدخل الكود</h2><p><small>وصل الكود داخل تطبيق تيليگرام على الحساب الثاني (محادثة Telegram).</small></p>"
+                "<form method=post><input type=hidden name=a value=code>الكود<input name=code inputmode=numeric required autocomplete=off><button>تأكيد</button></form>")
+    if step == "pw":
+        return ("<h2>🔐 كلمة سر التحقق بخطوتين</h2><form method=post><input type=hidden name=a value=pw>"
+                "<input name=pw type=password required autocomplete=off><button>تأكيد</button></form>")
+    return "<h2>✅ تم ربط الحساب</h2><p>يمكنك إغلاق هذه الصفحة والعودة إلى البوت.</p>"
+
+class TgLoginH(tornado.web.RequestHandler):
+    def prepare(self):
+        self.set_header("Cache-Control", "no-store")
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("X-Robots-Tag", "noindex")
+        self.st = LOGINS.get(self.path_args[0] if self.path_args else "")
+        if not self.st or self.st["exp"] < time.time():
+            LOGINS.pop(self.path_args[0] if self.path_args else "", None)
+            self.set_status(404)
+            self.finish(login_page("<h2>انتهت صلاحية الرابط</h2><p>اطلب رابطاً جديداً من لوحة الأدمن.</p>"))
+
+    async def get(self, token):
+        self.finish(login_page(login_form(self.st["step"])))
+
+    async def post(self, token):
+        st = self.st
+        st["tries"] += 1
+        if st["tries"] > 12:
+            LOGINS.pop(token, None)
+            self.finish(login_page("<h2>محاولات كثيرة</h2>"))
+            return
+        a = self.get_body_argument("a", "")
+        try:
+            from telethon import TelegramClient, errors
+            from telethon.sessions import StringSession
+            if a == "start" and st["step"] == "start":
+                api_id = int(self.get_body_argument("api_id").strip())
+                api_hash = self.get_body_argument("api_hash").strip()
+                phone = self.get_body_argument("phone").strip().replace(" ", "")
+                c = TelegramClient(StringSession(), api_id, api_hash, device_model="TalibBot")
+                await c.connect()
+                sent = await c.send_code_request(phone)
+                st.update(client=c, api_id=api_id, api_hash=api_hash, phone=phone, hash=sent.phone_code_hash, step="code")
+            elif a == "code" and st["step"] == "code":
+                try:
+                    await st["client"].sign_in(st["phone"], self.get_body_argument("code").strip().replace(" ", ""), phone_code_hash=st["hash"])
+                except errors.SessionPasswordNeededError:
+                    st["step"] = "pw"
+                    self.finish(login_page(login_form("pw")))
+                    return
+            elif a == "pw" and st["step"] == "pw":
+                await st["client"].sign_in(password=self.get_body_argument("pw"))
+            else:
+                self.finish(login_page(login_form(st["step"])))
+                return
+            if st["step"] != "code" or await st["client"].is_user_authorized():
+                if await st["client"].is_user_authorized():
+                    await login_done(st)
+                    LOGINS.pop(token, None)
+                    self.finish(login_page(login_form("done")))
+                    return
+            self.finish(login_page(login_form(st["step"])))
+        except Exception as e:
+            log.warning("tg login step failed: %s", type(e).__name__)
+            msg = {"PhoneCodeInvalidError": "الكود غير صحيح", "PhoneCodeExpiredError": "انتهى الكود، ابدأ من جديد",
+                   "PasswordHashInvalidError": "كلمة السر غير صحيحة", "ApiIdInvalidError": "api_id أو api_hash غير صحيح",
+                   "PhoneNumberInvalidError": "رقم الهاتف غير صحيح", "FloodWaitError": "انتظر قليلاً ثم أعد المحاولة"}.get(type(e).__name__, "تعذّرت العملية، تحقق من البيانات")
+            self.finish(login_page(login_form(st["step"]), msg))
+
+async def login_done(st):
+    c = st["client"]
+    sess = c.session.save()
+    me = await c.get_me()
+    await c.disconnect()
+    tg_save({"api_id": st["api_id"], "api_hash": st["api_hash"], "session": sess, "uid": me.id})
+    if W["client"]:
+        try:
+            await W["client"].disconnect()
+        except Exception:
+            pass
+        W["client"] = None
+    ok = await watch_start()
+    await watch_notify(f"✅ تم ربط الحساب المراقب ({'@' + me.username if me.username else me.first_name}). " + ("متصل." if ok else "تعذّر الاتصال، راجع السجلات."))
+
+def watch_status_text():
+    cfg_ok = bool(W["client"])
+    t = "➕ قنوات المصدر (الحساب المراقب)\n"
+    t += f"الحساب: {'✅ ' + str(W['uname']) if cfg_ok else ('⚠️ مربوط لكن غير متصل' if tg_load() else '❌ غير مربوط')}\n\n"
+    lst = src_list()
+    bf = bf_get()
+    if not lst:
+        t += "لا توجد قنوات بعد."
+    for s in lst:
+        flag = "⏸" if s.get("paused") else "🟢"
+        t += f"{flag} @{s['u']}"
+        if bf.get("cid") == s["id"] and bf.get("state"):
+            t += {"run": " · 📥 النسخ جارٍ", "pause": " · ⏸ النسخ متوقف مؤقتاً", "done": " · ✅ تم نسخ الأرشيف", "blocked": " · ⛔ التحويل ممنوع", "error": " · ⚠️ توقف بخطأ", "stop": " · ⛔ أُوقف"}.get(bf["state"], "") + f" ({bf.get('sent', 0)} أُرسل)"
+        t += "\n"
+    return t
+
+def watch_menu():
+    kb = [[hb("🔑 ربط الحساب" if not W["client"] else "🔑 إعادة الربط", "w:l")]]
+    if W["client"]:
+        kb.append([hb("➕ إضافة قناة", "w:a")])
+    bf = bf_get()
+    for s in src_list():
+        row = [hb(f"📥 أرشيف @{s['u']}"[:30], f"w:b:{s['id']}"), hb("▶" if s.get("paused") else "⏸", f"w:t:{s['id']}"), hb("🗑", f"w:d:{s['id']}")]
+        kb.append(row)
+    if bf.get("state") == "run":
+        kb.append([hb("⏸ إيقاف مؤقت للنسخ", "w:p"), hb("⛔ إلغاء النسخ", "w:s")])
+    elif bf.get("state") in ("pause", "error"):
+        kb.append([hb("▶ استئناف النسخ", "w:r"), hb("⛔ إلغاء النسخ", "w:s")])
+    kb.append([hb(("✅ " if store.get("gem_lite", "1") == "1" else "⬜ ") + "الذكاء فقط عند الحاجة (للأرشيف)", "w:g")])
+    if tg_load():
+        kb.append([hb("🔌 فصل الحساب", "w:x")])
+    kb.append([hb("🔙 رجوع", "a:main")])
+    return M(kb)
+
+async def watch_cb(update, ctx):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("للأدمن فقط", show_alert=True)
+        return
+    parts = q.data.split(":")
+    a = parts[1]
+    await q.answer()
+    if a == "l":
+        tok = _secrets.token_urlsafe(24)
+        LOGINS[tok] = {"exp": time.time() + 900, "step": "start", "tries": 0}
+        base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        await q.message.reply_text("🔑 رابط ربط الحساب (يعمل مرة واحدة ولمدة 15 دقيقة، لا تشاركه):\n" + f"{base}/tglogin/{tok}\n\nأدخل البيانات في الصفحة وليس في المحادثة.",
+                                   disable_web_page_preview=True)
+        return
+    if a == "a":
+        ctx.user_data["admin_wait"] = "wadd"
+        await q.message.reply_text("أرسل @username للقناة العامة (مثال: @mychannel).")
+        return
+    if a == "b":
+        cid = int(parts[2])
+        await q.message.edit_text("📥 نسخ كل الأرشيف: بأي ترتيب؟", reply_markup=M([
+            [hb("⬆️ من الأقدم للأحدث", f"w:bo:{cid}:old"), hb("⬇️ من الأحدث للأقدم", f"w:bo:{cid}:new")], [hb("🔙 رجوع", "w:m")]]))
+        return
+    if a == "bo":
+        if not W["client"]:
+            await q.message.reply_text("اربط الحساب أولاً.")
+            return
+        if W["task"] and not W["task"].done():
+            await q.message.reply_text("هناك نسخ جارٍ بالفعل.")
+            return
+        cid, d = int(parts[2]), parts[3]
+        bf_put({"cid": cid, "dir": d, "cursor": 0, "sent": 0, "state": "run"})
+        W["task"] = asyncio.create_task(bf_run(cid))
+        await q.message.reply_text("📥 بدأ نسخ الأرشيف. سأحدّث رسالة تقدّم واحدة صامتة.")
+    elif a in ("p", "r", "s"):
+        bf = bf_get()
+        if a == "p" and bf.get("state") == "run":
+            bf["state"] = "pause"
+        elif a == "r" and bf.get("state") in ("pause", "error"):
+            bf["state"] = "run"
+            bf_put(bf)
+            if not W["task"] or W["task"].done():
+                W["task"] = asyncio.create_task(bf_run(bf["cid"], resume=True))
+        elif a == "s":
+            bf["state"] = "stop"
+        bf_put(bf)
+    elif a == "g":
+        store.set("gem_lite", "0" if store.get("gem_lite", "1") == "1" else "1")
+    elif a == "t":
+        lst = src_list()
+        for s in lst:
+            if s["id"] == int(parts[2]):
+                s["paused"] = 0 if s.get("paused") else 1
+        src_save(lst)
+        await watch_resolve()
+    elif a == "d":
+        src_save([s for s in src_list() if s["id"] != int(parts[2])])
+        await watch_resolve()
+    elif a == "x":
+        if W["client"]:
+            try:
+                await W["client"].log_out()
+            except Exception:
+                pass
+            W["client"] = None
+        tg_save(None)
+    t, kb = watch_status_text(), watch_menu()
+    try:
+        await q.message.edit_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
+
+async def watch_input(update, ctx, act):
+    msg = update.message
+    if act == "wadd":
+        txt = (msg.text or "").strip()
+        m = re.search(r"(?:t\.me/|@)?([A-Za-z][A-Za-z0-9_]{3,31})", txt)
+        if not m or not W["client"]:
+            await msg.reply_text("اربط الحساب أولاً، ثم أرسل @username صحيحاً.")
+            return True
+        uname = m.group(1)
+        try:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            from telethon import utils
+            ent = await W["client"].get_entity(uname)
+            if not getattr(ent, "broadcast", False):
+                await msg.reply_text("هذا ليس قناة عامة.")
+                return True
+            cid = utils.get_peer_id(ent)
+            try:
+                await W["client"](JoinChannelRequest(ent))
+            except Exception as e:
+                log.warning("join: %r", e)
+            lst = [s for s in src_list() if s["id"] != cid] + [{"id": cid, "u": uname, "title": getattr(ent, "title", ""), "paused": 0}]
+            src_save(lst)
+            await watch_resolve()
+            await msg.reply_text(f"✅ أُضيفت @{uname}. المنشورات الجديدة تُنسخ تلقائياً. لنسخ الأرشيف استعمل «📥 أرشيف».")
+        except Exception as e:
+            log.warning("add source: %r", e)
+            await msg.reply_text("تعذّر العثور على القناة. تأكد من الاسم وأنها عامة.")
+        await msg.reply_text(watch_status_text(), reply_markup=watch_menu())
+        return True
+    return False
 
 async def ing_reply(update, ctx):
     msg = update.message
@@ -2331,6 +2830,10 @@ async def post_init(app):
     store = Store(DB_PATH)
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
+    async def _ws():
+        await asyncio.sleep(20)
+        await watch_start()
+    asyncio.create_task(_ws())
 
 async def on_error(update, ctx):
     log.warning("handler error: %r", ctx.error)
@@ -2346,6 +2849,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(handout_cb, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(ing_cb, pattern=r"^i:"))
     app.add_handler(CallbackQueryHandler(stamp_cb, pattern=r"^k:"))
+    app.add_handler(CallbackQueryHandler(watch_cb, pattern=r"^w:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, drop_pin_notice))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
@@ -2515,7 +3019,7 @@ async def serve(url):
     await app.bot.set_webhook(url=f"{url.rstrip('/')}/{TOKEN}", allowed_updates=Update.ALL_TYPES)
     web = tornado.web.Application([
         (rf"/{re.escape(TOKEN)}", WebhookH),
-        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH),
+        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH), (r"/tglogin/([A-Za-z0-9_\-]+)", TgLoginH),
         (r"/api/(\w+)", ApiH),
     ], tgapp=app)
     web.listen(int(os.environ.get("PORT", "10000")), address="0.0.0.0")
