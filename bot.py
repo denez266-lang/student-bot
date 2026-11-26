@@ -50,6 +50,7 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
+        self.q("""CREATE TABLE IF NOT EXISTS searches(ts REAL, user_id INTEGER, q TEXT)""")
         for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER", "ftype TEXT"):
             try:
                 self.q("ALTER TABLE h_files ADD COLUMN " + col)
@@ -686,6 +687,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     mode = ctx.user_data.get("mode")
 
+    if mode == "hsearch":
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.reply_text("اكتب كلمات البحث نصاً من فضلك.")
+            return
+        ctx.user_data.pop("mode", None)
+        files, total = search_files(text)
+        log_search(u.id, text)
+        if files:
+            await msg.reply_text(f"🔍 نتائج «{trim(text, 40)}» ({total}):", reply_markup=results_markup(files, total))
+        else:
+            await msg.reply_text("😕 لم أجد ملزمة مطابقة. جرّب كلمات أقل (مثلاً المادة فقط) أو استعمل البحث الموجّه.",
+                                 reply_markup=M([[B("🧭 بحث موجّه", callback_data="h:g:0:-:-:-"), B("🔎 بحث جديد", callback_data="h:qm")],
+                                                 [B("🔙 المكتبة", callback_data="h:s")]]))
+        return
     if mode == "quiz":
         topic = (msg.text or "").strip()
         if not topic:
@@ -788,6 +804,10 @@ def stats_text():
     t += f"\n📚 الملازم: {n_h} ملزمة | {n_d} تنزيل\n"
     for title, d in store.q("SELECT title, downloads FROM h_files WHERE downloads>0 ORDER BY downloads DESC LIMIT 5", fetch=True):
         t += f"  ◦ {title}: {d}\n"
+    n_s = store.q("SELECT COUNT(*) FROM searches", fetch=True)[0][0]
+    t += f"\n🔍 عمليات البحث: {n_s}\n"
+    for w, n in store.q("SELECT q, COUNT(*) c FROM searches GROUP BY q ORDER BY c DESC, MAX(ts) DESC LIMIT 5", fetch=True):
+        t += f"  ◦ {w}: {n}\n"
     return t
 
 def uline(r):
@@ -897,9 +917,21 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     act = parts[1]
     if act == "s":
         rows = hq("SELECT s.id, s.name, (SELECT COUNT(*) FROM h_files f JOIN h_subjects j ON f.subject_id=j.id WHERE j.stage_id=s.id) FROM h_stages s ORDER BY s.id")
-        kb = [[B(f"🎓 {trim(r[1])} ({r[2]})", callback_data=f"h:t:{r[0]}")] for r in rows[:50]]
+        kb = [[B("🔍 بحث", callback_data="h:q")]]
+        kb += [[B(f"🎓 {trim(r[1])} ({r[2]})", callback_data=f"h:t:{r[0]}")] for r in rows[:50]]
         kb.append(HOME)
         await hshow(q, "📚 الملازم\nاختر المرحلة الدراسية:" if rows else "📚 الملازم\nلا توجد ملازم بعد، سنضيفها قريباً.", M(kb))
+    elif act == "q":
+        ctx.user_data.pop("mode", None)
+        await hshow(q, "🔍 كيف تريد البحث عن الملزمة؟",
+                    M([[B("⌨️ بحث بالكتابة", callback_data="h:qm")], [B("🧭 بحث موجّه بالأزرار", callback_data="h:g:0:-:-:-")],
+                       [B("🔙 المكتبة", callback_data="h:s")]]))
+    elif act == "qm":
+        ctx.user_data["mode"] = "hsearch"
+        await hshow(q, "⌨️ اكتب كلمات البحث: المادة أو الأستاذ أو العنوان أو السنة أو النوع.\nمثال: كيمياء سعد 2027 وزاريات",
+                    M([[B("🔙 رجوع", callback_data="h:q")]]))
+    elif act == "g":
+        await guided_view(q, int(parts[2]), parts[3], parts[4], parts[5])
     elif act == "t":
         sid = int(parts[2])
         st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
@@ -1194,6 +1226,91 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🚫 تم الحظر." if act == "ban" else "✅ تم فك الحظر.", reply_markup=back_admin("users"))
         return True
     return False
+
+# ---------------- handout search ----------------
+def all_files():
+    rows = store.q("SELECT f.id, f.title, f.teacher, f.ftype, f.year, f.quality, j.name, s.name FROM h_files f "
+                   "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id ORDER BY f.id DESC", fetch=True)
+    out = []
+    for fid, title, teacher, ftype, year, quality, jn, sn in rows:
+        t = eff_teacher(teacher, title)
+        y = eff_type(ftype, title)
+        fields = (title, jn, sn, "" if t == GENERAL else t, y, year or "", quality or "")
+        out.append({"id": fid, "title": title, "teacher": t, "type": y, "year": year or "", "subject": jn, "stage": sn,
+                    "doc": " ".join(nrm(x) for x in fields), "ntitle": nrm(title),
+                    "sk": sid_of(nrm(jn)), "gk": sid_of(nrm(sn)), "tk": sid_of(t)})
+    return out
+
+def tok_variants(tok):
+    v = {tok}
+    if tok == "ملازم":
+        v.add("ملزم")
+    if len(tok) >= 4:
+        v.add(tok[:-1])
+    if len(tok) >= 5 and tok.endswith(("ات", "ون", "ين")):
+        v.add(tok[:-2])
+    return v
+
+def search_files(query, stage=None, subject=None, teacher=None, limit=25):
+    """query: free text (may be empty); stage/subject/teacher: normalized-name keys (sid_of) or None."""
+    toks = [t for t in (nrm(w) for w in (query or "").split()) if t]
+    res = []
+    for f in all_files():
+        if stage and f["gk"] != stage or subject and f["sk"] != subject or teacher and f["tk"] != teacher:
+            continue
+        score = 0
+        ok = True
+        for t in toks:
+            vs = tok_variants(t)
+            if not any(v in f["doc"] for v in vs):
+                ok = False
+                break
+            score += 2 if any(v in f["ntitle"] for v in vs) else 1
+        if ok:
+            res.append((score, f))
+    res.sort(key=lambda x: -x[0])
+    return [f for _, f in res[:limit]], len(res)
+
+def log_search(uid, q):
+    q = " ".join(nrm(w) for w in (q or "").split() if nrm(w))[:60]
+    if len(q) >= 2:
+        store.q("INSERT INTO searches(ts,user_id,q) VALUES(?,?,?)", (time.time(), uid, q))
+
+def results_markup(files, total, back="h:q"):
+    kb = [[B(f"📄 {trim(f['title'], 40)} · {trim(f['stage'], 18)}", callback_data=f"h:d:{f['id']}")] for f in files]
+    kb.append([B("🔎 بحث جديد", callback_data="h:q"), B("🔙 المكتبة", callback_data="h:s")])
+    return M(kb)
+
+def uniq_options(files, key, label):
+    seen = {}
+    for f in files:
+        k = f[key]
+        e = seen.setdefault(k, [f[label], 0])
+        e[1] += 1
+    return [(k, v[0], v[1]) for k, v in sorted(seen.items(), key=lambda kv: (kv[1][0] == GENERAL, kv[1][0]))]
+
+async def guided_view(q, step, S, T, C):
+    """step 0 subject, 1 stage, 2 teacher, 3 results. S/T/C: chosen key or '-'."""
+    key = lambda x: None if x == "-" else x
+    files, total = search_files("", stage=key(T), subject=key(S), teacher=key(C), limit=60)
+    chosen = any(x != "-" for x in (S, T, C))
+    if step >= 3 or (chosen and total <= 6):
+        txt = f"🔍 النتائج ({total})" if files else "😕 لا توجد نتائج بهذه الاختيارات."
+        await hshow(q, txt, results_markup(files[:25], total))
+        return
+    spec = {0: ("sk", "subject", "📖", "اختر المادة"), 1: ("gk", "stage", "🎓", "اختر المرحلة"), 2: ("tk", "teacher", "👨‍🏫", "اختر الأستاذ")}[step]
+    opts = uniq_options(files, spec[0], spec[1])
+    def nxt(val):
+        ch = [S, T, C]
+        ch[step] = val
+        return f"h:g:{step + 1}:{ch[0]}:{ch[1]}:{ch[2]}"
+    kb = [[B(f"{spec[2]} {trim(n, 35)} ({c})", callback_data=nxt(k))] for k, n, c in opts[:40]]
+    row = [B("⏭ تخطي", callback_data=nxt("-"))]
+    if chosen:
+        row.append(B(f"📄 عرض النتائج ({total})", callback_data=f"h:g:3:{S}:{T}:{C}"))
+    kb.append(row)
+    kb.append([B("🔙 رجوع", callback_data="h:q")])
+    await hshow(q, f"🧭 بحث موجّه ({step + 1}/3)\n{spec[3]}:" if opts else "لا توجد ملازم بعد.", M(kb))
 
 # ---------------- handout library tree (stage > subject > teacher > type > files) ----------------
 TYPES = ["ملازم", "وزاريات", "أسئلة", "ملخصات", "اختبارات"]
@@ -1782,6 +1899,15 @@ class ApiH(tornado.web.RequestHandler):
                 out.append({"id": sid, "name": sname, "subjects": subs})
             store.event(uid, "webapp")
             return self.write({"stages": out})
+        if name == "search":
+            qtxt = str(body.get("q", ""))[:80]
+            def kk(v):
+                v = str(body.get(v, "") or "")
+                return sid_of(nrm(v)) if v else None
+            files, total = search_files(qtxt, stage=kk("stage"), subject=kk("subject"), teacher=(sid_of(str(body.get("teacher"))) if body.get("teacher") else None), limit=30)
+            if qtxt.strip():
+                log_search(uid, qtxt)
+            return self.write({"total": total, "files": [{k: f[k] for k in ("id", "title", "stage", "subject", "teacher", "type")} for f in files]})
         if name == "download":
             r = store.q("SELECT title,file_id,kind FROM h_files WHERE id=?", (int(body.get("id", 0)),), fetch=True)
             if not r:
