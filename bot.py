@@ -1750,6 +1750,38 @@ def stamp_preview_png(cfg):
     sheet.save(out, "PNG")
     return out.getvalue()
 
+STORE_OK = {"v": None}   # None = unverified, True = deleted-message file_ids work, False = keep messages
+
+async def store_doc(bot, out, fname):
+    """Upload bytes to get a bot file_id without leaving chat clutter: delete the message afterwards.
+    Verified once per process that a file_id still works after its message is deleted; if not, messages are kept."""
+    m = await bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=fname), disable_notification=True)
+    fid = m.document.file_id
+    if STORE_OK["v"] is None:
+        try:
+            t = await bot.send_document(ADMIN_BACKUP_CHAT, fid, disable_notification=True)
+            await bot.delete_message(ADMIN_BACKUP_CHAT, m.message_id)   # original gone; fid must still work (the test copy proves it below)
+            t2 = await bot.send_document(ADMIN_BACKUP_CHAT, fid, disable_notification=True)
+            for x in (t, t2):
+                try:
+                    await bot.delete_message(ADMIN_BACKUP_CHAT, x.message_id)
+                except Exception:
+                    pass
+            STORE_OK["v"] = True
+            log.info("store_doc: file_id works after message deletion, cleanup on")
+        except Exception:
+            STORE_OK["v"] = False
+            log.exception("store_doc: deleted-message file_id failed; keeping messages")
+            m = await bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=fname), disable_notification=True)
+            fid = m.document.file_id
+        return fid
+    if STORE_OK["v"]:
+        try:
+            await bot.delete_message(ADMIN_BACKUP_CHAT, m.message_id)
+        except Exception:
+            pass
+    return fid
+
 async def apply_stamp(ctx, rec):
     """Stamp rec['fid'] (first + last page) and swap in the stamped file_id. Never raises. Returns a short note."""
     cfg = stamp_cfg()
@@ -1768,11 +1800,10 @@ async def apply_stamp(ctx, rec):
             data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
             out, n = await asyncio.wait_for(asyncio.to_thread(stamp_pdf, data, cfg), 90)
             del data
-            m = await ctx.bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=(rec.get("fname") or "handout.pdf")),
-                                            disable_notification=True)
+            new_fid = await store_doc(ctx.bot, out, rec.get("fname") or "handout.pdf")
             del out
         rec["orig_fid"] = rec["fid"]
-        rec["fid"] = m.document.file_id
+        rec["fid"] = new_fid
         rec["stamped"] = 1
         return "🖼 تم ختم الصفحة الأولى والأخيرة.\n"
     except Exception as e:
