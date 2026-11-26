@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>طالب AI</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{
   --bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#1a1a1a);
@@ -52,16 +51,32 @@ h2{font-size:17px;margin:4px 0 12px}
 <div class="nav" id="nav"></div>
 <div class="toast" id="toast"></div>
 <script>
-const tg = window.Telegram && Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
-const INIT = tg ? tg.initData : "";
+/* No external script is required: Telegram passes everything in the URL hash. */
+const HP = new URLSearchParams(location.hash.replace(/^#/, ""));
+let INIT = HP.get("tgWebAppData") || "";
+try{ const th = JSON.parse(HP.get("tgWebAppThemeParams")||"{}");
+  for (const k in th) document.documentElement.style.setProperty("--tg-theme-"+k.replace(/_/g,"-"), th[k]); }catch(e){}
+function tgPost(ev, data){
+  try{
+    if (window.TelegramWebviewProxy) TelegramWebviewProxy.postEvent(ev, JSON.stringify(data||{}));
+    else if (window.parent !== window) parent.postMessage(JSON.stringify({eventType:ev,eventData:data||{}}), "*");
+  }catch(e){}
+}
+tgPost("web_app_ready"); tgPost("web_app_expand");
+let tg = null; /* optional helper script, loaded late and never blocking */
+(function(){ const s=document.createElement("script"); s.async=true; s.src="https://telegram.org/js/telegram-web-app.js";
+  s.onload=()=>{ tg = window.Telegram && Telegram.WebApp; if(tg){ if(!INIT) INIT = tg.initData||""; try{tg.expand()}catch(e){} } }; document.head.appendChild(s); })();
 let TOOLS = [], cur = null;
 let LIB = null, tab = "home", sel = {stage:null, subject:null};
 const $ = id => document.getElementById(id);
 function toast(t){const e=$("toast");e.textContent=t;e.classList.add("on");setTimeout(()=>e.classList.remove("on"),2200)}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 async function api(path, body){
-  const r = await fetch("/api/"+path,{method:"POST",headers:{"Content-Type":"application/json","X-Init-Data":INIT},body:JSON.stringify(body||{})});
+  const ac = new AbortController(); const to = setTimeout(()=>ac.abort(), path==="run"||path==="quiz" ? 120000 : 25000);
+  let r;
+  try { r = await fetch("/api/"+path,{method:"POST",signal:ac.signal,headers:{"Content-Type":"application/json","X-Init-Data":INIT},body:JSON.stringify(body||{})}); }
+  catch(e){ throw new Error("تعذر الاتصال بالخادم، تحقق من الإنترنت وحاول مرة أخرى"); }
+  finally { clearTimeout(to); }
   const j = await r.json().catch(()=>({error:"خطأ"}));
   if(!r.ok) throw new Error(j.error||"خطأ");
   return j;
@@ -180,9 +195,14 @@ function tick(){
   if(ring)ring.style.setProperty("--p",((1-left/T.total)*100)+"%");
   if(left<=0){clearInterval(T.iv);T.iv=null;T.total=0;toast("⏰ انتهى التركيز!");if(tg&&tg.HapticFeedback)tg.HapticFeedback.notificationOccurred("success");const m=$("tmsg");if(m)m.textContent="أحسنت! خذ استراحة 🎉"}
 }
-const u = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
-if(u) $("hi").textContent = "أهلاً " + (u.first_name||"") + " 👋";
-(async()=>{try{TOOLS=(await api('tools')).tools}catch(e){}render()})();
+try{ const u = JSON.parse(new URLSearchParams(INIT).get("user")||"null"); if(u) $("hi").textContent = "أهلاً " + (u.first_name||"") + " 👋"; }catch(e){}
+function loadTools(){
+  $("view").innerHTML = '<div class="empty">⏳ جاري التحميل...</div>';
+  api('tools').then(j=>{TOOLS=j.tools;render()}).catch(e=>{
+    $("view").innerHTML = '<div class="empty">❌ '+esc(e.message)+'<br><br><button class="btn" onclick="loadTools()">إعادة المحاولة</button></div>';
+  });
+}
+render(); loadTools();
 </script>
 </body>
 </html>
