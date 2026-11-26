@@ -1701,8 +1701,12 @@ def stamp_pdf(data, cfg):
     for idx, slot in targets:
         page = w.pages[idx]
         if (page.get("/Rotate", 0) or 0) % 360:
-            continue
-        mb = page.mediabox
+            try:
+                page.transfer_rotation_to_content()
+            except Exception:
+                log.warning("rotate transfer failed")
+                continue
+        mb = page.cropbox
         W, H = float(mb.width), float(mb.height)
         im = imgs[slot]
         x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
