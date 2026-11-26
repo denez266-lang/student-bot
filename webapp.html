@@ -73,7 +73,7 @@ let tg = null; /* optional helper script, loaded late and never blocking */
 (function(){ const s=document.createElement("script"); s.async=true; s.src="https://telegram.org/js/telegram-web-app.js";
   s.onload=()=>{ tg = window.Telegram && Telegram.WebApp; if(tg){ if(!INIT) INIT = tg.initData||""; try{tg.expand()}catch(e){} } }; document.head.appendChild(s); })();
 
-let TOOLS = [], cur = null, LIB = null, tab = "home", sel = {stage:null, subject:null, teacher:null, type:null}, FILE = null, QZ = null, NAME = "";
+let TOOLS = [], cur = null, LIB = null, tab = "home", sel = {stage:null, subject:null, teacher:null, type:null, search:false}, SR = {q:"",stage:"",subject:"",teacher:""}, srT = null, FILE = null, QZ = null, NAME = "";
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function toast(t){const e=$("toast");e.textContent=t;e.classList.add("on");setTimeout(()=>e.classList.remove("on"),2200)}
@@ -105,7 +105,7 @@ function nav(){
   const items=[["home","🏠","الرئيسية"],["lib","📚","الملازم"],["timer","⏱","المؤقت"],["tools","🤖","الأدوات"]];
   $("nav").innerHTML = items.map(i=>`<button class="${tab===i[0]||(tab==="tool"&&i[0]==="tools")?"on":""}" onclick="go('${i[0]}')"><span>${i[1]}</span>${i[2]}</button>`).join("");
 }
-function go(t){tab=t;QZ=null;if(t==="lib"){sel={stage:null,subject:null,teacher:null,type:null}}render();window.scrollTo(0,0)}
+function go(t){tab=t;QZ=null;if(t==="lib"){sel={stage:null,subject:null,teacher:null,type:null,search:false}}render();window.scrollTo(0,0)}
 function tile(t,k){return `<button class="t c${k%8}" onclick="openTool('${t.id}')"><div class="ico">${t.icon}</div>${esc(t.name)}</button>`}
 function render(){
   nav();
@@ -175,8 +175,9 @@ async function renderLib(v){
   const back=(js)=>`<div class="pill" onclick="${js};render()">‹ رجوع</div>`;
   const row=(icon,name,n,unit,fn)=>`<div class="row" onclick="${fn}"><span>${icon} ${esc(name)}</span><small>${n} ${unit} ‹</small></div>`;
   if(!LIB.length){ v.innerHTML=title+'<div class="empty">📭 لا توجد ملازم بعد، سنضيفها قريباً.</div>'; return }
+  if(sel.search){ renderSearch(v); return }
   if(sel.stage===null){
-    v.innerHTML=title+'<h2>🎓 اختر المرحلة</h2>'+LIB.map((s,i)=>row("🎓",s.name,s.subjects.length,"مادة",`pick(${i})`)).join(""); return }
+    v.innerHTML=title+'<div class="row" onclick="sel.search=true;render()"><span>🔍 بحث في الملازم</span><small>مادة، أستاذ، عنوان ‹</small></div><h2>🎓 اختر المرحلة</h2>'+LIB.map((s,i)=>row("🎓",s.name,s.subjects.length,"مادة",`pick(${i})`)).join(""); return }
   const st=LIB[sel.stage];
   if(sel.subject===null){
     v.innerHTML=back("sel.stage=null")+title+`<h2>📖 اختر المادة (${esc(st.name)})</h2>`+
@@ -193,7 +194,31 @@ async function renderLib(v){
   v.innerHTML=back("sel.type=null")+title+`<h2>📄 ${esc(ty.name)} · ${esc(tc.name)} · ${esc(sj.name)}</h2>`+
     ty.files.map(f=>`<div class="row"><span>📄 ${esc(f.title)}</span><button class="btn green" style="padding:10px 14px;font-size:14px" onclick="dl(${f.id},this)">⬇ تحميل</button></div>`).join("");
 }
-function pick(i){sel={stage:i,subject:null,teacher:null,type:null};render()}
+function renderSearch(v){
+  const stages=LIB.map(s=>s.name), subs=[...new Set(LIB.flatMap(s=>s.subjects.map(j=>j.name)))], tch=[...new Set(LIB.flatMap(s=>s.subjects.flatMap(j=>j.teachers.map(t=>t.name))))];
+  const opt=(arr,cur,all)=>`<option value="">${all}</option>`+arr.map(x=>`<option value="${esc(x)}"${x===cur?" selected":""}>${esc(x)}</option>`).join("");
+  const sty='style="width:100%;margin-bottom:8px;padding:12px;border-radius:16px;border:2px solid var(--shadow);background:var(--sec);color:var(--tx);font:inherit"';
+  v.innerHTML=`<div class="pill" onclick="sel.search=false;render()">‹ رجوع</div><div class="top"><h1>🔍 بحث في الملازم</h1></div>
+   <input id="sq" ${sty} placeholder="🔎 مادة، أستاذ، عنوان، سنة، نوع..." value="${esc(SR.q)}" oninput="srGo()">
+   <select id="sf1" ${sty} onchange="srGo()">${opt(stages,SR.stage,"🎓 كل المراحل")}</select>
+   <select id="sf2" ${sty} onchange="srGo()">${opt(subs,SR.subject,"📖 كل المواد")}</select>
+   <select id="sf3" ${sty} onchange="srGo()">${opt(tch,SR.teacher,"👨‍🏫 كل الأساتذة")}</select>
+   <div id="sres"></div>`;
+  srRun();
+}
+function srGo(){SR.q=$("sq").value;SR.stage=$("sf1").value;SR.subject=$("sf2").value;SR.teacher=$("sf3").value;clearTimeout(srT);srT=setTimeout(srRun,350)}
+async function srRun(){
+  const box=$("sres"); if(!box)return;
+  if(!SR.q.trim()&&!SR.stage&&!SR.subject&&!SR.teacher){box.innerHTML='<div class="empty">✍️ اكتب كلمة للبحث أو اختر مادة/مرحلة/أستاذ.</div>';return}
+  box.innerHTML='<div class="empty">⏳ جاري البحث...</div>';
+  const mine={...SR};
+  try{
+    const r=await api("search",mine);
+    if(JSON.stringify(mine)!==JSON.stringify(SR))return;
+    box.innerHTML=r.files.length?`<h2>📄 النتائج (${r.total})</h2>`+r.files.map(f=>`<div class="row"><span>📄 ${esc(f.title)}<br><small>🎓 ${esc(f.stage)} · 📖 ${esc(f.subject)} · 🗂 ${esc(f.type)}</small></span><button class="btn green" style="padding:10px 14px;font-size:14px" onclick="dl(${f.id},this)">⬇ تحميل</button></div>`).join(""):'<div class="empty">😕 لا توجد نتائج. جرّب كلمات أقل.</div>';
+  }catch(e){box.innerHTML='<div class="empty">❌ '+esc(e.message)+'</div>'}
+}
+function pick(i){sel={stage:i,subject:null,teacher:null,type:null,search:false};render()}
 function pickSub(i){sel.subject=i;sel.teacher=null;sel.type=null;render()}
 function pickT(i){sel.teacher=i;sel.type=null;render()}
 function pickY(i){sel.type=i;render()}
