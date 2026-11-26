@@ -1903,8 +1903,16 @@ async def stamp_input(update, ctx, act):
         fid = None
         if msg.photo:
             fid = msg.photo[-1].file_id
-        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-            fid = msg.document.file_id
+        elif msg.sticker and not getattr(msg.sticker, "is_animated", False) and not getattr(msg.sticker, "is_video", False):
+            fid = msg.sticker.file_id
+        elif msg.document:
+            dn = (msg.document.file_name or "").lower()
+            if (msg.document.mime_type or "").startswith("image/") or dn.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic")):
+                fid = msg.document.file_id
+            else:
+                ctx.user_data["admin_wait"] = act
+                await msg.reply_text("هذا ليس ملف صورة (%s). أرسل PNG أو JPG." % (msg.document.mime_type or dn or "؟"))
+                return True
         if not fid:
             ctx.user_data["admin_wait"] = act
             await msg.reply_text("أرسل صورة (PNG أو JPG) وليس نصاً.")
@@ -1912,10 +1920,10 @@ async def stamp_input(update, ctx, act):
         try:
             data = await fetch_file(ctx, fid)
             png = await asyncio.to_thread(prep_stamp_image, data)
-        except Exception:
+        except Exception as e:
             log.exception("stamp image")
             ctx.user_data["admin_wait"] = act
-            await msg.reply_text("تعذّرت قراءة الصورة، أرسل صورة PNG أو JPG أخرى.")
+            await msg.reply_text("تعذّرت قراءة الصورة (%s: %s). أرسل صورة PNG أو JPG أخرى." % (type(e).__name__, str(e)[:120]))
             return True
         import base64 as b64
         store.set("stamp_img_" + slot, b64.b64encode(png).decode())
@@ -3023,6 +3031,11 @@ async def serve(url):
         (r"/api/(\w+)", ApiH),
     ], tgapp=app)
     web.listen(int(os.environ.get("PORT", "10000")), address="0.0.0.0")
+    try:
+        import PIL, pypdf, reportlab
+        log.info("stamp libs ok: PIL %s pypdf %s reportlab %s", PIL.__version__, pypdf.__version__, reportlab.Version)
+    except Exception:
+        log.exception("stamp libs missing")
     log.info("web server + webhook up")
     await asyncio.Event().wait()
 
