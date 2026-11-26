@@ -2045,10 +2045,13 @@ AI_PROMPT = ("This is a first or last page of a study handout PDF. Is the page M
 
 async def ai_promo(jpeg):
     """'p' / 'n', or None when AI is unavailable (quota)."""
+    if time.time() < AIST.get("off_until", 0):
+        return None
     try:
         t = await gemini([img_part(jpeg), {"text": AI_PROMPT}], system="", temperature=0, max_tokens=200, fast=True)
     except Exception as e:
         log.warning("ai promo unavailable: %s", str(e)[:80])
+        AIST["off_until"] = time.time() + 600
         return None
     return "p" if t.strip().upper().startswith("P") else "n"
 
@@ -2107,9 +2110,11 @@ def old_menu():
     t = (f"🧹 استبدال الأختام اليدوية القديمة\n"
          f"النماذج المحفوظة: {n}\n\n"
          "يُحذف تلقائياً فقط: (1) صفحة أولى/أخيرة نصية فيها @ أو t.me مع كلام قليل (إعلان)، (2) صفحة صورة تشبه نموذجاً أكّدته، (3) صفحة صورة يحكم الذكاء أنها إعلان بدون محتوى دراسي. "
-         "الصفحة التي فيها @ لكن لها محتوى حقيقي تُعرض للمراجعة فقط ولا تُحذف. بعد الحذف يوضع الختم الجديد. التسلسل الآمن: أضف نماذج ← فحص ← تجربة على ملف ← تطبيق. ويمكن التراجع.")
+         "الصفحة التي فيها @ لكن لها محتوى حقيقي تُترك. لا تُحذف إلا الصفحة الأولى/الأخيرة. بعد الحذف يوضع الختم الجديد. التسلسل الآمن: أضف نماذج ← فحص ← تجربة على ملف ← تطبيق. ويمكن التراجع.")
     kb = M([
-        [hb("🔎 اكتشاف الأختام القديمة تلقائياً", "k:o:c")],
+        [hb("🤖 تشغيل تلقائي الآن (فحص + حذف + ختم)", "k:o:auto")],
+        [hb(("✅ " if store.get("old_auto", "1") == "1" else "⬜ ") + "تلقائي للملازم الجديدة", "k:o:ao")],
+        [hb("🔎 مراجعة الأشكال المتكررة يدوياً", "k:o:c")],
         [hb("➕ إضافة نموذج يدوي", "k:o:a"), hb(f"🗑 مسح النماذج ({n})", "k:o:dx")],
         [hb("🔍 فحص (بدون تغيير)", "k:o:d")],
         [hb(("✅ " if store.get("old_ai", "1") == "1" else "⬜ ") + "فحص صفحات الصور بالذكاء (@ / إعلان)", "k:o:ai")],
@@ -2185,6 +2190,11 @@ async def old_scan(ctx, chat, mid, after):
             await old_dry(ctx, chat)
         elif after == "c":
             await old_cands(ctx, chat)
+        elif after == "auto":
+            ad, rj, un = await old_auto_adopt(ctx)
+            await ctx.bot.send_message(chat, f"🤖 الأشكال المتكررة: اعتُمد {ad} · رُفض {rj} · غير محسوم (تُركت) {un}")
+            m = await ctx.bot.send_message(chat, "⏳ جاري الاستبدال...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
+            await old_apply(ctx, m.chat_id, m.message_id)
     except Exception:
         log.exception("old after-scan")
 
@@ -2220,18 +2230,15 @@ async def old_dry(ctx, chat):
     if len(hits) > 15:
         t += f"… و{len(hits) - 15} أخرى\n"
     if rv:
-        t += f"\n👀 للمراجعة فقط (فيها @ أو t.me لكن لها محتوى حقيقي، لن تُحذف): {len(rv)}\n"
-        for hid, title in rv[:8]:
-            t += f"• {trim(title, 40)}\n"
+        t += f"\nتُركت دون حذف (فيها @ لكن لها محتوى حقيقي): {len(rv)}\n"
     if not AIST["on"]:
         t += "\n⚠️ حصة الذكاء امتلأت أثناء الفحص: بعض الصفحات الصورية لم تُفحص بالذكاء. أعد 🔍 فحص لاحقاً لإكمالها.\n"
     t += "\nالخطوة التالية: 🧪 تجربة على ملف ثم ▶️ تطبيق."
     await ctx.bot.send_message(chat, t)
 
-async def old_cands(ctx, chat):
-    """Cluster identical-looking image-only first/last pages that repeat across files."""
+def old_clusters(minfiles=3, limit=8):
     rows = hq("SELECT fid, sf, sl FROM h_sig")
-    cl = []   # [sig, set(fids), kind-counts]
+    cl = []
     for fid, a, b in rows:
         for sg, kind in ((a, "أولى"), (b, "أخيرة")):
             if not sg:
@@ -2243,7 +2250,7 @@ async def old_cands(ctx, chat):
                     break
             else:
                 cl.append({"sig": sg, "fids": {fid}, "k": {kind: 1}})
-    cl = [c for c in cl if len(c["fids"]) >= 3]
+    cl = [c for c in cl if len(c["fids"]) >= minfiles]
     cl.sort(key=lambda c: -len(c["fids"]))
     refs = old_refs()
     no = []
@@ -2251,7 +2258,46 @@ async def old_cands(ctx, chat):
         no = json.loads(store.get("old_no", "") or "[]")
     except Exception:
         pass
-    cl = [c for c in cl if not old_match(c["sig"], refs)[1] and not any(sig_dist(c["sig"], z) <= 12 for z in no)][:8]
+    return [c for c in cl if not old_match(c["sig"], refs)[1] and not any(sig_dist(c["sig"], z) <= 12 for z in no)][:limit]
+
+async def old_cluster_jpeg(ctx, c):
+    fid = next(iter(c["fids"]))
+    data = await fetch_file(ctx, fid)
+    from pypdf import PdfReader
+    r = PdfReader(io.BytesIO(data))
+    pg = r.pages[0] if "أولى" in c["k"] else r.pages[len(r.pages) - 1]
+    return page_jpeg(pg)
+
+async def old_auto_adopt(ctx):
+    """Auto mode: a repeating image page becomes an old-stamp shape only if the AI judges it promo-only. Returns (adopted, rejected, unknown)."""
+    ad = rj = un = 0
+    for c in old_clusters(3, 8):
+        try:
+            j = await old_cluster_jpeg(ctx, c)
+            v = await ai_promo(j) if j else None
+        except Exception:
+            v = None
+        if v == "p":
+            refs = old_refs()
+            refs.append({"s": c["sig"], "n": f"auto{len(refs) + 1}"})
+            store.set("old_refs", json.dumps(refs[-40:]))
+            ad += 1
+        elif v == "n":
+            try:
+                no = json.loads(store.get("old_no", "") or "[]")
+            except Exception:
+                no = []
+            no.append(c["sig"])
+            store.set("old_no", json.dumps(no[-60:]))
+            rj += 1
+        else:
+            un += 1
+        await asyncio.sleep(0.5)
+    return ad, rj, un
+
+async def old_cands(ctx, chat):
+    """Manual review of repeating image-only first/last pages."""
+    cl = old_clusters(3, 8)
     if not cl:
         await ctx.bot.send_message(chat, "ما لقيت صفحات صورة متكررة (3 ملفات فأكثر) غير مغطاة بالنماذج.")
         return
@@ -2356,6 +2402,25 @@ async def old_apply(ctx, chat, mid):
         backup_soon()
         await show(True)
 
+async def old_auto_ingest(ctx, rec):
+    """New handout: remove a stamp/promo FIRST/LAST page automatically (never other pages). Silent on any doubt."""
+    try:
+        if store.get("old_auto", "1") != "1" or int(rec.get("fsize", 0) or 0) > MAX_DL:
+            return ""
+        async with STAMP_LOCK:
+            data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
+            res = await asyncio.wait_for(old_fix_one(ctx, data, None, live_ai=True), 120)
+            del data
+            if not res:
+                return ""
+            cleaned, _, mf, ml = res
+            rec["fid"] = await store_doc(ctx.bot, cleaned, rec.get("fname") or "handout.pdf")
+        rec["old_removed"] = (1 if mf else 0) + (1 if ml else 0)
+        return "🧽 حُذفت صفحة إعلان/ختم قديم.\n"
+    except Exception as e:
+        log.warning("old auto ingest failed: %r", e)
+        return ""
+
 async def old_cb(q, ctx, parts):
     x = parts[2] if len(parts) > 2 else ""
     chat = q.message.chat_id
@@ -2366,6 +2431,15 @@ async def old_cb(q, ctx, parts):
     if x == "dx":
         store.set("old_refs", "[]")
         OLDST["tested"] = False
+    elif x == "ao":
+        store.set("old_auto", "0" if store.get("old_auto", "1") == "1" else "1")
+    elif x == "auto":
+        if OLDJOB["run"]:
+            await q.message.reply_text("⏳ هناك عملية جارية.")
+            return
+        m = await q.message.reply_text("⏳ جاري فحص الملازم...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
+        asyncio.create_task(old_scan(ctx, m.chat_id, m.message_id, "auto"))
+        return
     elif x == "ai":
         store.set("old_ai", "0" if store.get("old_ai", "1") == "1" else "1")
     elif x == "c":
@@ -2605,6 +2679,7 @@ async def ing_finalize(status, rec, ctx):
         cleanup_empty(jid)
         await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {dup[1]}")
         return
+    rec["note"] = rec.get("note", "") + await old_auto_ingest(ctx, rec)
     rec["note"] = rec.get("note", "") + await apply_stamp(ctx, rec)
     hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
@@ -2723,6 +2798,7 @@ async def bulk_save(rec, ctx):
     if dup:
         cleanup_empty(jid)
         return "dup"
+    await old_auto_ingest(ctx, rec)
     await apply_stamp(ctx, rec)
     hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
