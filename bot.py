@@ -779,15 +779,32 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- main ----------------
 
+async def keepalive():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    await asyncio.sleep(60)
+    async with httpx.AsyncClient(timeout=30) as c:
+        while True:
+            try:
+                await c.get(url + "/health")
+            except Exception as e:
+                log.warning("keepalive failed: %s", e)
+            await asyncio.sleep(540)
+
 async def post_init(app):
     global store, APP
     APP = app
     await restore_backup(app)
     store = Store(DB_PATH)
     asyncio.create_task(backup_loop())
+    asyncio.create_task(keepalive())
+
+async def on_error(update, ctx):
+    log.warning("handler error: %r", ctx.error)
 
 def build_app():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^a:"))
@@ -795,6 +812,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
     return app
 
 if __name__ == "__main__":
