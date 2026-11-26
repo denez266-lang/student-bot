@@ -50,7 +50,7 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
-        for col in ("teacher TEXT", "file_uid TEXT"):
+        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT"):
             try:
                 self.q("ALTER TABLE h_files ADD COLUMN " + col)
             except sqlite3.OperationalError:
@@ -740,7 +740,8 @@ def screen(name):
             [B("📊 الإحصائيات", callback_data="a:stats"), B("👥 المستخدمون", callback_data="a:users")],
             [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
             [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
-            [B("📚 إدارة الملازم", callback_data="a:hm"), B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("📚 إدارة الملازم", callback_data="a:hm"), B("📝 كليشة الملازم", callback_data="a:cfoot")],
+            [B("💾 نسخة احتياطية", callback_data="a:backup")],
             [B("🏠 قائمة الطالب", callback_data="m:menu")],
         ]
         return "🎛 لوحة الأدمن", M(rows)
@@ -798,6 +799,7 @@ WAIT_PROMPTS = {
     "gch": "📺 أرسل يوزر القناة مثل @mychannel (البوت مشرف فيها).",
     "gmsg": "✏️ أرسل نص رسالة الاشتراك. أرسل - للافتراضية.",
     "maintmsg": "✏️ أرسل نص رسالة الصيانة. أرسل - للافتراضية.",
+    "cfoot": "📝 أرسل كليشة الملازم: النص الذي يظهر أسفل وصف كل ملزمة (يمكن عدة أسطر، ويوزر @ وروابط تعمل بالضغط). أرسل - لحذفها.",
     "ban": "🚫 أرسل آيدي المستخدم (رقم) لحظره.",
     "unban": "✅ أرسل آيدي المستخدم (رقم) لفك حظره.",
 }
@@ -837,6 +839,9 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["admin_wait"] = act
         back = {"bc": "main", "welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}.get(act, "users")
         t, kb = WAIT_PROMPTS[act], back_admin(back)
+        if act == "cfoot":
+            cur = (s.get("h_footer", "") or "").strip()
+            t += "\n\nالكليشة الحالية:\n" + (cur or "(لا توجد)")
     elif act == "tmaint":
         s.set("maintenance", "0" if s.on("maintenance") else "1")
         t, kb = screen("settings")
@@ -918,9 +923,9 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         title, fid, kind, jid = r[0]
         try:
             if kind == "photo":
-                await q.message.reply_photo(fid, caption=f"📄 {title}")
+                await q.message.reply_photo(fid, caption=hcaption(hid) or f"📄 {title}")
             else:
-                await q.message.reply_document(fid, caption=f"📄 {title}")
+                await q.message.reply_document(fid, caption=hcaption(hid) or f"📄 {title}")
         except Exception:
             log.exception("send handout failed")
             await q.message.reply_text("تعذر إرسال الملف حالياً، حاول لاحقاً.")
@@ -1020,9 +1025,9 @@ async def hadmin_cb(q, ctx, act):
         r = hq("SELECT title, file_id, kind FROM h_files WHERE id=?", (int(parts[1]),))
         if r:
             if r[0][2] == "photo":
-                await q.message.reply_photo(r[0][1], caption=r[0][0])
+                await q.message.reply_photo(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
             else:
-                await q.message.reply_document(r[0][1], caption=r[0][0])
+                await q.message.reply_document(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
     elif a == "hrt":
         ctx.user_data["admin_wait"] = f"hrnt:{parts[1]}"
         await hshow(q, "✏️ أرسل العنوان الجديد.", M([[hb("🔙 رجوع", f"a:hh:{parts[1]}")]]))
@@ -1135,6 +1140,10 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
         await msg.reply_text(f"✅ انتهت الإذاعة\nنجح: {ok}\nفشل: {fail}", reply_markup=back_admin())
         return True
+    if act == "cfoot":
+        s.set("h_footer", "" if text == "-" else (msg.text or "").strip()[:700])
+        await msg.reply_text("✅ تم حفظ كليشة الملازم." if text != "-" else "🗑 تم حذف الكليشة.", reply_markup=back_admin("main"))
+        return True
     if act in ("welcome", "gmsg", "maintmsg"):
         key = {"welcome": "welcome", "gmsg": "gate_msg", "maintmsg": "maintenance_msg"}[act]
         s.set(key, "" if text == "-" else text)
@@ -1165,6 +1174,43 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🚫 تم الحظر." if act == "ban" else "✅ تم فك الحظر.", reply_markup=back_admin("users"))
         return True
     return False
+
+# ---------------- handout caption ----------------
+def stage_for(stage):
+    st = (stage or "").strip()
+    if re.search(r"(الإعدادي|الاعدادي)\s+(العلمي|الأدبي|الادبي)", st):
+        st = re.sub(r"\s*(الإعدادي|الاعدادي)", "", st)
+    st = re.sub(r"^ال", "لل", st) if st.startswith("ال") else "ل" + st
+    return st
+
+def hcaption(hid):
+    r = hq("SELECT f.title, f.teacher, f.year, f.quality, j.name, s.name FROM h_files f "
+           "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
+    if not r:
+        return ""
+    title, teacher, year, quality, subj, stage = [(x or "").strip() for x in r[0]]
+    base = title
+    if teacher and base.endswith(f" - أ. {teacher}"):
+        base = base[: -len(f" - أ. {teacher}")].strip()
+    if subj and nrm(subj) not in nrm(base):
+        base = f"{base} - {subj}"
+    lines = [f"💡➖ {base}", f"⭕️➖ {stage_for(stage)}"]
+    if teacher:
+        lines.append(f"🛎➖ للاستاذ {teacher}")
+    if year:
+        lines.append(f"✏️➖ لسنــــة : {year}")
+    if quality:
+        lines.append(f"✅➖ دقة : {quality}")
+    head = "\n".join(lines)
+    foot = (store.get("h_footer", "") or "").strip()
+    if not foot:
+        return head[:1024]
+    room = 1024 - len(head) - 2
+    if room < 10:
+        return head[:1024]
+    if len(foot) > room:
+        foot = foot[: room - 1] + "…"
+    return head + "\n\n" + foot
 
 # ---------------- auto handout ingest (admin sends a PDF, AI files it) ----------------
 ING_LOCK = asyncio.Lock()
@@ -1263,11 +1309,14 @@ async def analyze_pdf(ctx, doc, caption):
         "المرحلة بصيغة مثل: السادس الإعدادي العلمي، الثالث المتوسط، الرابع الإعدادي. "
         "المادة مثل: الفيزياء، الرياضيات. اسم المدرّس بدون لقب (بدون أ. أو الأستاذ). "
         "العنوان هو عنوان الملزمة فقط مثل «ملزمة الفصل الأول» أو «أسئلة وزارية» بدون اسم المدرّس وبدون المرحلة. "
-        "لا تخمّن: إذا لم تجد قيمة بوضوح اتركها نصاً فارغاً.\n"
-        'الصيغة: {"stage":"","subject":"","teacher":"","title":""}'
+        "السنة year: سنة أو دورة الملزمة كما هي مكتوبة فعلاً (مثل 2027 أو 2026-2027). "
+        "الدقة quality: فقط إذا كُتبت صراحةً في الوصف أو اسم الملف (مثل سكنر، نسخة أصلية). "
+        "لا تخمّن ولا تخترع: إذا لم تجد قيمة مكتوبة بوضوح (خصوصاً المدرّس والسنة) اتركها نصاً فارغاً.\n"
+        'الصيغة: {"stage":"","subject":"","teacher":"","title":"","year":"","quality":""}'
     )
     parts = [{"text": prompt}]
     size = doc.file_size or 0
+    text, small, scanned = "", None, False
     if size and size <= MAX_DL:
         data = await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
         try:
@@ -1276,6 +1325,7 @@ async def analyze_pdf(ctx, doc, caption):
             log.exception("pdf_head failed")
             text, small = "", None
         del data
+        scanned = not text
         if text:
             parts.append({"text": "نص أول صفحات الملف:\n" + text})
         elif small:
@@ -1283,7 +1333,14 @@ async def analyze_pdf(ctx, doc, caption):
     out = await asyncio.wait_for(gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024, fast=True), 45)
     m = re.search(r"\{.*\}", out, re.S)
     d = json.loads(m.group(0)) if m else {}
-    return {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title")}
+    res = {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title", "year", "quality")}
+    if res["year"] and not small:   # no visual source: the year must really appear in the name, caption or text
+        src = f"{doc.file_name or ''} {caption or ''} {text}"
+        if not all(y in src for y in re.findall(r"\d{4}", res["year"])) or not re.search(r"\d{4}", res["year"]):
+            res["year"] = ""
+    if not res["quality"] and scanned:
+        res["quality"] = "سكنر"
+    return res
 
 SUBJ_KW = [("انكليزي", "اللغة الإنكليزية"), ("انجليزي", "اللغة الإنكليزية"), ("english", "اللغة الإنكليزية"),
            ("عربي", "اللغة العربية"), ("فيزياء", "الفيزياء"), ("كيمياء", "الكيمياء"), ("رياضيات", "الرياضيات"),
@@ -1294,7 +1351,12 @@ ORD = ["الاول", "الثاني", "الثالث", "الرابع", "الخام
 def guess_from_name(name, caption):
     raw = f"{stem(name)} {caption or ''}"
     n = nrm(raw.replace("_", " ").replace("-", " "))
-    g = {"stage": "", "subject": "", "teacher": "", "title": ""}
+    g = {"stage": "", "subject": "", "teacher": "", "title": "", "year": "", "quality": ""}
+    ym = re.search(r"(20\d\d)(?:\s*[-/]\s*(20\d\d))?", raw)
+    if ym:
+        g["year"] = ym.group(0).replace(" ", "")
+    if re.search(r"سكنر|سكانر|scan", raw, re.I):
+        g["quality"] = "سكنر"
     for sid, sname in hq("SELECT id, name FROM h_subjects ORDER BY id"):
         if nrm(sname) and nrm(sname) in n:
             g["subject"] = sname
@@ -1327,12 +1389,12 @@ def guess_from_name(name, caption):
     return g
 
 def ing_summary(hid):
-    r = hq("SELECT f.title, f.teacher, j.name, s.name FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
+    r = hq("SELECT f.title, f.teacher, j.name, s.name, f.year, f.quality FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
            "JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
     if not r:
         return None, None
-    title, teacher, subj, stage = r[0]
-    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}"
+    title, teacher, subj, stage, year, quality = r[0]
+    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}\n📅 السنة: {year or 'غير محددة'} › 🔎 الدقة: {quality or 'غير محددة'}"
     kb = M([[hb("✏️ تعديل", f"i:e:{hid}"), hb("🗑 حذف", f"i:d:{hid}")]])
     return text, kb
 
@@ -1365,8 +1427,8 @@ async def ing_finalize(status, rec, ctx):
             await status.edit_text(f"⚠️ موجودة مسبقاً، لم أكررها:\n📄 {title}",
                                    reply_markup=M([[hb("➕ أضفها رغم ذلك", "i:f")]]))
             return
-    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid) VALUES(?,?,?,?,?,?,?)",
-       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"]), False)
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality) VALUES(?,?,?,?,?,?,?,?,?)",
+       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", "")), False)
     backup_soon()
     hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
     PENDING.pop(status.message_id, None)
@@ -1378,7 +1440,7 @@ async def ingest_pdf(update, ctx):
     doc = msg.document
     cap = (msg.caption or "").strip()
     status = await msg.reply_text(f"⏳ جاري قراءة: {trim(doc.file_name or 'ملف', 50)}")
-    info = {"stage": "", "subject": "", "teacher": "", "title": ""}
+    info = {"stage": "", "subject": "", "teacher": "", "title": "", "year": "", "quality": ""}
     note = ""
     try:
         async with ING_LOCK:
@@ -1449,11 +1511,12 @@ async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_reply_markup(M([
             [hb("✏️ العنوان", f"i:w:title:{hid}"), hb("👨‍🏫 المعلم", f"i:w:teacher:{hid}")],
             [hb("🎓 المرحلة", f"i:w:stage:{hid}"), hb("📘 المادة", f"i:w:subject:{hid}")],
+            [hb("📅 السنة", f"i:w:year:{hid}"), hb("🔎 الدقة", f"i:w:quality:{hid}")],
             [hb("🔙 رجوع", f"i:b:{hid}")]]))
     elif a == "w":
         field, hid = parts[2], int(parts[3])
         ctx.user_data["admin_wait"] = f"ie:{field}:{hid}"
-        names = {"title": "العنوان الجديد", "teacher": "اسم المعلم الجديد", "stage": "اسم المرحلة الجديد", "subject": "اسم المادة الجديد"}
+        names = {"title": "العنوان الجديد", "teacher": "اسم المعلم الجديد", "stage": "اسم المرحلة الجديد", "subject": "اسم المادة الجديد", "year": "السنة (مثل 2027، أو - للحذف)", "quality": "الدقة (مثل سكنر، أو - للحذف)"}
         await q.message.reply_text(f"✏️ أرسل {names[field]}:")
     elif a == "d":
         r = hq("SELECT title FROM h_files WHERE id=?", (hid,))
@@ -1482,7 +1545,9 @@ async def ing_edit_input(update, ctx, act):
         await msg.reply_text("أرسل نصاً صحيحاً، أو الملزمة محذوفة.")
         return True
     title, teacher, jid = r[0]
-    if field == "title":
+    if field in ("year", "quality"):
+        hq(f"UPDATE h_files SET {field}=? WHERE id=?", ("" if text == "-" else text, hid), False)
+    elif field == "title":
         hq("UPDATE h_files SET title=? WHERE id=?", (text, hid), False)
     elif field == "teacher":
         if teacher and teacher in title:
@@ -1648,9 +1713,9 @@ class ApiH(tornado.web.RequestHandler):
             title, fid, kind = r[0]
             try:
                 if kind == "photo":
-                    await tgapp.bot.send_photo(uid, fid, caption=f"📄 {title}")
+                    await tgapp.bot.send_photo(uid, fid, caption=hcaption(int(body.get("id", 0))) or f"📄 {title}")
                 else:
-                    await tgapp.bot.send_document(uid, fid, caption=f"📄 {title}")
+                    await tgapp.bot.send_document(uid, fid, caption=hcaption(int(body.get("id", 0))) or f"📄 {title}")
             except Exception:
                 log.exception("webapp send failed")
                 return self.fail(500, "تعذر الإرسال، اضغط /start في البوت أولاً")
