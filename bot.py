@@ -1829,6 +1829,7 @@ def stamp_menu():
         [hb("📏 الحجم: " + SIZE_LABEL[cfg["size"]], "k:z"), hb(f"🌫 الشفافية: {int(cfg['op'] * 100)}%", "k:o")],
         [hb("👁 معاينة", "k:v"), hb("🧪 جرّب على ملف PDF", "k:x")],
         [hb("♻️ ختم الملازم الموجودة", "k:r"), hb("🧹 إزالة الختم من الموجودة", "k:u")],
+        [hb("🧽 استبدال الأختام القديمة", "k:o:m")],
         [hb("🔙 رجوع", "a:main")]])
     return t, kb
 
@@ -1881,6 +1882,9 @@ async def stamp_cb(update, ctx):
     cfg = stamp_cfg()
     if a == "m":
         pass
+    elif a == "o":
+        await old_cb(q, ctx, parts)
+        return
     elif a == "i":
         ctx.user_data["admin_wait"] = "ksi:" + parts[2]
         extra = "\\nأرسل - لإلغاء صورة الأخيرة والعودة لنفس صورة الأولى." if parts[2] == "l" else ""
@@ -1929,8 +1933,486 @@ async def stamp_cb(update, ctx):
     except Exception:
         await q.message.reply_text(t, reply_markup=kb)
 
+# ---------------- old manual stamp pages: detect and replace ----------------
+OLD_HAM = 24          # max differing bits (of 256) to count as the same old-stamp page
+OLDJOB = {"run": False, "stop": False}
+OLDC = {}             # candidate idx -> {"sig","count","fids"}
+OLDST = {"tested": False}
+
+def img_sig(pim):
+    g = pim.convert("L").resize((17, 16))
+    px = list(g.getdata())
+    bits = 0
+    for r in range(16):
+        for c in range(16):
+            bits = (bits << 1) | (1 if px[r * 17 + c] > px[r * 17 + c + 1] else 0)
+    return "%064x:%.3f" % (bits, pim.width / max(1, pim.height))
+
+def sig_dist(a, b):
+    try:
+        ha, aa = a.split(":")
+        hb2, ab = b.split(":")
+        if abs(float(aa) - float(ab)) / max(float(ab), 0.01) > 0.15:
+            return 999
+        return bin(int(ha, 16) ^ int(hb2, 16)).count("1")
+    except Exception:
+        return 999
+
+def page_sig(page):
+    """Signature of the page's main image if the page is image-only (no text layer), else ''."""
+    try:
+        txt = (page.extract_text() or "").strip()
+    except Exception:
+        txt = ""
+    if len(txt) > 25:
+        return ""
+    best = None
+    try:
+        for im in list(page.images):
+            try:
+                p = im.image
+                a = p.width * p.height
+                if best is None or a > best[0]:
+                    best = (a, p)
+            except Exception:
+                continue
+    except Exception:
+        return ""
+    if not best or min(best[1].size) < 200:
+        return ""
+    return img_sig(best[1])
+
+def pdf_sigs(data):
+    from pypdf import PdfReader
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    sf = page_sig(r.pages[0]) if n else ""
+    sl = page_sig(r.pages[n - 1]) if n > 1 else ""
+    return n, sf, sl
+
+def old_refs():
+    try:
+        return json.loads(store.get("old_refs", "") or "[]")
+    except Exception:
+        return []
+
+def old_match(sig, refs=None):
+    """(best distance, matched?)"""
+    if not sig:
+        return 999, False
+    d = min([sig_dist(sig, r["s"]) for r in (refs if refs is not None else old_refs())] or [999])
+    return d, d <= OLD_HAM
+
+def clean_pdf(data, rm_first, rm_last):
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    drop = set()
+    if rm_first:
+        drop.add(0)
+    if rm_last and n > 1:
+        drop.add(n - 1)
+    if len(drop) >= n:
+        raise ValueError("would remove every page")
+    w = PdfWriter()
+    for i in range(n):
+        if i not in drop:
+            w.add_page(r.pages[i])
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue()
+
+def old_db_init():
+    hq("CREATE TABLE IF NOT EXISTS h_sig(fid TEXT PRIMARY KEY, pages INTEGER, sf TEXT, sl TEXT)", (), False)
+    for col in ("prev_fid TEXT", "prev_orig TEXT", "prev_st INTEGER"):
+        try:
+            hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
+        except Exception:
+            pass
+
+def src_fid(fid, stamped, orig):
+    return orig if (stamped and orig) else fid
+
+def old_menu():
+    n = len(old_refs())
+    t = (f"🧹 استبدال الأختام اليدوية القديمة\n"
+         f"النماذج المحفوظة: {n}\n\n"
+         "كيف يشتغل: أي صفحة أولى/أخيرة تكون صورة فقط (بدون نص) وتشبه أحد النماذج تُحذف، ثم يوضع الختم الجديد على الصفحات الحقيقية. "
+         "لا يُحذف شيء إلا بتطابق مع نموذج. التسلسل الآمن: أضف نماذج ← فحص ← تجربة على ملف ← تطبيق. ويمكن التراجع.")
+    kb = M([
+        [hb("🔎 اكتشاف الأختام القديمة تلقائياً", "k:o:c")],
+        [hb("➕ إضافة نموذج يدوي", "k:o:a"), hb(f"🗑 مسح النماذج ({n})", "k:o:dx")],
+        [hb("🔍 فحص (بدون تغيير)", "k:o:d")],
+        [hb("🧪 تجربة على ملف", "k:o:t"), hb("▶️ تطبيق على الكل", "k:o:g")],
+        [hb("↩️ تراجع عن الاستبدال", "k:o:u")],
+        [hb("🔙 رجوع", "k:m")]])
+    return t, kb
+
+async def old_scan(ctx, chat, mid, after):
+    """Compute and cache first/last page signatures for every library PDF (downloadable ones)."""
+    if OLDJOB["run"]:
+        return
+    OLDJOB.update(run=True, stop=False)
+    rows = hq("SELECT id, file_id, COALESCE(stamped,0), COALESCE(orig_fid,''), COALESCE(fsize,0) FROM h_files WHERE kind='document'")
+    todo = []
+    for hid, fid, st, orig, fs in rows:
+        sf = src_fid(fid, st, orig)
+        if (fs or 0) > MAX_DL:
+            continue
+        if not hq("SELECT 1 FROM h_sig WHERE fid=?", (sf,)):
+            todo.append(sf)
+    done, bad, last = 0, 0, 0.0
+    async def show(final=False):
+        nonlocal last
+        if not final and time.time() - last < 3:
+            return
+        try:
+            await ctx.bot.edit_message_text(f"{'✅ انتهى الفحص' if final else '⏳ فحص الملازم'} {done}/{len(todo)} · تعذّر {bad}", chat_id=chat, message_id=mid,
+                                            reply_markup=None if final else M([[hb("⛔ إيقاف", "k:o:s")]]))
+            last = time.time()
+        except Exception:
+            pass
+    try:
+        for sf in todo:
+            if OLDJOB["stop"]:
+                break
+            try:
+                data = await asyncio.wait_for(fetch_file(ctx, sf), 60)
+                n, a, b = await asyncio.wait_for(asyncio.to_thread(pdf_sigs, data), 90)
+                del data
+                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl) VALUES(?,?,?,?)", (sf, n, a, b), False)
+            except Exception as e:
+                bad += 1
+                log.warning("old scan failed: %r", e)
+                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl) VALUES(?,?,?,?)", (sf, 0, "", ""), False)
+            done += 1
+            await show()
+            await asyncio.sleep(0.3)
+    finally:
+        OLDJOB["run"] = False
+        backup_soon()
+        await show(True)
+    try:
+        if after == "d":
+            await old_dry(ctx, chat)
+        elif after == "c":
+            await old_cands(ctx, chat)
+    except Exception:
+        log.exception("old after-scan")
+
+def old_hits():
+    refs = old_refs()
+    out = []
+    for hid, title, fid, st, orig in hq("SELECT id, title, file_id, COALESCE(stamped,0), COALESCE(orig_fid,'') FROM h_files WHERE kind='document'"):
+        r = hq("SELECT pages, sf, sl FROM h_sig WHERE fid=?", (src_fid(fid, st, orig),))
+        if not r:
+            continue
+        n, a, b = r[0]
+        mf = old_match(a, refs)[1]
+        ml = old_match(b, refs)[1]
+        if mf or ml:
+            out.append((hid, title, mf, ml, n))
+    return out
+
+async def old_dry(ctx, chat):
+    if not old_refs():
+        await ctx.bot.send_message(chat, "أضف نموذجاً واحداً على الأقل أولاً.")
+        return
+    hits = old_hits()
+    nf = sum(1 for h in hits if h[2])
+    nl = sum(1 for h in hits if h[3])
+    total = hq("SELECT COUNT(*) FROM h_sig")[0][0]
+    t = f"🔍 نتيجة الفحص (لا تغيير): {len(hits)} ملزمة فيها ختم قديم من أصل {total} مفحوصة · صفحة أولى: {nf} · صفحة أخيرة: {nl}\n"
+    for hid, title, mf, ml, n in hits[:15]:
+        t += f"• {trim(title, 40)} ({'أولى' if mf else ''}{' + ' if mf and ml else ''}{'أخيرة' if ml else ''})\n"
+    if len(hits) > 15:
+        t += f"… و{len(hits) - 15} أخرى\n"
+    t += "\nالخطوة التالية: 🧪 تجربة على ملف ثم ▶️ تطبيق."
+    await ctx.bot.send_message(chat, t)
+
+async def old_cands(ctx, chat):
+    """Cluster identical-looking image-only first/last pages that repeat across files."""
+    rows = hq("SELECT fid, sf, sl FROM h_sig")
+    cl = []   # [sig, set(fids), kind-counts]
+    for fid, a, b in rows:
+        for sg, kind in ((a, "أولى"), (b, "أخيرة")):
+            if not sg:
+                continue
+            for c in cl:
+                if sig_dist(sg, c["sig"]) <= 12:
+                    c["fids"].add(fid)
+                    c["k"][kind] = c["k"].get(kind, 0) + 1
+                    break
+            else:
+                cl.append({"sig": sg, "fids": {fid}, "k": {kind: 1}})
+    cl = [c for c in cl if len(c["fids"]) >= 3]
+    cl.sort(key=lambda c: -len(c["fids"]))
+    refs = old_refs()
+    no = []
+    try:
+        no = json.loads(store.get("old_no", "") or "[]")
+    except Exception:
+        pass
+    cl = [c for c in cl if not old_match(c["sig"], refs)[1] and not any(sig_dist(c["sig"], z) <= 12 for z in no)][:8]
+    if not cl:
+        await ctx.bot.send_message(chat, "ما لقيت صفحات صورة متكررة (3 ملفات فأكثر) غير مغطاة بالنماذج.")
+        return
+    OLDC.clear()
+    await ctx.bot.send_message(chat, f"🔎 وجدت {len(cl)} شكل متكرر. اعتمد الأشكال التي هي ختم قديم فقط (الصفحات الحقيقية المصوّرة لا تتكرر عادةً):")
+    for i, c in enumerate(cl):
+        OLDC[i] = c
+        try:
+            fid = next(iter(c["fids"]))
+            data = await fetch_file(ctx, fid)
+            from pypdf import PdfReader
+            r = PdfReader(io.BytesIO(data))
+            pg = r.pages[0] if "أولى" in c["k"] else r.pages[len(r.pages) - 1]
+            best = max(list(pg.images), key=lambda im: im.image.width * im.image.height).image
+            best = best.convert("RGB")
+            best.thumbnail((500, 500))
+            bio = io.BytesIO()
+            best.save(bio, "JPEG", quality=70)
+            bio.seek(0)
+            ks = " + ".join(f"{k} {v}" for k, v in c["k"].items())
+            await ctx.bot.send_photo(chat, bio, caption=f"الشكل {i + 1}: يتكرر في {len(c['fids'])} ملف ({ks})",
+                                     reply_markup=M([[hb("✅ هذا ختم قديم", f"k:o:p:{i}"), hb("❌ لا", f"k:o:n:{i}")]]))
+        except Exception as e:
+            log.warning("cand thumb failed: %r", e)
+            await ctx.bot.send_message(chat, f"الشكل {i + 1}: يتكرر في {len(c['fids'])} ملف (تعذّر عرض الصورة)",
+                                       reply_markup=M([[hb("✅ هذا ختم قديم", f"k:o:p:{i}"), hb("❌ لا", f"k:o:n:{i}")]]))
+
+async def old_fix_one(ctx, data, cfg):
+    """Returns (cleaned_bytes, final_bytes_or_None, removed_first, removed_last) or None when nothing matches."""
+    n, a, b = await asyncio.to_thread(pdf_sigs, data)
+    refs = old_refs()
+    mf, ml = old_match(a, refs)[1], old_match(b, refs)[1]
+    if not (mf or ml):
+        return None
+    cleaned = await asyncio.to_thread(clean_pdf, data, mf, ml)
+    final = None
+    if cfg and cfg["on"]:
+        final, _ = await asyncio.to_thread(stamp_pdf, cleaned, cfg)
+    return cleaned, final, mf, ml
+
+async def old_apply(ctx, chat, mid):
+    if OLDJOB["run"]:
+        return
+    OLDJOB.update(run=True, stop=False)
+    hits = old_hits()
+    done, ok, fail, last = 0, 0, 0, 0.0
+    async def show(final=False):
+        nonlocal last
+        if not final and time.time() - last < 3:
+            return
+        try:
+            await ctx.bot.edit_message_text(f"{'✅ انتهى' if final else '⏳'} استبدال الأختام القديمة {done}/{len(hits)} · ✔ {ok} · ⚠️ {fail}", chat_id=chat, message_id=mid,
+                                            reply_markup=None if final else M([[hb("⛔ إيقاف", "k:o:s")]]))
+            last = time.time()
+        except Exception:
+            pass
+    try:
+        for hid, title, mf, ml, n in hits:
+            if OLDJOB["stop"]:
+                break
+            try:
+                fid, st, orig, fn = hq("SELECT file_id, COALESCE(stamped,0), COALESCE(orig_fid,''), COALESCE(fname,'') FROM h_files WHERE id=?", (hid,))[0]
+                cfg = stamp_cfg()
+                async with STAMP_LOCK:
+                    data = await asyncio.wait_for(fetch_file(ctx, src_fid(fid, st, orig)), 60)
+                    res = await asyncio.wait_for(old_fix_one(ctx, data, cfg), 240)
+                    del data
+                    if not res:
+                        fail += 1
+                        done += 1
+                        continue
+                    cleaned, final, _, _ = res
+                    fname = fn or "handout.pdf"
+                    cfid = await store_doc(ctx.bot, cleaned, fname)
+                    if final:
+                        ffid = await store_doc(ctx.bot, final, fname)
+                        hq("UPDATE h_files SET prev_fid=?, prev_orig=?, prev_st=?, file_id=?, orig_fid=?, stamped=1 WHERE id=?", (fid, orig, st, ffid, cfid, hid), False)
+                    else:
+                        hq("UPDATE h_files SET prev_fid=?, prev_orig=?, prev_st=?, file_id=?, orig_fid='', stamped=0 WHERE id=?", (fid, orig, st, cfid, hid), False)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                log.warning("old apply failed %s: %r", hid, e)
+            done += 1
+            await show()
+            await asyncio.sleep(0.5)
+    finally:
+        OLDJOB["run"] = False
+        backup_soon()
+        await show(True)
+
+async def old_cb(q, ctx, parts):
+    x = parts[2] if len(parts) > 2 else ""
+    chat = q.message.chat_id
+    if x == "a":
+        ctx.user_data["admin_wait"] = "kso:a"
+        await q.message.reply_text("➕ أرسل نموذج الختم القديم: (1) صورة الصفحة، أو (أفضل) (2) ملف PDF فيه الصفحة مع كتابة في التعليق: 1 إذا الختم أول صفحة، أو 0 إذا آخر صفحة. يمكنك إضافة عدة نماذج، واحداً بعد الآخر.")
+        return
+    if x == "dx":
+        store.set("old_refs", "[]")
+        OLDST["tested"] = False
+    elif x == "c":
+        if OLDJOB["run"]:
+            await q.message.reply_text("⏳ هناك عملية جارية.")
+            return
+        m = await q.message.reply_text("⏳ جاري فحص الملازم...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
+        asyncio.create_task(old_scan(ctx, m.chat_id, m.message_id, "c"))
+        return
+    elif x == "d":
+        if not old_refs():
+            await q.message.reply_text("أضف نموذجاً واحداً على الأقل أولاً.")
+            return
+        if OLDJOB["run"]:
+            await q.message.reply_text("⏳ هناك عملية جارية.")
+            return
+        m = await q.message.reply_text("⏳ جاري فحص الملازم...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
+        asyncio.create_task(old_scan(ctx, m.chat_id, m.message_id, "d"))
+        return
+    elif x == "t":
+        ctx.user_data["admin_wait"] = "kso:t"
+        await q.message.reply_text("🧪 أرسل ملف PDF فيه ختم قديم لأعالجه لك وأرجعه (لا يُحفظ في المكتبة).")
+        return
+    elif x == "p":
+        c = OLDC.get(int(parts[3]))
+        if c:
+            refs = old_refs()
+            refs.append({"s": c["sig"], "n": f"auto{len(refs) + 1}"})
+            store.set("old_refs", json.dumps(refs[-40:]))
+            await q.message.reply_text(f"✅ اعتُمد ختماً قديماً (المجموع {len(refs)}). بعد اعتماد كل الأشكال اضغط 🔍 فحص.")
+        return
+    elif x == "n":
+        c = OLDC.get(int(parts[3]))
+        if c:
+            try:
+                no = json.loads(store.get("old_no", "") or "[]")
+            except Exception:
+                no = []
+            no.append(c["sig"])
+            store.set("old_no", json.dumps(no[-60:]))
+            await q.message.reply_text("👍 تم، لن يظهر هذا الشكل مرة ثانية.")
+        return
+    elif x == "g":
+        if not OLDST["tested"]:
+            await q.message.reply_text("جرّب على ملف أولاً (🧪 تجربة على ملف) وتأكد أن النتيجة صحيحة.")
+            return
+        hits = old_hits()
+        if not hits:
+            await q.message.reply_text("لا توجد ملازم مطابقة في الفحص المحفوظ. شغّل 🔍 فحص أولاً.")
+            return
+        await q.message.reply_text(f"سيتم تعديل {len(hits)} ملزمة (حذف صفحة الختم القديم" + (" ووضع الختم الجديد" if (stamp_cfg() or {}).get("on") else "") + "). النسخة السابقة تبقى ويمكن التراجع. متأكد؟",
+                                   reply_markup=M([[hb("✅ نعم، طبّق", "k:o:g1"), hb("إلغاء", "k:o:m")]]))
+        return
+    elif x == "g1":
+        if OLDJOB["run"] or not OLDST["tested"]:
+            await q.message.reply_text("⏳ لا يمكن البدء الآن.")
+            return
+        m = await q.message.reply_text("⏳ جاري الاستبدال...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
+        asyncio.create_task(old_apply(ctx, m.chat_id, m.message_id))
+        return
+    elif x == "s":
+        OLDJOB["stop"] = True
+        return
+    elif x == "u":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(prev_fid,'')<>''")[0][0]
+        await q.message.reply_text(f"↩️ سيعاد الوضع السابق لـ {n} ملزمة (قبل الاستبدال). متأكد؟", reply_markup=M([[hb("✅ نعم، تراجع", "k:o:u1"), hb("إلغاء", "k:o:m")]]))
+        return
+    elif x == "u1":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(prev_fid,'')<>''")[0][0]
+        hq("UPDATE h_files SET file_id=prev_fid, orig_fid=COALESCE(prev_orig,''), stamped=COALESCE(prev_st,0), prev_fid='' WHERE COALESCE(prev_fid,'')<>''", (), False)
+        backup_soon()
+        await q.message.reply_text(f"↩️ أُعيدت {n} ملزمة لوضعها السابق.")
+        return
+    t, kb = old_menu()
+    try:
+        await q.message.edit_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
+
+async def old_input(update, ctx, act):
+    msg = update.message
+    chat = msg.chat_id
+    if act == "kso:a":
+        d = msg.document
+        cap = (msg.caption or "").strip()
+        try:
+            if d and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+                if cap not in ("0", "1"):
+                    ctx.user_data["admin_wait"] = act
+                    await msg.reply_text("أعد إرسال الـPDF مع كتابة 1 (الختم أول صفحة) أو 0 (آخر صفحة) في التعليق.")
+                    return True
+                data = await fetch_file(ctx, d.file_id)
+                from pypdf import PdfReader
+                r = PdfReader(io.BytesIO(data))
+                pg = r.pages[0] if cap == "1" else r.pages[len(r.pages) - 1]
+                sig = await asyncio.to_thread(page_sig, pg)
+                if not sig:
+                    ctx.user_data["admin_wait"] = act
+                    await msg.reply_text("هذه الصفحة ليست صورة فقط (فيها نص أو لا صورة قابلة للقراءة). أرسل ملفاً آخر أو صورة الصفحة.")
+                    return True
+            else:
+                fid = msg.photo[-1].file_id if msg.photo else (d.file_id if d and (d.mime_type or "").startswith("image/") else None)
+                if not fid:
+                    ctx.user_data["admin_wait"] = act
+                    await msg.reply_text("أرسل صورة أو PDF.")
+                    return True
+                data = await fetch_file(ctx, fid)
+                from PIL import Image
+                sig = await asyncio.to_thread(lambda: img_sig(Image.open(io.BytesIO(data))))
+        except Exception as e:
+            log.exception("old ref")
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("تعذّرت القراءة (%s: %s)." % (type(e).__name__, str(e)[:100]))
+            return True
+        refs = old_refs()
+        refs.append({"s": sig, "n": f"m{len(refs) + 1}"})
+        store.set("old_refs", json.dumps(refs[-40:]))
+        ctx.user_data["admin_wait"] = act
+        await msg.reply_text(f"✅ أُضيف النموذج (المجموع {len(refs)}). أرسل نموذجاً آخر، أو اضغط رجوع. (صورة الصفحة قد تختلف قليلاً عن صورتها داخل الـPDF، الـPDF أدق.)",
+                             reply_markup=M([[hb("🔙 قائمة الأختام القديمة", "k:o:m")]]))
+        return True
+    if act == "kso:t":
+        d = msg.document
+        if not d or not ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل ملف PDF.")
+            return True
+        if (d.file_size or 0) > MAX_DL:
+            await msg.reply_text("الملف أكبر من 20MB.")
+            return True
+        try:
+            data = await fetch_file(ctx, d.file_id)
+            n, a, b = await asyncio.to_thread(pdf_sigs, data)
+            da, ma = old_match(a)
+            db_, mb = old_match(b)
+            res = await old_fix_one(ctx, data, stamp_cfg()) if (ma or mb) else None
+        except Exception as e:
+            log.exception("old test")
+            await msg.reply_text("تعذّرت المعالجة (%s: %s)" % (type(e).__name__, str(e)[:100]))
+            return True
+        if not res:
+            fmt = lambda s, d_: ("ليست صورة فقط" if not s else f"فرق {d_}/256")
+            await msg.reply_text(f"ما لقيت ختماً قديماً يطابق النماذج. الصفحة الأولى: {fmt(a, da)} · الأخيرة: {fmt(b, db_)} (المطابقة تحتاج ≤ {OLD_HAM}). أضف نموذجاً أقرب.")
+            return True
+        cleaned, final, mf, ml = res
+        out = final or cleaned
+        OLDST["tested"] = True
+        await msg.reply_document(InputFile(io.BytesIO(out), filename="old_stamp_test.pdf"),
+                                 caption=f"🧪 حُذفت: {'الصفحة الأولى ' if mf else ''}{'الصفحة الأخيرة' if ml else ''} · الصفحات {n} ← {n - int(mf) - int(ml and n > 1)}" + (" · ووُضع الختم الجديد" if final else " · (الختم الجديد معطّل)") + "\nإذا النتيجة صحيحة اضغط ▶️ تطبيق على الكل من القائمة.")
+        return True
+    return True
+
 async def stamp_input(update, ctx, act):
     msg = update.message
+    if act.startswith("kso"):
+        return await old_input(update, ctx, act)
     if act.startswith("ksi:"):
         slot = act.split(":")[1]
         if slot == "l" and (msg.text or "").strip() == "-":
@@ -3051,6 +3533,7 @@ async def post_init(app):
     APP = app
     await restore_backup(app)
     store = Store(DB_PATH)
+    old_db_init()
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
     async def _ws():
