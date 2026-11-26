@@ -124,7 +124,7 @@ store = None
 
 _backup_dirty = False
 _last_backup = 0.0
-BACKUP_EVERY = 48 * 3600
+BACKUP_EVERY = 300   # silent; keeps settings/library across restarts (Render restarts lose anything newer than the last backup)
 APP = None
 
 def backup_soon():
@@ -134,7 +134,7 @@ def backup_soon():
 
 async def backup_loop():
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(120)
         try:
             if _backup_dirty and time.time() - _last_backup >= BACKUP_EVERY:
                 await do_backup()
@@ -2131,6 +2131,7 @@ async def bulk_one(item, st, ctx):
         st["review"].append(rec)
         return
     r = await bulk_save(rec, ctx)
+    log.info("bulk %s %s size=%s stamped=%s fail=%s", r, (rec.get("fname") or "")[:40], rec.get("fsize"), rec.get("stamped"), rec.get("stamp_fail"))
     st["ok" if r == "ok" else "dup"] += 1
     if r == "ok":
         if rec.get("stamped"):
@@ -3216,6 +3217,19 @@ async def serve(url):
     except Exception:
         log.exception("stamp libs missing")
     log.info("web server + webhook up")
+    import signal
+    async def _bye():
+        try:
+            if _backup_dirty:
+                await asyncio.wait_for(do_backup(), 20)
+                log.info("shutdown backup done")
+        except Exception:
+            log.exception("shutdown backup")
+        os._exit(0)
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_bye()))
+    except Exception:
+        log.exception("sigterm hook")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
