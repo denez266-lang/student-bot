@@ -172,7 +172,7 @@ def is_admin(update: Update):
 def tick(on):
     return "✅" if on else "❌"
 
-FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-2.5-flash-lite").split(",") if m.strip()]
+FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest").split(",") if m.strip()]
 
 async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     body = {
@@ -184,7 +184,7 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     models = [MODEL] + [m.strip() for m in FALLBACKS if m.strip() != MODEL]
     r = None
     async with httpx.AsyncClient(timeout=180) as c:
-        for attempt, m in enumerate(models + models[:1]):
+        for attempt, m in enumerate(models + models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
             try:
                 r = await c.post(url, params={"key": GKEY}, json=body)
@@ -197,7 +197,7 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
                 break
             log.warning("gemini %s (%s): %s", r.status_code, m, r.text[:200])
             if r.status_code in (429, 500, 503, 404):
-                await asyncio.sleep(2 * (attempt + 1))
+                await asyncio.sleep(1.5)
                 continue
             break
     if r is None or r.status_code != 200:
@@ -822,7 +822,6 @@ async def post_init(app):
     store = Store(DB_PATH)
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
-    asyncio.create_task(list_models())
 
 async def on_error(update, ctx):
     log.warning("handler error: %r", ctx.error)
