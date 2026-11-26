@@ -50,7 +50,7 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
-        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER"):
+        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER", "ftype TEXT"):
             try:
                 self.q("ALTER TABLE h_files ADD COLUMN " + col)
             except sqlite3.OperationalError:
@@ -907,13 +907,33 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = [[B(f"📖 {trim(r[1])} ({r[2]})", callback_data=f"h:j:{r[0]}")] for r in rows[:50]]
         kb.append([B("🔙 رجوع", callback_data="h:s")])
         await hshow(q, f"🎓 {st[0][0] if st else ''}\nاختر المادة:" if rows else "لا توجد مواد في هذه المرحلة بعد.", M(kb))
-    elif act == "j":
+    elif act in ("j", "r", "y"):
         jid = int(parts[2])
         j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
-        rows = hq("SELECT id, title FROM h_files WHERE subject_id=? ORDER BY id", (jid,))
-        kb = [[B(f"📄 {trim(r[1], 50)}", callback_data=f"h:d:{r[0]}")] for r in rows[:60]]
-        kb.append([B("🔙 رجوع", callback_data=f"h:t:{j[0][1]}" if j else "h:s")])
-        await hshow(q, f"📖 {j[0][0] if j else ''}\nاختر الملزمة لتصلك:" if rows else "لا توجد ملازم في هذه المادة بعد.", M(kb))
+        sname = j[0][0] if j else ""
+        tree = lib_tree(jid)
+        back_subj = f"h:t:{j[0][1]}" if j else "h:s"
+        if act == "j":
+            kb = [[B(f"👨‍🏫 {trim(t['name'], 40)} ({t['n']})", callback_data=f"h:r:{jid}:{t['id']}")] for t in tree[:50]]
+            kb.append([B("🔙 رجوع", callback_data=back_subj)])
+            await hshow(q, f"📖 {sname}\nاختر الأستاذ:" if tree else "لا توجد ملازم في هذه المادة بعد.", M(kb))
+            return
+        tch = next((t for t in tree if t["id"] == parts[3]), None)
+        if not tch:
+            await hshow(q, "لم يعد هذا القسم متوفراً.", M([[B("🔙 رجوع", callback_data=f"h:j:{jid}")]]))
+            return
+        if act == "r":
+            kb = [[B(f"🗂 {trim(y['name'], 40)} ({y['n']})", callback_data=f"h:y:{jid}:{tch['id']}:{y['id']}")] for y in tch["types"][:50]]
+            kb.append([B("🔙 رجوع", callback_data=f"h:j:{jid}")])
+            await hshow(q, f"👨‍🏫 {tch['name']} · {sname}\nاختر النوع:", M(kb))
+            return
+        ty = next((y for y in tch["types"] if y["id"] == parts[4]), None)
+        if not ty:
+            await hshow(q, "لم يعد هذا القسم متوفراً.", M([[B("🔙 رجوع", callback_data=f"h:r:{jid}:{tch['id']}")]]))
+            return
+        kb = [[B(f"📄 {trim(f['title'], 50)}", callback_data=f"h:d:{f['id']}")] for f in ty["files"][:60]]
+        kb.append([B("🔙 رجوع", callback_data=f"h:r:{jid}:{tch['id']}")])
+        await hshow(q, f"🗂 {ty['name']} · {tch['name']} · {sname}\nاختر الملف لتصلك:", M(kb))
     elif act == "d":
         hid = int(parts[2])
         r = hq("SELECT title, file_id, kind, subject_id FROM h_files WHERE id=?", (hid,))
@@ -1175,6 +1195,46 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return True
     return False
 
+# ---------------- handout library tree (stage > subject > teacher > type > files) ----------------
+TYPES = ["ملازم", "وزاريات", "أسئلة", "ملخصات", "اختبارات"]
+GENERAL = "عام"
+
+def classify_type(text):
+    n = nrm(text)
+    for kw, t in (("وزاري", "وزاريات"), ("اختبار", "اختبارات"), ("امتحان", "اختبارات"), ("كويز", "اختبارات"),
+                  ("سؤال", "أسئلة"), ("اسئل", "أسئلة"), ("ملخص", "ملخصات"), ("مختصر", "ملخصات")):
+        if kw in n:
+            return t
+    return "ملازم"
+
+def eff_teacher(teacher, title):
+    t = (teacher or "").strip()
+    if not t:
+        m = re.search(r" - أ\. (.+)$", title or "")
+        t = m.group(1).strip() if m else ""
+    return t or GENERAL
+
+def eff_type(ftype, title):
+    return (ftype or "").strip() or classify_type(title)
+
+def sid_of(name):
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:6]
+
+def lib_tree(jid):
+    """[{name, id, n, types:[{name, id, n, files:[{id,title}]}]}] for one subject."""
+    teachers = {}
+    for fid, title, teacher, ftype in store.q("SELECT id, title, teacher, ftype FROM h_files WHERE subject_id=? ORDER BY id", (jid,), fetch=True):
+        t = eff_teacher(teacher, title)
+        y = eff_type(ftype, title)
+        teachers.setdefault(t, {}).setdefault(y, []).append({"id": fid, "title": title})
+    out = []
+    for t in sorted(teachers, key=lambda x: (x == GENERAL, x)):
+        tys = teachers[t]
+        order = sorted(tys, key=lambda y: (TYPES.index(y) if y in TYPES else len(TYPES), y))
+        types = [{"name": y, "id": sid_of(y), "n": len(tys[y]), "files": tys[y]} for y in order]
+        out.append({"name": t, "id": sid_of(t), "n": sum(x["n"] for x in types), "types": types})
+    return out
+
 # ---------------- handout caption ----------------
 def stage_for(stage):
     st = (stage or "").strip()
@@ -1309,10 +1369,11 @@ async def analyze_pdf(ctx, doc, caption):
         "المرحلة بصيغة مثل: السادس الإعدادي العلمي، الثالث المتوسط، الرابع الإعدادي. "
         "المادة مثل: الفيزياء، الرياضيات. اسم المدرّس بدون لقب (بدون أ. أو الأستاذ). "
         "العنوان هو عنوان الملزمة فقط مثل «ملزمة الفصل الأول» أو «أسئلة وزارية» بدون اسم المدرّس وبدون المرحلة. "
+        "النوع type: واحد من (ملازم، وزاريات، أسئلة، ملخصات، اختبارات) حسب محتوى الملف، أو كلمة قصيرة أخرى إن لم ينطبق أي منها. "
         "السنة year: سنة أو دورة الملزمة كما هي مكتوبة فعلاً (مثل 2027 أو 2026-2027). "
         "الدقة quality: فقط إذا كُتبت صراحةً في الوصف أو اسم الملف (مثل سكنر، نسخة أصلية). "
         "لا تخمّن ولا تخترع: إذا لم تجد قيمة مكتوبة بوضوح (خصوصاً المدرّس والسنة) اتركها نصاً فارغاً.\n"
-        'الصيغة: {"stage":"","subject":"","teacher":"","title":"","year":"","quality":""}'
+        'الصيغة: {"stage":"","subject":"","teacher":"","title":"","type":"","year":"","quality":""}'
     )
     parts = [{"text": prompt}]
     size = doc.file_size or 0
@@ -1333,11 +1394,13 @@ async def analyze_pdf(ctx, doc, caption):
     out = await asyncio.wait_for(gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024, fast=True), 45)
     m = re.search(r"\{.*\}", out, re.S)
     d = json.loads(m.group(0)) if m else {}
-    res = {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title", "year", "quality")}
+    res = {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title", "type", "year", "quality")}
     if res["year"] and not small:   # no visual source: the year must really appear in the name, caption or text
         src = f"{doc.file_name or ''} {caption or ''} {text}"
         if not all(y in src for y in re.findall(r"\d{4}", res["year"])) or not re.search(r"\d{4}", res["year"]):
             res["year"] = ""
+    if not res["type"]:
+        res["type"] = classify_type(f"{res['title']} {doc.file_name or ''} {caption or ''}")
     if not res["quality"] and scanned:
         res["quality"] = "سكنر"
     return res
@@ -1351,7 +1414,7 @@ ORD = ["الاول", "الثاني", "الثالث", "الرابع", "الخام
 def guess_from_name(name, caption):
     raw = f"{stem(name)} {caption or ''}"
     n = nrm(raw.replace("_", " ").replace("-", " "))
-    g = {"stage": "", "subject": "", "teacher": "", "title": "", "year": "", "quality": ""}
+    g = {"stage": "", "subject": "", "teacher": "", "title": "", "type": classify_type(raw), "year": "", "quality": ""}
     ym = re.search(r"(20\d\d)(?:\s*[-/]\s*(20\d\d))?", raw)
     if ym:
         g["year"] = ym.group(0).replace(" ", "")
@@ -1389,12 +1452,12 @@ def guess_from_name(name, caption):
     return g
 
 def ing_summary(hid):
-    r = hq("SELECT f.title, f.teacher, j.name, s.name, f.year, f.quality FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
+    r = hq("SELECT f.title, f.teacher, j.name, s.name, f.year, f.quality, f.ftype FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
            "JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
     if not r:
         return None, None
-    title, teacher, subj, stage, year, quality = r[0]
-    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}\n📅 السنة: {year or 'غير محددة'} › 🔎 الدقة: {quality or 'غير محددة'}"
+    title, teacher, subj, stage, year, quality, ftype = r[0]
+    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}\n📅 السنة: {year or 'غير محددة'} › 🔎 الدقة: {quality or 'غير محددة'}\n🗂 النوع: {eff_type(ftype, title)}"
     kb = M([[hb("✏️ تعديل", f"i:e:{hid}"), hb("🗑 حذف", f"i:d:{hid}")]])
     return text, kb
 
@@ -1425,9 +1488,9 @@ async def ing_finalize(status, rec, ctx):
         cleanup_empty(jid)
         await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {dup[1]}")
         return
-    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
-        rec.get("fname", ""), int(rec.get("fsize", 0) or 0)), False)
+        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title)), False)
     backup_soon()
     hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
     PENDING.pop(status.message_id, None)
@@ -1451,7 +1514,7 @@ async def ingest_pdf(update, ctx):
     doc = msg.document
     cap = (msg.caption or "").strip()
     status = await msg.reply_text(f"⏳ جاري قراءة: {trim(doc.file_name or 'ملف', 50)}")
-    info = {"stage": "", "subject": "", "teacher": "", "title": "", "year": "", "quality": ""}
+    info = {"stage": "", "subject": "", "teacher": "", "title": "", "type": "", "year": "", "quality": ""}
     note = ""
     try:
         async with ING_LOCK:
@@ -1520,11 +1583,12 @@ async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [hb("✏️ العنوان", f"i:w:title:{hid}"), hb("👨‍🏫 المعلم", f"i:w:teacher:{hid}")],
             [hb("🎓 المرحلة", f"i:w:stage:{hid}"), hb("📘 المادة", f"i:w:subject:{hid}")],
             [hb("📅 السنة", f"i:w:year:{hid}"), hb("🔎 الدقة", f"i:w:quality:{hid}")],
+            [hb("🗂 النوع", f"i:w:type:{hid}")],
             [hb("🔙 رجوع", f"i:b:{hid}")]]))
     elif a == "w":
         field, hid = parts[2], int(parts[3])
         ctx.user_data["admin_wait"] = f"ie:{field}:{hid}"
-        names = {"title": "العنوان الجديد", "teacher": "اسم المعلم الجديد", "stage": "اسم المرحلة الجديد", "subject": "اسم المادة الجديد", "year": "السنة (مثل 2027، أو - للحذف)", "quality": "الدقة (مثل سكنر، أو - للحذف)"}
+        names = {"title": "العنوان الجديد", "teacher": "اسم المعلم الجديد", "stage": "اسم المرحلة الجديد", "subject": "اسم المادة الجديد", "year": "السنة (مثل 2027، أو - للحذف)", "quality": "الدقة (مثل سكنر، أو - للحذف)", "type": "النوع (ملازم، وزاريات، أسئلة، ملخصات، اختبارات، أو أي اسم)"}
         await q.message.reply_text(f"✏️ أرسل {names[field]}:")
     elif a == "d":
         r = hq("SELECT title FROM h_files WHERE id=?", (hid,))
@@ -1553,7 +1617,12 @@ async def ing_edit_input(update, ctx, act):
         await msg.reply_text("أرسل نصاً صحيحاً، أو الملزمة محذوفة.")
         return True
     title, teacher, jid = r[0]
-    if field in ("year", "quality"):
+    if not teacher:
+        e = eff_teacher("", title)
+        teacher = "" if e == GENERAL else e
+    if field == "type":
+        hq("UPDATE h_files SET ftype=? WHERE id=?", ("" if text == "-" else text, hid), False)
+    elif field in ("year", "quality"):
         hq(f"UPDATE h_files SET {field}=? WHERE id=?", ("" if text == "-" else text, hid), False)
     elif field == "title":
         hq("UPDATE h_files SET title=? WHERE id=?", (text, hid), False)
@@ -1708,9 +1777,8 @@ class ApiH(tornado.web.RequestHandler):
             for sid, sname in store.q("SELECT id,name FROM h_stages ORDER BY id", fetch=True):
                 subs = []
                 for jid, jname in store.q("SELECT id,name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,), fetch=True):
-                    files = [{"id": f[0], "title": f[1]} for f in
-                             store.q("SELECT id,title FROM h_files WHERE subject_id=? ORDER BY id", (jid,), fetch=True)]
-                    subs.append({"id": jid, "name": jname, "files": files})
+                    tch = lib_tree(jid)
+                    subs.append({"id": jid, "name": jname, "n": sum(t["n"] for t in tch), "teachers": tch})
                 out.append({"id": sid, "name": sname, "subjects": subs})
             store.event(uid, "webapp")
             return self.write({"stages": out})
