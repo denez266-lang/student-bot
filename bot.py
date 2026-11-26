@@ -2514,15 +2514,46 @@ def login_page(body, err=""):
 def html_esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
-def login_form(step):
+def sent_type_text(t):
+    n = type(t).__name__ if t is not None else ""
+    return {"SentCodeTypeApp": "داخل تطبيق تيليگرام (محادثة Telegram) على جهاز مسجّل بنفس الحساب",
+            "SentCodeTypeSms": "رسالة SMS", "SentCodeTypeCall": "مكالمة صوتية", "SentCodeTypeFlashCall": "مكالمة فلاش",
+            "SentCodeTypeMissedCall": "مكالمة فائتة (آخر أرقام الرقم هي الكود)", "SentCodeTypeFirebaseSms": "SMS عبر التطبيق",
+            "SentCodeTypeEmailCode": "بريد إلكتروني", "CodeTypeSms": "رسالة SMS", "CodeTypeCall": "مكالمة صوتية", "CodeTypeFlashCall": "مكالمة فلاش", "CodeTypeMissedCall": "مكالمة فائتة", "CodeTypeFragmentSms": "SMS عبر Fragment"}.get(n, n or "غير معروف")
+
+def login_form(step, st=None):
+    st = st or {}
     if step == "start":
         return ("<h2>🔑 ربط الحساب المراقب</h2><p><small>استعمل بيانات الحساب الثاني فقط. هذه الصفحة تعمل مرة واحدة ولا تُحفظ البيانات إلا مشفّرة.</small></p>"
                 "<form method=post><input type=hidden name=a value=start>api_id<input name=api_id inputmode=numeric required>"
-                "api_hash<input name=api_hash required autocomplete=off>رقم الهاتف مع المفتاح (+964...)<input name=phone required>"
-                "<button>إرسال الكود</button></form>")
+                "api_hash<input name=api_hash required autocomplete=off>رقم الهاتف مع المفتاح (+964...) <small>(للكود فقط، يُترك فارغاً مع QR)</small><input name=phone>"
+                "<button name=m value=code>إرسال الكود</button><div style='height:10px'></div>"
+                "<button name=m value=qr style='background:#2BB673'>🔳 الدخول عبر QR (بدون كود)</button></form>")
     if step == "code":
-        return ("<h2>📩 أدخل الكود</h2><p><small>وصل الكود داخل تطبيق تيليگرام على الحساب الثاني (محادثة Telegram).</small></p>"
-                "<form method=post><input type=hidden name=a value=code>الكود<input name=code inputmode=numeric required autocomplete=off><button>تأكيد</button></form>")
+        nxt = st.get("next_t")
+        info = "طريقة الإرسال: <b>" + html_esc(sent_type_text(st.get("sent_t"))) + "</b>"
+        if st.get("timeout"):
+            info += f"<br>مدة الصلاحية للتالي: {int(st['timeout'])} ثانية"
+        if nxt:
+            info += "<br>الطريقة التالية: " + html_esc(sent_type_text(nxt))
+        rs = ""
+        if nxt:
+            rs = ("<form method=post><input type=hidden name=a value=resend><button style='background:#F59E0B'>↻ إعادة الإرسال بالطريقة التالية</button></form><div style='height:10px'></div>")
+        return ("<h2>📩 أدخل الكود</h2><p><small>" + info + "</small></p>"
+                "<form method=post><input type=hidden name=a value=code>الكود<input name=code inputmode=numeric required autocomplete=off><button>تأكيد</button></form><div style='height:10px'></div>"
+                + rs + "<form method=post><input type=hidden name=a value=qr><button style='background:#2BB673'>🔳 جرّب QR بدلاً من الكود</button></form>")
+    if step == "qr":
+        svg = ""
+        try:
+            import segno, io as _io
+            bio = _io.BytesIO()
+            segno.make(st["qr"].url, error="m").save(bio, kind="svg", scale=5, border=2, xmldecl=False, svgns=True)
+            svg = bio.getvalue().decode()
+        except Exception:
+            svg = "<p>تعذّر رسم QR</p>"
+        return ("<meta http-equiv=refresh content=3><h2>🔳 دخول عبر QR</h2><p><small>من الحساب الثاني في تيليگرام: الإعدادات ← الأجهزة ← ربط جهاز سطح مكتب، ثم امسح الرمز. (الصفحة تتحدّث تلقائياً)</small></p>"
+                "<div style='background:#fff;text-align:center;direction:ltr'>" + svg + "</div>"
+                "<p><a href='" + html_esc(st["qr"].url) + "'>أو اضغط هنا إن كنت تفتح الصفحة من نفس الهاتف</a></p>")
     if step == "pw":
         return ("<h2>🔐 كلمة سر التحقق بخطوتين</h2><form method=post><input type=hidden name=a value=pw>"
                 "<input name=pw type=password required autocomplete=off><button>تأكيد</button></form>")
@@ -2540,7 +2571,34 @@ class TgLoginH(tornado.web.RequestHandler):
             self.finish(login_page("<h2>انتهت صلاحية الرابط</h2><p>اطلب رابطاً جديداً من لوحة الأدمن.</p>"))
 
     async def get(self, token):
-        self.finish(login_page(login_form(self.st["step"])))
+        st = self.st
+        if st["step"] == "qr":
+            try:
+                qr = st["qr"]
+                try:
+                    await qr.wait(timeout=2.5)
+                except asyncio.TimeoutError:
+                    if qr.expires and qr.expires.timestamp() < time.time() + 3:
+                        await qr.recreate()
+                    self.finish(login_page(login_form("qr", st)))
+                    return
+                except Exception as e:
+                    if type(e).__name__ == "SessionPasswordNeededError":
+                        st["step"] = "pw"
+                        self.finish(login_page(login_form("pw", st)))
+                        return
+                    raise
+                if await st["client"].is_user_authorized():
+                    await login_done(st)
+                    LOGINS.pop(token, None)
+                    self.finish(login_page(login_form("done")))
+                    return
+            except Exception as e:
+                log.warning("qr step failed: %r", e)
+                st["step"] = "start"
+                self.finish(login_page(login_form("start"), "فشل الدخول عبر QR: " + type(e).__name__))
+                return
+        self.finish(login_page(login_form(st["step"], st)))
 
     async def post(self, token):
         st = self.st
@@ -2556,22 +2614,48 @@ class TgLoginH(tornado.web.RequestHandler):
             if a == "start" and st["step"] == "start":
                 api_id = int(self.get_body_argument("api_id").strip())
                 api_hash = self.get_body_argument("api_hash").strip()
-                phone = self.get_body_argument("phone").strip().replace(" ", "")
+                phone = self.get_body_argument("phone", "").strip().replace(" ", "")
                 c = TelegramClient(StringSession(), api_id, api_hash, device_model="TalibBot")
                 await c.connect()
+                st.update(client=c, api_id=api_id, api_hash=api_hash, phone=phone)
+                if self.get_body_argument("m", "code") == "qr":
+                    st["qr"] = await c.qr_login()
+                    st["step"] = "qr"
+                    self.finish(login_page(login_form("qr", st)))
+                    return
+                if not phone:
+                    st["step"] = "start"
+                    raise ValueError("nophone")
                 sent = await c.send_code_request(phone)
-                st.update(client=c, api_id=api_id, api_hash=api_hash, phone=phone, hash=sent.phone_code_hash, step="code")
+                st.update(hash=sent.phone_code_hash, step="code", sent_t=sent.type, next_t=getattr(sent, "next_type", None), timeout=getattr(sent, "timeout", None), resends=0)
+                log.info("tg code sent: type=%s next=%s timeout=%s", type(sent.type).__name__, type(getattr(sent, "next_type", None)).__name__, getattr(sent, "timeout", None))
+            elif a == "resend" and st["step"] == "code":
+                from telethon.tl.functions.auth import ResendCodeRequest
+                if st.get("resends", 0) >= 2 or time.time() - st.get("last_resend", 0) < 30:
+                    raise ValueError("resend limit")
+                st["last_resend"] = time.time()
+                st["resends"] = st.get("resends", 0) + 1
+                sent = await st["client"](ResendCodeRequest(st["phone"], st["hash"]))
+                st.update(hash=sent.phone_code_hash, sent_t=sent.type, next_t=getattr(sent, "next_type", None), timeout=getattr(sent, "timeout", None))
+                log.info("tg code resent: type=%s next=%s", type(sent.type).__name__, type(getattr(sent, "next_type", None)).__name__)
+                self.finish(login_page(login_form("code", st)))
+                return
+            elif a == "qr" and st["step"] == "code":
+                st["qr"] = await st["client"].qr_login()
+                st["step"] = "qr"
+                self.finish(login_page(login_form("qr", st)))
+                return
             elif a == "code" and st["step"] == "code":
                 try:
                     await st["client"].sign_in(st["phone"], self.get_body_argument("code").strip().replace(" ", ""), phone_code_hash=st["hash"])
                 except errors.SessionPasswordNeededError:
                     st["step"] = "pw"
-                    self.finish(login_page(login_form("pw")))
+                    self.finish(login_page(login_form("pw", st)))
                     return
             elif a == "pw" and st["step"] == "pw":
                 await st["client"].sign_in(password=self.get_body_argument("pw"))
             else:
-                self.finish(login_page(login_form(st["step"])))
+                self.finish(login_page(login_form(st["step"], st)))
                 return
             if st["step"] != "code" or await st["client"].is_user_authorized():
                 if await st["client"].is_user_authorized():
@@ -2579,12 +2663,15 @@ class TgLoginH(tornado.web.RequestHandler):
                     LOGINS.pop(token, None)
                     self.finish(login_page(login_form("done")))
                     return
-            self.finish(login_page(login_form(st["step"])))
+            self.finish(login_page(login_form(st["step"], st)))
         except Exception as e:
-            log.warning("tg login step failed: %s", type(e).__name__)
+            log.warning("tg login step failed: %r", e)
             msg = {"PhoneCodeInvalidError": "الكود غير صحيح", "PhoneCodeExpiredError": "انتهى الكود، ابدأ من جديد",
                    "PasswordHashInvalidError": "كلمة السر غير صحيحة", "ApiIdInvalidError": "api_id أو api_hash غير صحيح",
-                   "PhoneNumberInvalidError": "رقم الهاتف غير صحيح", "FloodWaitError": "انتظر قليلاً ثم أعد المحاولة"}.get(type(e).__name__, "تعذّرت العملية، تحقق من البيانات")
+                   "PhoneNumberInvalidError": "رقم الهاتف غير صحيح", "FloodWaitError": "انتظر قليلاً ثم أعد المحاولة (حدّ تيليگرام): " + str(getattr(e, "seconds", "")) + "ث",
+                   "ValueError": "أدخل رقم الهاتف، أو انتظر 30 ثانية قبل إعادة الإرسال (حد أقصى مرتان)",
+                   "PhoneCodeHashEmptyError": "ابدأ من جديد", "SendCodeUnavailableError": "لا توجد طريقة إرسال أخرى متاحة، جرّب QR",
+                   "PhonePasswordFloodError": "محاولات كثيرة، انتظر ساعات أو جرّب QR"}.get(type(e).__name__, "تعذّرت العملية، تحقق من البيانات")
             self.finish(login_page(login_form(st["step"]), msg))
 
 async def login_done(st):
