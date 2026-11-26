@@ -195,7 +195,7 @@ def tick(on):
 
 FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest").split(",") if m.strip()]
 
-async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
+async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192, fast=False):
     body = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
@@ -203,9 +203,11 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     if system:
         body["system_instruction"] = {"parts": [{"text": system}]}
     models = [MODEL] + [m.strip() for m in FALLBACKS if m.strip() != MODEL]
+    if fast:
+        models = models[:3]
     r = None
-    async with httpx.AsyncClient(timeout=180) as c:
-        for attempt, m in enumerate(models + models):
+    async with httpx.AsyncClient(timeout=20 if fast else 180) as c:
+        for attempt, m in enumerate(models if fast else models + models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
             try:
                 r = await c.post(url, params={"key": GKEY}, json=body)
@@ -1267,9 +1269,9 @@ async def analyze_pdf(ctx, doc, caption):
     parts = [{"text": prompt}]
     size = doc.file_size or 0
     if size and size <= MAX_DL:
-        data = await fetch_file(ctx, doc.file_id)
+        data = await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
         try:
-            text, small = await asyncio.to_thread(pdf_head, data)
+            text, small = await asyncio.wait_for(asyncio.to_thread(pdf_head, data), 20)
         except Exception:
             log.exception("pdf_head failed")
             text, small = "", None
@@ -1278,10 +1280,51 @@ async def analyze_pdf(ctx, doc, caption):
             parts.append({"text": "نص أول صفحات الملف:\n" + text})
         elif small:
             parts.append({"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(small).decode()}})
-    out = await gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024)
+    out = await asyncio.wait_for(gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024, fast=True), 45)
     m = re.search(r"\{.*\}", out, re.S)
     d = json.loads(m.group(0)) if m else {}
     return {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title")}
+
+SUBJ_KW = [("انكليزي", "اللغة الإنكليزية"), ("انجليزي", "اللغة الإنكليزية"), ("english", "اللغة الإنكليزية"),
+           ("عربي", "اللغة العربية"), ("فيزياء", "الفيزياء"), ("كيمياء", "الكيمياء"), ("رياضيات", "الرياضيات"),
+           ("احياء", "الأحياء"), ("اسلامي", "التربية الإسلامية"), ("حاسوب", "الحاسوب"), ("جغرافي", "الجغرافية"),
+           ("تاريخ", "التاريخ"), ("فرنسي", "اللغة الفرنسية"), ("علوم", "العلوم")]
+ORD = ["الاول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس"]
+
+def guess_from_name(name, caption):
+    raw = f"{stem(name)} {caption or ''}"
+    n = nrm(raw.replace("_", " ").replace("-", " "))
+    g = {"stage": "", "subject": "", "teacher": "", "title": ""}
+    for sid, sname in hq("SELECT id, name FROM h_subjects ORDER BY id"):
+        if nrm(sname) and nrm(sname) in n:
+            g["subject"] = sname
+            break
+    if not g["subject"]:
+        for kw, nm in SUBJ_KW:
+            if kw in n:
+                g["subject"] = nm
+                break
+    for o in ORD:
+        if nrm(o) in n:
+            if "متوسط" in n or o in ("الاول", "الثاني", "الثالث") and "اعدادي" not in n:
+                g["stage"] = f"{o} المتوسط".replace("الاول", "الأول")
+            else:
+                g["stage"] = f"{o} الإعدادي" + (" العلمي" if "علمي" in n else " الأدبي" if "ادبي" in n else "")
+            break
+    # teacher: first Arabic chunk of the file name that is not a subject, stage word or number
+    for part in re.split(r"[_\-|]+", re.sub(r"\.pdf$", "", name or "", flags=re.I)):
+        pn = nrm(part)
+        if not pn or pn.isdigit() or not re.search(r"[\u0600-\u06FF]", part):
+            continue
+        if any(kw in pn for kw, _ in SUBJ_KW) or any(nrm(o) in pn for o in ORD) or "ملزم" in pn or "متوسط" in pn or "اعدادي" in pn:
+            continue
+        if len(part.split()) <= 4:
+            g["teacher"] = part.strip()
+            break
+    year = re.search(r"(20\d\d)", stem(name))
+    if g["subject"]:
+        g["title"] = "ملزمة " + g["subject"] + (f" {year.group(1)}" if year else "")
+    return g
 
 def ing_summary(hid):
     r = hq("SELECT f.title, f.teacher, j.name, s.name FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
@@ -1299,7 +1342,13 @@ async def ing_finalize(status, rec, ctx):
         if not rec.get(need):
             rec["need"] = need
             PENDING[status.message_id] = rec
-            await status.edit_text(f"❓ لم أستطع تحديد {label} للملف:\n📄 {trim(rec['name'], 60)}\n\n↩️ اكتب الجواب بالرد على هذه الرسالة.")
+            if need == "stage":
+                opts = hq("SELECT id, name FROM h_stages ORDER BY id LIMIT 8")
+            else:
+                st = get_stage(rec["stage"], create=False)
+                opts = hq("SELECT id, name FROM h_subjects WHERE stage_id=? ORDER BY id LIMIT 8", (st,)) if st else []
+            kb = M([[hb(trim(n, 30), f"i:p:{i}")] for i, n in opts]) if opts else None
+            await status.edit_text(f"{rec.get('note', '')}❓ لم أستطع تحديد {label} للملف:\n📄 {trim(rec['name'], 60)}\n\n↩️ اضغط خياراً أو اكتب الجواب بالرد على هذه الرسالة.", reply_markup=kb)
             return
     rec.pop("need", None)
     sid = get_stage(rec["stage"])
@@ -1322,7 +1371,7 @@ async def ing_finalize(status, rec, ctx):
     hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
     PENDING.pop(status.message_id, None)
     text, kb = ing_summary(hid)
-    await status.edit_text(text, reply_markup=kb)
+    await status.edit_text(rec.get("note", "") + text, reply_markup=kb)
 
 async def ingest_pdf(update, ctx):
     msg = update.message
@@ -1330,13 +1379,26 @@ async def ingest_pdf(update, ctx):
     cap = (msg.caption or "").strip()
     status = await msg.reply_text(f"⏳ جاري قراءة: {trim(doc.file_name or 'ملف', 50)}")
     info = {"stage": "", "subject": "", "teacher": "", "title": ""}
-    async with ING_LOCK:
+    note = ""
+    try:
+        async with ING_LOCK:
+            try:
+                info = await asyncio.wait_for(analyze_pdf(ctx, doc, cap), 100)
+            except Exception as e:
+                log.warning("ingest analyze failed: %r", e)
+                note = "⚠️ تعذرت قراءة الملف بالذكاء الاصطناعي، اعتمدت على اسم الملف.\n"
+        g = guess_from_name(doc.file_name or "", cap)
+        for k in info:
+            if not info[k]:
+                info[k] = g[k]
+        rec = dict(info, fid=doc.file_id, uid=doc.file_unique_id or "", name=doc.file_name or "ملزمة", note=note)
+        await ing_finalize(status, rec, ctx)
+    except Exception:
+        log.exception("ingest failed")
         try:
-            info = await analyze_pdf(ctx, doc, cap)
-        except Exception as e:
-            log.warning("ingest analyze failed: %r", e)
-    rec = dict(info, fid=doc.file_id, uid=doc.file_unique_id or "", name=doc.file_name or "ملزمة")
-    await ing_finalize(status, rec, ctx)
+            await status.edit_text(f"❌ تعذر إضافة الملف: {trim(doc.file_name or 'ملف', 50)}\nأعد إرساله بعد قليل.")
+        except Exception:
+            pass
 
 async def ing_reply(update, ctx):
     msg = update.message
@@ -1363,6 +1425,18 @@ async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         rec["force"] = True
         await ing_finalize(q.message, rec, ctx)
+        return
+    if a == "p":
+        rec = PENDING.get(q.message.message_id)
+        need = rec.get("need") if rec else None
+        if not need:
+            await q.message.edit_text("انتهت صلاحية هذا الطلب، أعد إرسال الملف.")
+            return
+        tbl = "h_stages" if need == "stage" else "h_subjects"
+        r = hq(f"SELECT name FROM {tbl} WHERE id=?", (int(parts[2]),))
+        if r:
+            rec[need] = r[0][0]
+            await ing_finalize(q.message, rec, ctx)
         return
     hid = int(parts[2])
     if a == "b":
