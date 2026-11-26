@@ -1957,6 +1957,1968 @@ def sig_dist(a, b):
             return 999
         return bin(int(ha, 16) ^ int(hb2, 16)).count("1")
     except Exception:
+"""بوت الطالب الذكي - smart student bot backed by Gemini, with admin panel."""
+import os, io, re, json, base64, time, logging, asyncio, sqlite3, threading, hmac, hashlib
+from urllib.parse import parse_qsl
+
+import httpx
+from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile, WebAppInfo
+from telegram.constants import ChatAction
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, ContextTypes, filters)
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("studentbot")
+
+TOKEN = os.environ["BOT_TOKEN"]
+GKEY = os.environ["GEMINI_API_KEY"]
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GURL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
+ADMIN_USERNAMES = {x.strip().lstrip("@").lower() for x in os.environ.get("ADMIN_USERNAMES", "").replace(",", " ").split() if x.strip()}
+ADMIN_BACKUP_CHAT = int(os.environ.get("ADMIN_BACKUP_CHAT", next(iter(ADMIN_IDS), 0)))
+
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Amiri-Regular.ttf")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "student.db")
+
+BASE_SYS = (
+    "أنت «الطالب الذكي»: مساعد تعليمي للطلاب. أجب باللغة العربية الواضحة والبسيطة "
+    "ما لم يطلب الطالب لغة أخرى صراحة. نظّم إجابتك بعناوين قصيرة ونقاط عندما يكون ذلك مفيداً، "
+    "وتجنّب الحشو. إذا كان السؤال خارج الدراسة أجب عنه باختصار مفيد."
+)
+
+DEFAULT_WELCOME = "🎓 أهلاً بك في بوت الطالب الذكي!\n\nاختر ماذا تريد من القائمة، أو أرسل سؤالك مباشرة وسأجيبك:"
+DEFAULT_GATE_MSG = "🔐 لاستخدام البوت اشترك أولاً في القناة ثم اضغط تحقق."
+DEFAULT_MAINT_MSG = "🛠 البوت في وضع الصيانة حالياً، عد لاحقاً."
+
+# ---------------- store ----------------
+
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.Lock()
+        self.q("""CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY, name TEXT, username TEXT,
+            joined REAL, last_seen REAL, banned INTEGER DEFAULT 0)""")
+        self.q("""CREATE TABLE IF NOT EXISTS events(
+            ts REAL, user_id INTEGER, kind TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
+            title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
+        self.q("""CREATE TABLE IF NOT EXISTS searches(ts REAL, user_id INTEGER, q TEXT)""")
+        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER", "ftype TEXT", "stamped INTEGER DEFAULT 0", "orig_fid TEXT"):
+            try:
+                self.q("ALTER TABLE h_files ADD COLUMN " + col)
+            except sqlite3.OperationalError:
+                pass
+
+    def q(self, sql, args=(), fetch=None):
+        with self.lock:
+            cur = self.db.execute(sql, args)
+            rows = cur.fetchall() if fetch else None
+            self.db.commit()
+            return rows
+
+    def get(self, key, default=""):
+        r = self.q("SELECT value FROM settings WHERE key=?", (key,), fetch=True)
+        return r[0][0] if r else default
+
+    def set(self, key, value):
+        self.q("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        backup_soon()
+
+    def on(self, key):
+        return self.get(key, "0") == "1"
+
+    def upsert_user(self, u):
+        r = self.q("SELECT id FROM users WHERE id=?", (u.id,), fetch=True)
+        now = time.time()
+        if r:
+            self.q("UPDATE users SET name=?, username=?, last_seen=? WHERE id=?",
+                   (u.full_name or "", u.username or "", now, u.id))
+            return False
+        self.q("INSERT INTO users(id,name,username,joined,last_seen) VALUES(?,?,?,?,?)",
+               (u.id, u.full_name or "", u.username or "", now, now))
+        backup_soon()
+        return True
+
+    def event(self, user_id, kind):
+        self.q("INSERT INTO events(ts,user_id,kind) VALUES(?,?,?)", (time.time(), user_id, kind))
+        backup_soon()
+
+    def is_banned(self, uid):
+        r = self.q("SELECT banned FROM users WHERE id=?", (uid,), fetch=True)
+        return bool(r and r[0][0])
+
+    def set_ban(self, uid, flag):
+        self.q("UPDATE users SET banned=? WHERE id=?", (1 if flag else 0, uid))
+        backup_soon()
+
+    def stats(self):
+        day = time.time() - 86400
+        total = self.q("SELECT COUNT(*) FROM users", fetch=True)[0][0]
+        new_today = self.q("SELECT COUNT(*) FROM users WHERE joined>?", (day,), fetch=True)[0][0]
+        active = self.q("SELECT COUNT(*) FROM users WHERE last_seen>?", (day,), fetch=True)[0][0]
+        banned = self.q("SELECT COUNT(*) FROM users WHERE banned=1", fetch=True)[0][0]
+        feats = self.q("SELECT kind, COUNT(*) FROM events GROUP BY kind ORDER BY 2 DESC", fetch=True)
+        feats_day = self.q("SELECT kind, COUNT(*) FROM events WHERE ts>? GROUP BY kind ORDER BY 2 DESC", (day,), fetch=True)
+        return total, new_today, active, banned, feats, feats_day
+
+    def recent_users(self, limit=10):
+        return self.q("SELECT id,name,username,last_seen FROM users WHERE banned=0 ORDER BY last_seen DESC LIMIT ?", (limit,), fetch=True)
+
+    def banned_users(self):
+        return self.q("SELECT id,name,username FROM users WHERE banned=1 ORDER BY last_seen DESC LIMIT 30", fetch=True)
+
+    def all_user_ids(self):
+        return [r[0] for r in self.q("SELECT id FROM users WHERE banned=0", fetch=True)]
+
+store = None
+
+# ---------------- backup (pinned doc in admin chat) ----------------
+
+_backup_dirty = False
+_last_backup = 0.0
+BACKUP_EVERY = 300   # silent; keeps settings/library across restarts (Render restarts lose anything newer than the last backup)
+APP = None
+
+def backup_soon():
+    # يعلّم أن هناك تغييرات؛ النسخ الفعلي يتم كل 48 ساعة فقط
+    global _backup_dirty
+    _backup_dirty = True
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(120)
+        try:
+            if _backup_dirty and time.time() - _last_backup >= BACKUP_EVERY:
+                await do_backup()
+        except Exception:
+            log.exception("backup tick")
+
+async def do_backup():
+    global _backup_dirty, _last_backup
+    if not APP or not ADMIN_BACKUP_CHAT or not store:
+        return
+    try:
+        _backup_dirty = False
+        store.db.commit()
+        old_id = None
+        try:
+            ch = await APP.bot.get_chat(ADMIN_BACKUP_CHAT)
+            if ch.pinned_message and ch.pinned_message.document:
+                old_id = ch.pinned_message.message_id
+        except Exception:
+            pass
+        with open(DB_PATH, "rb") as f:
+            msg = await APP.bot.send_document(
+                ADMIN_BACKUP_CHAT, InputFile(f, filename="student.db"),
+                caption="💾 نسخة احتياطية من بيانات البوت", disable_notification=True)
+        _last_backup = time.time()
+        try:
+            log.info("backup saved, %d bytes", os.path.getsize(DB_PATH))
+        except Exception:
+            pass
+        try:
+            await APP.bot.pin_chat_message(ADMIN_BACKUP_CHAT, msg.message_id, disable_notification=True)
+        except Exception:
+            log.exception("pin failed")
+        if old_id and old_id != msg.message_id:
+            try:
+                await APP.bot.delete_message(ADMIN_BACKUP_CHAT, old_id)
+            except Exception:
+                pass
+    except Exception:
+        _backup_dirty = True
+        log.exception("backup failed")
+
+async def drop_pin_notice(update, ctx):
+    # يحذف رسالة "تم تثبيت رسالة" الخدمية
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        pass
+
+async def restore_backup(app):
+    global _last_backup
+    if not ADMIN_BACKUP_CHAT:
+        return False
+    try:
+        chat = await app.bot.get_chat(ADMIN_BACKUP_CHAT)
+        pin = chat.pinned_message
+        if pin and pin.document and pin.document.file_name == "student.db":
+            f = await app.bot.get_file(pin.document.file_id)
+            out = io.BytesIO()
+            await f.download_to_memory(out=out)
+            with open(DB_PATH, "wb") as fh:
+                fh.write(out.getvalue())
+            try:
+                _last_backup = pin.date.timestamp()
+            except Exception:
+                _last_backup = time.time()
+            log.info("backup restored, %d bytes", len(out.getvalue()))
+            return True
+    except Exception:
+        log.exception("restore failed")
+    return False
+
+SOLVE_SYS = (
+    "أنت مدرّس خبير في المنهج الدراسي العراقي (المتوسط والإعدادي) لمواد الرياضيات والفيزياء والكيمياء والأحياء وغيرها. "
+    "حلّ المسائل باللغة العربية بأسلوب كتب ومدرسي العراق: اكتب المعطيات، ثم المطلوب، ثم القانون المستخدم، ثم التعويض، ثم الحل خطوة بخطوة مع سبب كل خطوة، ثم الجواب النهائي. "
+    "استخدم المصطلحات والرموز المعتمدة في الكتب العراقية. تحقق من الجواب قبل كتابته وانتبه للوحدات. "
+    "إذا كانت الصورة غير واضحة أو ناقصة فاذكر ذلك واطلب إعادة تصويرها ولا تخمّن. "
+    "التنسيق: الرسالة تظهر في تيليجرام كنص عادي، لذلك لا تستخدم LaTeX أبداً ولا الرموز $ ولا \\frac ولا markdown مثل ** أو ##. "
+    "اكتب المعادلات بسطر مستقل وبرموز يونيكود مقروءة: x² ، √ ، ÷ ، × ، ½ ، π ، Δ ، θ ، ≈ ، → ، ⇌ ، وأرقام سفلية للكيمياء مثل H₂O و CO₂ و x₁. "
+    "اجعل كل خطوة في سطر أو سطرين قصيرين وضع قبلها رقمها مثل: ١) ٢) ٣) أو 1) 2) 3). "
+    "اختم دائماً بسطر: ✅ الجواب النهائي: ..."
+)
+
+# ---------------- helpers ----------------
+
+def is_admin(update: Update):
+    u = update.effective_user
+    if not u:
+        return False
+    return u.id in ADMIN_IDS or (u.username or "").lower() in ADMIN_USERNAMES
+
+def tick(on):
+    return "✅" if on else "❌"
+
+FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest").split(",") if m.strip()]
+
+async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192, fast=False):
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+    }
+    if system:
+        body["system_instruction"] = {"parts": [{"text": system}]}
+    models = [MODEL] + [m.strip() for m in FALLBACKS if m.strip() != MODEL]
+    if fast:
+        models = models[:3]
+    r = None
+    async with httpx.AsyncClient(timeout=20 if fast else 180) as c:
+        for attempt, m in enumerate(models if fast else models + models):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+            try:
+                r = await c.post(url, params={"key": GKEY}, json=body)
+            except httpx.HTTPError as e:
+                log.warning("gemini network %s: %s", m, e)
+                r = None
+                await asyncio.sleep(2)
+                continue
+            if r.status_code == 200:
+                break
+            log.warning("gemini %s (%s): %s", r.status_code, m, r.text[:200])
+            if r.status_code in (429, 500, 503, 404):
+                await asyncio.sleep(1.5)
+                continue
+            break
+    if r is None or r.status_code != 200:
+        if r is not None and r.status_code in (429, 503):
+            raise RuntimeError("الخدمة مزدحمة حالياً، حاول بعد دقيقة.")
+        raise RuntimeError("تعذر الاتصال بالذكاء الاصطناعي، حاول لاحقاً.")
+    data = r.json()
+    try:
+        parts_out = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts_out if not p.get("thought"))
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("لم يصلني رد صالح، حاول صياغة الطلب بشكل أوضح.")
+    text = text.strip()
+    if not text:
+        raise RuntimeError("لم أستطع معالجة هذا المحتوى، جرّب محتوى آخر.")
+    return text
+
+def img_part(data, mime="image/jpeg"):
+    return {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
+
+async def send_long(msg, text):
+    limit = 4000
+    while text:
+        chunk = text[:limit]
+        if len(text) > limit:
+            cut = chunk.rfind("\n")
+            if cut > 1500:
+                chunk = chunk[:cut]
+        await msg.reply_text(chunk)
+        text = text[len(chunk):].lstrip("\n")
+
+def ago(ts):
+    d = int(time.time() - ts)
+    if d < 60:
+        return "الآن"
+    if d < 3600:
+        return f"قبل {d//60} د"
+    if d < 86400:
+        return f"قبل {d//3600} س"
+    return f"قبل {d//86400} يوم"
+
+# ---------------- user menu ----------------
+
+# ---- one shared registry: add a tool here and it appears in the bot menu AND the Mini App ----
+# input: text = text only, both = text or file (image/PDF/txt), audio = voice file
+TOOLS = [
+    dict(id="explain",   icon="📷", name="اشرح صورة",           input="both",  group="main"),
+    dict(id="summary",   icon="📝", name="أنشئ ملخص",           input="both",  group="main"),
+    dict(id="questions", icon="📚", name="أنشئ أسئلة",          input="both",  group="main"),
+    dict(id="quiz",      icon="🧠", name="اختبرني",             input="text",  group="main", kind="quiz"),
+    dict(id="schedule",  icon="📅", name="جدول دراستي",         input="text",  group="main"),
+    dict(id="voice",     icon="🎤", name="حوّل صوتاً إلى نص",   input="audio", group="main"),
+    dict(id="pdf",       icon="📄", name="أنشئ PDF",            input="both",  group="main"),
+    dict(id="solve",     icon="🧮", name="حل المسائل",          input="both",  group="main"),
+    dict(id="simple",    icon="🧒", name="اشرحها ببساطة",       input="both",  group="more"),
+    dict(id="cards",     icon="🃏", name="بطاقات حفظ",          input="both",  group="more"),
+    dict(id="check",     icon="✅", name="صحّح إجابتي",         input="both",  group="more"),
+    dict(id="translate", icon="🌐", name="ترجمة",               input="both",  group="more"),
+    dict(id="formulas",  icon="📐", name="ورقة قوانين",         input="text",  group="more"),
+]
+
+def tool_buttons(group):
+    bs = [B(f"{t['icon']} {t['name']}", callback_data=f"m:{t['id']}") for t in TOOLS if t["group"] == group]
+    return [bs[i:i + 2] for i in range(0, len(bs), 2)]
+
+def menu_markup(adm=False):
+    rows = ([[B("🎛 لوحة الأدمن", callback_data="a:main")]] if adm else [])
+    base = os.environ.get("RENDER_EXTERNAL_URL")
+    if base:
+        rows = [[B("🌐 افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app"))]] + rows
+    return M(tool_buttons("main") + [
+        [B("📚 الملازم", callback_data="h:s")],
+        [B("✨ أدوات إضافية", callback_data="m:more")],
+    ] + rows)
+
+def more_markup():
+    return M(tool_buttons("more") + [
+        [B("⏱ مؤقت مذاكرة", callback_data="m:timer")],
+        [B("🔙 القائمة الرئيسية", callback_data="m:menu")],
+    ])
+
+def timer_markup():
+    return M([
+        [B("🍅 25 دقيقة تركيز", callback_data="m:t25"), B("📚 45 دقيقة", callback_data="m:t45")],
+        [B("🔙 رجوع", callback_data="m:more")],
+    ])
+
+MODE_PROMPTS = {
+    "explain":   "📷 أرسل الصورة الآن (صفحة من كتاب، لوحة، تمرين...) وسأشرحها لك.",
+    "summary":   "📝 أرسل النص أو صورة الصفحات أو ملف PDF، وسأصنع لك ملخصاً منظماً.",
+    "questions": "📚 أرسل المادة (نصاً أو صورة أو PDF)، وسأنشئ لك أسئلة عليها مع الأجوبة النموذجية.",
+    "quiz":      "🧠 عن ماذا تريد أن أختبرك؟ أرسل اسم المادة أو الموضوع (مثال: الفيزياء - الحرارة).",
+    "schedule":  "📅 أرسل في رسالة واحدة: المواد التي تدرسها، وتواريخ الامتحانات إن وجدت، وعدد الساعات المتاحة يومياً. وسأرتب لك جدولاً.",
+    "voice":     "🎤 أرسل الرسالة الصوتية أو المقطع الصوتي الآن، وسأحوّله إلى نص.",
+    "pdf":       "📄 أرسل المحتوى (نصاً أو صورة)، وسأحوّله إلى ورقة مراجعة منظمة بصيغة PDF.",
+    "simple":    "🧒 أرسل الدرس أو الفقرة أو السؤال (نصاً أو صورة)، وسأشرحه لك كأنك بعمر 10 سنوات مع أمثلة من الحياة.",
+    "cards":     "🃏 أرسل المادة (نصاً أو صورة أو PDF) أو اسم الدرس، وسأصنع لك بطاقات حفظ (سؤال وجواب) مع حيل تساعدك على التذكر.",
+    "check":     "✅ أرسل السؤال ثم إجابتك في رسالة واحدة (نصاً أو صورة)، وسأصححها وأعطيك درجة وملاحظات لتحسينها.",
+    "translate": "🌐 أرسل النص (أو صورة فيها نص) وسأترجمه: من العربية إلى الإنجليزية، ومن أي لغة أخرى إلى العربية، مع شرح المصطلحات الصعبة.",
+    "formulas":  "📐 اكتب المادة والموضوع أو الفصل (مثال: الفيزياء - الحركة)، وسأجهز لك ورقة بكل القوانين المهمة مع معنى كل رمز.",
+    "solve":     "🧮 أرسل المسألة نصاً أو صورة (رياضيات، فيزياء، كيمياء، أحياء، أو أي مادة)، وسأحلها لك خطوة بخطوة بأسلوب المنهج العراقي.\n\nيمكنك إضافة تعليق مع الصورة مثل: حل السؤال 3 فقط.",
+}
+
+def back_markup():
+    return M([[B("🔙 القائمة الرئيسية", callback_data="m:menu")]])
+
+# ---------------- gate ----------------
+
+async def gate_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if is_admin(update):
+        return True
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    if store.is_banned(u.id):
+        if msg:
+            await msg.reply_text("🚫 تم حظرك من استخدام البوت.")
+        return False
+    if store.on("maintenance"):
+        if msg:
+            await msg.reply_text(store.get("maintenance_msg", DEFAULT_MAINT_MSG) or DEFAULT_MAINT_MSG)
+        return False
+    if store.on("gate_on"):
+        ch = store.get("gate_channel", "")
+        if ch:
+            try:
+                cm = await ctx.bot.get_chat_member(ch, u.id)
+                if cm.status in ("member", "administrator", "creator"):
+                    return True
+            except Exception as e:
+                log.warning("gate check failed: %s", e)
+                return True
+            kb = M([[B("📢 اشترك في القناة", url=f"https://t.me/{ch.lstrip('@')}")],
+                    [B("✅ تحقق", callback_data="g:verify")]])
+            if msg:
+                await msg.reply_text(store.get("gate_msg", DEFAULT_GATE_MSG) or DEFAULT_GATE_MSG, reply_markup=kb)
+            return False
+    return True
+
+async def verify_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    ch = store.get("gate_channel", "")
+    try:
+        cm = await ctx.bot.get_chat_member(ch, q.from_user.id)
+        ok = cm.status in ("member", "administrator", "creator")
+    except Exception:
+        ok = False
+    if ok:
+        await q.answer("تم التحقق، أهلاً بك!")
+        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+    else:
+        await q.answer("لم تشترك بعد. اشترك ثم اضغط تحقق.", show_alert=True)
+
+# ---------------- user flows ----------------
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    is_new = store.upsert_user(u)
+    if is_new:
+        store.event(u.id, "join")
+        if store.on("join_notice"):
+            for aid in ADMIN_IDS:
+                try:
+                    await ctx.bot.send_message(aid, f"🔔 مستخدم جديد: {u.full_name} (@{u.username or '—'}) id={u.id}")
+                except Exception:
+                    pass
+    if not await gate_ok(update, ctx):
+        return
+    ctx.user_data.clear()
+    await update.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+
+async def run_timer(bot, chat_id, mins, rest):
+    try:
+        await asyncio.sleep(mins * 60)
+        await bot.send_message(chat_id, f"⏰ انتهت جلسة التركيز ({mins} دقيقة)! أحسنت 👏\nخذ استراحة {rest} دقائق: اشرب ماء وتحرّك قليلاً.")
+        await asyncio.sleep(rest * 60)
+        await bot.send_message(chat_id, "🔔 انتهت الاستراحة. هل نبدأ جلسة جديدة؟", reply_markup=timer_markup())
+    except Exception:
+        log.warning("timer failed")
+
+async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await gate_ok(update, ctx):
+        return
+    data = q.data
+    if data == "m:menu":
+        ctx.user_data.clear()
+        await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+        return
+    if data == "m:more":
+        ctx.user_data.clear()
+        await q.message.reply_text("✨ أدوات إضافية للطالب - اختر:", reply_markup=more_markup())
+        return
+    if data == "m:timer":
+        ctx.user_data.clear()
+        await q.message.reply_text("⏱ مؤقت المذاكرة: اختر مدة التركيز وسأنبهك عند انتهائها وعند انتهاء الاستراحة.", reply_markup=timer_markup())
+        return
+    if data in ("m:t25", "m:t45"):
+        mins = 25 if data == "m:t25" else 45
+        rest = 5 if mins == 25 else 10
+        store.event(q.from_user.id, "timer")
+        await q.message.reply_text(f"⏱ بدأ التركيز لمدة {mins} دقيقة. ضع الهاتف جانباً وركّز، وسأنبهك عند الانتهاء 💪", reply_markup=back_markup())
+        asyncio.create_task(run_timer(ctx.bot, q.message.chat_id, mins, rest))
+        return
+    mode = data.split(":", 1)[1]
+    ctx.user_data.clear()
+    ctx.user_data["mode"] = mode
+    await q.message.reply_text(MODE_PROMPTS[mode], reply_markup=back_markup())
+
+# ---------------- quiz ----------------
+
+async def make_quiz(topic):
+    """Shared by bot and Mini App. Returns a list of questions or None."""
+    raw = await gemini(
+        [{"text": (
+            f"أنشئ 5 أسئلة اختيار من متعدد لاختبار طالب في: «{topic}». "
+            "اجعل الأسئلة متدرجة الصعوبة. أعد JSON فقط دون أي نص آخر بهذا الشكل بالضبط:\n"
+            '[{"q":"نص السؤال","options":["خيار1","خيار2","خيار3","خيار4"],"answer":0,"why":"شرح قصير للإجابة"}]'
+            "\nanswer هو رقم الخيار الصحيح من 0 إلى 3."
+        )}],
+        temperature=0.6)
+    m = re.search(r"\[.*\]", raw, re.S)
+    qs = None
+    if m:
+        try:
+            qs = json.loads(m.group(0))
+        except Exception:
+            qs = None
+    if not qs or not isinstance(qs, list) or not all(isinstance(x, dict) and "q" in x and "options" in x for x in qs):
+        return None
+    qs = [x for x in qs if isinstance(x.get("options"), list) and len(x["options"]) >= 2 and isinstance(x.get("answer"), int)][:8]
+    return qs or None
+
+async def start_quiz(msg, ctx, topic, uid):
+    await msg.chat.send_action(ChatAction.TYPING)
+    qs = await make_quiz(topic)
+    store.event(uid, "quiz")
+    if not qs:
+        ctx.user_data.clear()
+        await msg.reply_text("تعذر إنشاء الاختبار لهذا الموضوع، جرّب موضوعاً آخر.", reply_markup=back_markup())
+        return
+    ctx.user_data["quiz"] = {"qs": qs, "i": 0, "score": 0, "topic": topic}
+    await msg.reply_text(f"🧠 اختبار: {topic}\nعدد الأسئلة: {len(qs)}. بالتوفيق!")
+    await ask_quiz(msg, ctx)
+
+async def ask_quiz(msg, ctx):
+    quiz = ctx.user_data.get("quiz")
+    if not quiz:
+        return
+    i = quiz["i"]
+    q = quiz["qs"][i]
+    letters = ["أ", "ب", "ج", "د", "هـ", "و"]
+    buttons = [[B(f"{letters[n]}) {str(opt)[:40]}", callback_data=f"qz:{n}")] for n, opt in enumerate(q["options"][:6])]
+    await msg.reply_text(f"س{i+1}) {q['q']}", reply_markup=M(buttons))
+
+async def quiz_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    quiz = ctx.user_data.get("quiz")
+    if not quiz:
+        await q.answer("انتهى هذا الاختبار. ابدأ اختباراً جديداً من القائمة.")
+        return
+    await q.answer()
+    i = quiz["i"]
+    cur = quiz["qs"][i]
+    pick = int(q.data.split(":")[1])
+    right = int(cur.get("answer", 0))
+    ok = pick == right
+    if ok:
+        quiz["score"] += 1
+    letters = ["أ", "ب", "ج", "د", "هـ", "و"]
+    why = cur.get("why", "")
+    verdict = "✅ صحيح!" if ok else f"❌ خطأ. الصحيح: {letters[right] if right < len(letters) else right}) {cur['options'][right] if right < len(cur['options']) else ''}"
+    try:
+        await q.message.edit_text(f"س{i+1}) {cur['q']}\n\n{verdict}" + (f"\n💡 {why}" if why else ""))
+    except Exception:
+        pass
+    quiz["i"] += 1
+    if quiz["i"] >= len(quiz["qs"]):
+        score, total = quiz["score"], len(quiz["qs"])
+        pct = round(100 * score / total)
+        note = "ممتاز! 🌟" if pct >= 80 else ("جيد، واصل 💪" if pct >= 50 else "راجع الدرس وحاول مجدداً 📖")
+        ctx.user_data.clear()
+        await q.message.reply_text(f"🏁 انتهى الاختبار!\nنتيجتك: {score} من {total} ({pct}%)\n{note}", reply_markup=back_markup())
+    else:
+        await ask_quiz(q.message, ctx)
+
+# ---------------- pdf ----------------
+
+def build_pdf(title, body_text):
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    pdfmetrics.registerFont(TTFont("Amiri", FONT_PATH))
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    margin = 55
+
+    def shape(t):
+        return get_display(arabic_reshaper.reshape(t))
+
+    def wrap(text, size, maxw):
+        words, lines, cur = text.split(), [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if pdfmetrics.stringWidth(shape(trial), "Amiri", size) <= maxw:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    y = H - margin
+
+    def new_page():
+        nonlocal y
+        c.showPage()
+        c.setFont("Amiri", 12)
+        y = H - margin
+
+    c.setFont("Amiri", 20)
+    for ln in wrap(title, 20, W - 2 * margin):
+        c.drawRightString(W - margin, y, shape(ln))
+        y -= 30
+        if y < margin:
+            new_page()
+    y -= 10
+    c.setFont("Amiri", 13)
+
+    for raw in body_text.split("\n"):
+        line = raw.strip()
+        if not line:
+            y -= 8
+            if y < margin:
+                new_page()
+            continue
+        heading = line.startswith("#")
+        line = re.sub(r"^#+\s*", "", line)
+        line = line.replace("**", "").replace("__", "")
+        size = 15 if heading else 13
+        c.setFont("Amiri", size)
+        for ln in wrap(line, size, W - 2 * margin):
+            if y < margin:
+                new_page()
+                c.setFont("Amiri", size)
+            c.drawRightString(W - margin, y, shape(ln))
+            y -= 22 if heading else 19
+        if heading:
+            y -= 4
+    c.save()
+    buf.seek(0)
+    return buf
+
+# ---------------- input helpers ----------------
+
+async def fetch_file(ctx, file_id):
+    f = await ctx.bot.get_file(file_id)
+    out = io.BytesIO()
+    await f.download_to_memory(out=out)
+    return out.getvalue()
+
+def blob_parts(data, mime, fname=""):
+    """Shared by bot and Mini App: turn an uploaded file into Gemini parts. Returns (parts, error)."""
+    mime = (mime or "").lower()
+    fname = (fname or "").lower()
+    if mime.startswith("image/"):
+        return [img_part(data, mime)], None
+    if mime.startswith("audio/") or mime.startswith("video/") or fname.endswith((".ogg", ".mp3", ".m4a", ".wav", ".oga", ".opus")):
+        mm = mime if mime.startswith(("audio/", "video/")) else "audio/ogg"
+        return [{"inline_data": {"mime_type": mm, "data": base64.b64encode(data).decode()}}], None
+    if mime == "application/pdf" or fname.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages[:40])
+        except Exception:
+            text = ""
+        text = text.strip()[:30000]
+        if not text:
+            return None, "لم أستطع استخراج نص من هذا الملف (قد يكون صوراً ممسوحة). أرسل صور الصفحات بدلاً منه."
+        return [{"text": "محتوى ملف PDF التالي:\n" + text}], None
+    if mime.startswith("text/") or fname.endswith(".txt"):
+        return [{"text": data.decode("utf-8", "ignore")[:30000]}], None
+    return None, "هذا النوع من الملفات غير مدعوم. أرسل نصاً أو صورة أو PDF."
+
+async def content_parts(update, ctx):
+    msg = update.message
+    parts = []
+    if msg.photo:
+        data = await fetch_file(ctx, msg.photo[-1].file_id)
+        parts.append(img_part(data, "image/jpeg"))
+    if msg.voice or msg.audio:
+        data = await fetch_file(ctx, (msg.voice or msg.audio).file_id)
+        parts.append({"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}})
+    if msg.document:
+        doc = msg.document
+        data = await fetch_file(ctx, doc.file_id)
+        p, err = blob_parts(data, doc.mime_type, doc.file_name)
+        if err:
+            return None, err
+        parts += p
+    cap = (msg.text or msg.caption or "").strip()
+    if cap:
+        parts.append({"text": cap})
+    if not parts:
+        return None, None
+    return parts, None
+
+MODE_ASKS = {
+    "explain":   "اشرح محتوى هذه الصورة شرحاً تعليمياً واضحاً ومفصلاً، وحدد الأفكار الرئيسية واشرح المصطلحات الصعبة.",
+    "summary":   "لخّص المحتوى التالي ملخصاً منظماً: الفكرة الرئيسية ثم أهم النقاط على شكل نقاط، ثم خلاصة قصيرة.",
+    "questions": "أنشئ 10 أسئلة متنوعة (اختيار من متعدد وصح/خطأ وأسئلة مقالية قصيرة) على المحتوى التالي، ثم ضع الأجوبة النموذجية في قسم منفصل في الأسفل.",
+    "simple":    "اشرح المحتوى التالي بأبسط طريقة ممكنة كأنك تشرح لطفل عمره 10 سنوات: جمل قصيرة، تشبيهات وأمثلة من الحياة اليومية، ثم لخّص الفكرة في سطرين. حافظ على صحة المعلومات والمصطلحات الأساسية.",
+    "cards":     "أنشئ من المحتوى أو الموضوع التالي 12 بطاقة حفظ. شكل كل بطاقة: 🃏 رقم) سؤال قصير  ثم  ✅ الجواب. بعدها أضف قسماً بعنوان «حيل للحفظ» فيه 3 طرق ذكية للتذكر (اختصار أحرف أو قصة قصيرة أو ربط بصورة ذهنية) خاصة بهذا الدرس.",
+    "check":     "الطالب أرسل سؤالاً وإجابته. صحّح الإجابة كمدرّس عراقي: أعطِ درجة من 10، ثم ✅ ما أصاب فيه، ثم ❌ الأخطاء أو النقص مع التصحيح، ثم اكتب الإجابة النموذجية المختصرة، ثم نصيحة واحدة للتحسين. إن لم تجد السؤال أو الإجابة واضحين فاطلب توضيحاً.",
+    "translate": "ترجم النص التالي: إذا كان بالعربية فترجمه إلى الإنجليزية، وإن كان بأي لغة أخرى فترجمه إلى العربية الفصحى الواضحة. ضع الترجمة أولاً، ثم أضف قسماً قصيراً «مفردات مهمة» يشرح أصعب 3 إلى 5 كلمات أو مصطلحات. لا تضف شيئاً آخر.",
+    "formulas":  "أنشئ ورقة قوانين منظمة للموضوع التالي وفق المنهج الدراسي العراقي: لكل قانون اكتب اسمه، ثم القانون بسطر مستقل بالرموز العادية (بدون LaTeX)، ثم معنى كل رمز ووحدته، ثم مثال رقمي صغير جداً. رتّبها من الأهم إلى الأقل أهمية.",
+    "solve":     "حل المسألة أو المسائل الموجودة في المحتوى التالي (نص أو صورة) وفق تعليمات الحل. إذا وُجدت عدة أسئلة فاحلها كلها بالترتيب، وإذا طلب الطالب سؤالاً محدداً فاحله فقط.",
+    "pdf":       "حوّل المحتوى التالي إلى ورقة مراجعة دراسية منظمة بعناوين ونقاط وتعريفات، مناسبة للطباعة والمراجعة قبل الامتحان. استخدم # للعناوين الرئيسية.",
+    "schedule":  "بناءً على معلومات الطالب التالية، أنشئ جدول مذاكرة أسبوعياً واقعياً: وزّع المواد على أيام الأسبوع مع أوقات تقريبية وفترات راحة، ورتّب الأولويات حسب قرب الامتحان وصعوبة المادة، وأضف نصائح قصيرة للالتزام بالجدول.",
+    "voice":     "انسخ هذا التسجيل الصوتي إلى نص مكتوب بدقة، باللغة التي يتحدث بها. اكتب النص فقط دون تعليق.",
+}
+
+async def run_ai(mode, parts):
+    """Shared AI call for a tool mode (bot and Mini App)."""
+    ask = MODE_ASKS.get(mode)
+    if mode == "solve":
+        return await gemini(parts + [{"text": ask}], system=SOLVE_SYS, temperature=0.2, max_tokens=16384)
+    return await gemini(parts + ([{"text": ask}] if ask else []))
+
+FEAT_NAMES = {
+    "join": "انضمام", "chat": "سؤال مباشر", "explain": "شرح صورة", "summary": "ملخص",
+    "questions": "أسئلة", "quiz": "اختبار", "schedule": "جدول", "voice": "صوت إلى نص",
+    "pdf": "PDF", "solve": "حل المسائل", "simple": "شرح مبسّط", "cards": "بطاقات حفظ",
+    "check": "تصحيح إجابة", "translate": "ترجمة", "formulas": "ورقة قوانين", "timer": "مؤقت", "handout": "تنزيل ملزمة", "webapp": "فتح التطبيق",
+}
+
+# ---------------- message flow ----------------
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    u = update.effective_user
+    if W["uid"] and u and u.id == W["uid"]:
+        d = msg.document
+        fwd = getattr(msg, "forward_origin", None)
+        if d and fwd and getattr(fwd, "type", "") == "channel" and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+            await bulk_add(update, ctx)
+        return   # the watcher account is only used to forward channel PDFs
+    store.upsert_user(u)
+    if await admin_input(update, ctx):
+        return
+    if is_admin(update):
+        if msg.reply_to_message and await ing_reply(update, ctx):
+            return
+        d = msg.document
+        is_pdf = bool(d and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")))
+        fwd = getattr(msg, "forward_origin", None)
+        from_chan = bool(fwd and getattr(fwd, "type", "") == "channel")
+        if from_chan and not ctx.user_data.get("mode"):
+            if is_pdf:
+                await bulk_add(update, ctx)
+            return   # forwarded channel posts that are not PDFs are skipped silently
+        if is_pdf and not ctx.user_data.get("mode"):
+            await ingest_pdf(update, ctx)
+            return
+    if not await gate_ok(update, ctx):
+        return
+    mode = ctx.user_data.get("mode")
+
+    if mode == "hsearch":
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.reply_text("اكتب كلمات البحث نصاً من فضلك.")
+            return
+        ctx.user_data.pop("mode", None)
+        files, total = search_files(text)
+        log_search(u.id, text)
+        if files:
+            await msg.reply_text(f"🔍 نتائج «{trim(text, 40)}» ({total}):", reply_markup=results_markup(files, total))
+        else:
+            await msg.reply_text("😕 لم أجد ملزمة مطابقة. جرّب كلمات أقل (مثلاً المادة فقط) أو استعمل البحث الموجّه.",
+                                 reply_markup=M([[B("🧭 بحث موجّه", callback_data="h:g:0:-:-:-"), B("🔎 بحث جديد", callback_data="h:qm")],
+                                                 [B("🔙 المكتبة", callback_data="h:s")]]))
+        return
+    if mode == "quiz":
+        topic = (msg.text or "").strip()
+        if not topic:
+            await msg.reply_text("أرسل اسم المادة أو الموضوع نصاً لأبني لك اختباراً.", reply_markup=back_markup())
+            return
+        ctx.user_data.pop("mode", None)
+        try:
+            await start_quiz(msg, ctx, topic, u.id)
+        except RuntimeError as e:
+            await msg.reply_text(str(e), reply_markup=back_markup())
+        return
+
+    ask = MODE_ASKS.get(mode)
+    try:
+        parts, err = await content_parts(update, ctx)
+    except Exception:
+        log.exception("download failed")
+        await msg.reply_text("تعذر تنزيل الملف، حاول إرساله مرة أخرى.", reply_markup=back_markup())
+        return
+    if err:
+        await msg.reply_text(err, reply_markup=back_markup())
+        return
+    if not parts:
+        return
+    await msg.chat.send_action(ChatAction.TYPING)
+    try:
+        result = await run_ai(mode, parts) if ask else await gemini(parts)
+    except RuntimeError as e:
+        await msg.reply_text(str(e), reply_markup=back_markup() if ask else None)
+        return
+    store.event(u.id, mode if ask else "chat")
+    if mode == "pdf":
+        try:
+            pdf = build_pdf("ورقة مراجعة", result)
+        except Exception:
+            log.exception("pdf build failed")
+            await send_long(msg, result)
+            return
+        await msg.reply_document(document=pdf, filename="مراجعة.pdf", caption="📄 ورقة المراجعة جاهزة!")
+    else:
+        await send_long(msg, result)
+    if not ask:
+        return
+    await msg.reply_text("هل تريد شيئاً آخر؟", reply_markup=back_markup())
+
+# ---------------- admin panel ----------------
+
+def screen(name):
+    s = store
+    if name == "main":
+        rows = [
+            [B("📊 الإحصائيات", callback_data="a:stats"), B("👥 المستخدمون", callback_data="a:users")],
+            [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
+            [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
+            [B("📚 إدارة الملازم", callback_data="a:hm"), B("📝 كليشة الملازم", callback_data="a:cfoot")],
+            [B("🖼 ختم الملازم", callback_data="k:m"), B("➕ قناة مصدر", callback_data="w:m")],
+            [B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("🏠 قائمة الطالب", callback_data="m:menu")],
+        ]
+        return "🎛 لوحة الأدمن", M(rows)
+    if name == "settings":
+        rows = [
+            [B(f"🛠 الصيانة {tick(s.on('maintenance'))}", callback_data="a:tmaint"),
+             B(f"🔔 إشعار الدخول {tick(s.on('join_notice'))}", callback_data="a:tjoin")],
+            [B("✏️ رسالة الصيانة", callback_data="a:maintmsg")],
+            [B("🔙 رجوع", callback_data="a:main")],
+        ]
+        return "⚙️ الإعدادات", M(rows)
+    if name == "sub":
+        ch = s.get("gate_channel", "") or "غير محددة"
+        rows = [
+            [B(f"🔐 الاشتراك الإجباري {tick(s.on('gate_on'))}", callback_data="a:tgate")],
+            [B("📺 تحديد القناة", callback_data="a:gch"), B("✏️ رسالة الاشتراك", callback_data="a:gmsg")],
+            [B("🔙 رجوع", callback_data="a:main")],
+        ]
+        return f"🔐 الاشتراك الإجباري\nالقناة: {ch}\n(يجب أن يكون البوت مشرفاً في القناة)", M(rows)
+    if name == "users":
+        rows = [
+            [B("🚫 حظر مستخدم", callback_data="a:ban"), B("✅ فك حظر", callback_data="a:unban")],
+            [B("📋 المحظورون", callback_data="a:banned"), B("🕒 آخر النشطين", callback_data="a:recent")],
+            [B("🔙 رجوع", callback_data="a:main")],
+        ]
+        return "👥 المستخدمون", M(rows)
+    return "🎛 لوحة الأدمن", M([[B("🔙 رجوع", callback_data="a:main")]])
+
+def back_admin(to="main"):
+    return M([[B("🔙 رجوع", callback_data=f"a:{to}")]])
+
+def stats_text():
+    total, new_today, active, banned, feats, feats_day = store.stats()
+    t = (f"📊 الإحصائيات\n\n👥 المستخدمون: {total}\n🆕 جدد (24 س): {new_today}\n"
+         f"🟢 نشطون (24 س): {active}\n🚫 محظورون: {banned}\n\n📈 استخدام الميزات (الكل / 24 س):\n")
+    day = dict(feats_day)
+    for k, n in feats:
+        if k == "join":
+            continue
+        t += f"• {FEAT_NAMES.get(k, k)}: {n} / {day.get(k, 0)}\n"
+    if not any(k != "join" for k, _ in feats):
+        t += "لا استخدام بعد.\n"
+    n_h, n_d = store.q("SELECT COUNT(*), COALESCE(SUM(downloads),0) FROM h_files", fetch=True)[0]
+    t += f"\n📚 الملازم: {n_h} ملزمة | {n_d} تنزيل\n"
+    for title, d in store.q("SELECT title, downloads FROM h_files WHERE downloads>0 ORDER BY downloads DESC LIMIT 5", fetch=True):
+        t += f"  ◦ {title}: {d}\n"
+    n_s = store.q("SELECT COUNT(*) FROM searches", fetch=True)[0][0]
+    t += f"\n🔍 عمليات البحث: {n_s}\n"
+    for w, n in store.q("SELECT q, COUNT(*) c FROM searches GROUP BY q ORDER BY c DESC, MAX(ts) DESC LIMIT 5", fetch=True):
+        t += f"  ◦ {w}: {n}\n"
+    return t
+
+def uline(r):
+    return f"• {r[1]} (@{r[2] or '—'}) id={r[0]}"
+
+WAIT_PROMPTS = {
+    "bc": "📢 أرسل الآن الرسالة التي تريد إذاعتها لكل المستخدمين (نص أو صورة مع تعليق).",
+    "welcome": "👋 أرسل نص رسالة الترحيب الجديدة. أرسل - للرجوع للافتراضية.",
+    "gch": "📺 أرسل يوزر القناة مثل @mychannel (البوت مشرف فيها).",
+    "gmsg": "✏️ أرسل نص رسالة الاشتراك. أرسل - للافتراضية.",
+    "maintmsg": "✏️ أرسل نص رسالة الصيانة. أرسل - للافتراضية.",
+    "cfoot": "📝 أرسل كليشة الملازم: النص الذي يظهر أسفل وصف كل ملزمة (يمكن عدة أسطر، ويوزر @ وروابط تعمل بالضغط). أرسل - لحذفها.",
+    "ban": "🚫 أرسل آيدي المستخدم (رقم) لحظره.",
+    "unban": "✅ أرسل آيدي المستخدم (رقم) لفك حظره.",
+}
+
+async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(f"🆔 آيديك: {u.id}\nاليوزر: @{u.username or '—'}")
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    log.info("ADMIN_CMD from id=%s username=%s admin=%s", u.id, u.username, is_admin(update))
+    if not is_admin(update):
+        await update.message.reply_text(f"🚫 هذا الأمر للأدمن فقط.\nآيديك: {u.id}\n(إن كنت صاحب البوت فأرسل هذا الآيدي لإعداد الصلاحية.)")
+        return
+    ctx.user_data.pop("admin_wait", None)
+    ctx.user_data.pop("mode", None)
+    t, kb = screen("main")
+    await update.message.reply_text(t, reply_markup=kb)
+
+async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("للأدمن فقط", show_alert=True)
+        return
+    await q.answer()
+    act = q.data.split(":", 1)[1]
+    ctx.user_data.pop("admin_wait", None)
+    s = store
+    if act.startswith("h"):
+        await hadmin_cb(q, ctx, act)
+        return
+    if act in ("main", "settings", "sub", "users"):
+        t, kb = screen(act)
+    elif act == "stats":
+        t, kb = stats_text(), back_admin()
+    elif act in WAIT_PROMPTS:
+        ctx.user_data["admin_wait"] = act
+        back = {"bc": "main", "welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}.get(act, "users")
+        t, kb = WAIT_PROMPTS[act], back_admin(back)
+        if act == "cfoot":
+            cur = (s.get("h_footer", "") or "").strip()
+            t += "\n\nالكليشة الحالية:\n" + (cur or "(لا توجد)")
+    elif act == "tmaint":
+        s.set("maintenance", "0" if s.on("maintenance") else "1")
+        t, kb = screen("settings")
+    elif act == "tjoin":
+        s.set("join_notice", "0" if s.on("join_notice") else "1")
+        t, kb = screen("settings")
+    elif act == "tgate":
+        s.set("gate_on", "0" if s.on("gate_on") else "1")
+        t, kb = screen("sub")
+    elif act == "banned":
+        rows = s.banned_users()
+        t = "📋 المحظورون\n" + ("\n".join(uline(r) for r in rows) if rows else "لا يوجد.")
+        kb = back_admin("users")
+    elif act == "recent":
+        rows = s.recent_users(10)
+        t = "🕒 آخر النشطين\n" + "\n".join(uline(r) + f" - {ago(r[3])}" for r in rows)
+        kb = back_admin("users")
+    elif act == "backup":
+        await do_backup()
+        t, kb = "💾 تم تحديث النسخة الاحتياطية (رسالة واحدة مثبتة بصمت). النسخ التلقائي كل 48 ساعة، وتُحمَّل عند إعادة تشغيل الخدمة.", back_admin()
+    else:
+        t, kb = screen("main")
+    try:
+        await q.message.edit_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
+
+
+# ---------------- handouts (ملازم) ----------------
+
+def hq(sql, args=(), fetch=True):
+    return store.q(sql, args, fetch=fetch)
+
+def trim(t, n=40):
+    t = (t or "").strip()
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+async def hshow(q, text, kb):
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb)
+
+HOME = [B("🔙 القائمة الرئيسية", callback_data="m:menu")]
+
+async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    store.upsert_user(q.from_user)
+    if not await gate_ok(update, ctx):
+        return
+    parts = q.data.split(":")
+    act = parts[1]
+    if act == "s":
+        rows = hq("SELECT s.id, s.name, (SELECT COUNT(*) FROM h_files f JOIN h_subjects j ON f.subject_id=j.id WHERE j.stage_id=s.id) FROM h_stages s ORDER BY s.id")
+        kb = [[B("🔍 بحث", callback_data="h:q")]]
+        kb += [[B(f"🎓 {trim(r[1])} ({r[2]})", callback_data=f"h:t:{r[0]}")] for r in rows[:50]]
+        kb.append(HOME)
+        await hshow(q, "📚 الملازم\nاختر المرحلة الدراسية:" if rows else "📚 الملازم\nلا توجد ملازم بعد، سنضيفها قريباً.", M(kb))
+    elif act == "q":
+        ctx.user_data.pop("mode", None)
+        await hshow(q, "🔍 كيف تريد البحث عن الملزمة؟",
+                    M([[B("⌨️ بحث بالكتابة", callback_data="h:qm")], [B("🧭 بحث موجّه بالأزرار", callback_data="h:g:0:-:-:-")],
+                       [B("🔙 المكتبة", callback_data="h:s")]]))
+    elif act == "qm":
+        ctx.user_data["mode"] = "hsearch"
+        await hshow(q, "⌨️ اكتب كلمات البحث: المادة أو الأستاذ أو العنوان أو السنة أو النوع.\nمثال: كيمياء سعد 2027 وزاريات",
+                    M([[B("🔙 رجوع", callback_data="h:q")]]))
+    elif act == "g":
+        await guided_view(q, int(parts[2]), parts[3], parts[4], parts[5])
+    elif act == "t":
+        sid = int(parts[2])
+        st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
+        rows = hq("SELECT j.id, j.name, (SELECT COUNT(*) FROM h_files f WHERE f.subject_id=j.id) FROM h_subjects j WHERE j.stage_id=? ORDER BY j.id", (sid,))
+        kb = [[B(f"📖 {trim(r[1])} ({r[2]})", callback_data=f"h:j:{r[0]}")] for r in rows[:50]]
+        kb.append([B("🔙 رجوع", callback_data="h:s")])
+        await hshow(q, f"🎓 {st[0][0] if st else ''}\nاختر المادة:" if rows else "لا توجد مواد في هذه المرحلة بعد.", M(kb))
+    elif act in ("j", "r", "y"):
+        jid = int(parts[2])
+        j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
+        sname = j[0][0] if j else ""
+        tree = lib_tree(jid)
+        back_subj = f"h:t:{j[0][1]}" if j else "h:s"
+        if act == "j":
+            kb = [[B(f"👨‍🏫 {trim(t['name'], 40)} ({t['n']})", callback_data=f"h:r:{jid}:{t['id']}")] for t in tree[:50]]
+            kb.append([B("🔙 رجوع", callback_data=back_subj)])
+            await hshow(q, f"📖 {sname}\nاختر الأستاذ:" if tree else "لا توجد ملازم في هذه المادة بعد.", M(kb))
+            return
+        tch = next((t for t in tree if t["id"] == parts[3]), None)
+        if not tch:
+            await hshow(q, "لم يعد هذا القسم متوفراً.", M([[B("🔙 رجوع", callback_data=f"h:j:{jid}")]]))
+            return
+        if act == "r":
+            kb = [[B(f"🗂 {trim(y['name'], 40)} ({y['n']})", callback_data=f"h:y:{jid}:{tch['id']}:{y['id']}")] for y in tch["types"][:50]]
+            kb.append([B("🔙 رجوع", callback_data=f"h:j:{jid}")])
+            await hshow(q, f"👨‍🏫 {tch['name']} · {sname}\nاختر النوع:", M(kb))
+            return
+        ty = next((y for y in tch["types"] if y["id"] == parts[4]), None)
+        if not ty:
+            await hshow(q, "لم يعد هذا القسم متوفراً.", M([[B("🔙 رجوع", callback_data=f"h:r:{jid}:{tch['id']}")]]))
+            return
+        kb = [[B(f"📄 {trim(f['title'], 50)}", callback_data=f"h:d:{f['id']}")] for f in ty["files"][:60]]
+        kb.append([B("🔙 رجوع", callback_data=f"h:r:{jid}:{tch['id']}")])
+        await hshow(q, f"🗂 {ty['name']} · {tch['name']} · {sname}\nاختر الملف لتصلك:", M(kb))
+    elif act == "d":
+        hid = int(parts[2])
+        r = hq("SELECT title, file_id, kind, subject_id FROM h_files WHERE id=?", (hid,))
+        if not r:
+            await q.message.reply_text("هذه الملزمة لم تعد متوفرة.")
+            return
+        title, fid, kind, jid = r[0]
+        try:
+            if kind == "photo":
+                await q.message.reply_photo(fid, caption=hcaption(hid) or f"📄 {title}")
+            else:
+                await q.message.reply_document(fid, caption=hcaption(hid) or f"📄 {title}")
+        except Exception:
+            log.exception("send handout failed")
+            await q.message.reply_text("تعذر إرسال الملف حالياً، حاول لاحقاً.")
+            return
+        store.q("UPDATE h_files SET downloads=downloads+1 WHERE id=?", (hid,))
+        store.event(q.from_user.id, "handout")
+
+# --- admin side ---
+
+def hb(text, cb):
+    return B(text, callback_data=cb)
+
+async def hadmin_cb(q, ctx, act):
+    parts = act.split(":")
+    a = parts[0]
+    back = [hb("🔙 رجوع", "a:main")]
+    if a == "hm":
+        n_s, n_j, n_h = [hq(f"SELECT COUNT(*) FROM {t}")[0][0] for t in ("h_stages", "h_subjects", "h_files")]
+        kb = [[hb("➕ إضافة ملزمة", "a:hb"), hb("📋 استعراض وتعديل", "a:hb")],
+              [hb("🗂 مراحل جديدة", "a:hns")], back]
+        await hshow(q, f"📚 إدارة الملازم\nالمراحل: {n_s} | المواد: {n_j} | الملازم: {n_h}\n\nلإضافة ملزمة: افتح المرحلة ثم المادة ثم اضغط ➕ إضافة ملزمة هنا.", M(kb))
+    elif a == "hns":
+        ctx.user_data["admin_wait"] = "hstage"
+        await hshow(q, "🗂 أرسل اسم المرحلة الجديدة (مثال: السادس الإعدادي العلمي).", M([[hb("🔙 رجوع", "a:hm")]]))
+    elif a == "hb":
+        rows = hq("SELECT id, name FROM h_stages ORDER BY id")
+        kb = [[hb(f"🎓 {trim(r[1])}", f"a:hbs:{r[0]}")] for r in rows[:50]]
+        kb.append([hb("➕ مرحلة جديدة", "a:hns")])
+        kb.append([hb("🔙 رجوع", "a:hm")])
+        await hshow(q, "اختر المرحلة:" if rows else "لا توجد مراحل. أضف مرحلة أولاً.", M(kb))
+    elif a == "hbs":
+        sid = int(parts[1])
+        st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
+        rows = hq("SELECT id, name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,))
+        kb = [[hb(f"📖 {trim(r[1])}", f"a:hbj:{r[0]}")] for r in rows[:50]]
+        kb.append([hb("➕ مادة جديدة", f"a:hnj:{sid}")])
+        kb.append([hb("✏️ تغيير اسم المرحلة", f"a:hrs:{sid}"), hb("🗑 حذف المرحلة", f"a:hds:{sid}")])
+        kb.append([hb("🔙 رجوع", "a:hb")])
+        await hshow(q, f"🎓 {st[0][0] if st else ''}\nالمواد:", M(kb))
+    elif a == "hnj":
+        ctx.user_data["admin_wait"] = f"hsub:{parts[1]}"
+        await hshow(q, "📖 أرسل اسم المادة الجديدة (مثال: الفيزياء).", M([[hb("🔙 رجوع", f"a:hbs:{parts[1]}")]]))
+    elif a == "hrs":
+        ctx.user_data["admin_wait"] = f"hrst:{parts[1]}"
+        await hshow(q, "✏️ أرسل الاسم الجديد للمرحلة.", M([[hb("🔙 رجوع", f"a:hbs:{parts[1]}")]]))
+    elif a == "hds":
+        sid = parts[1]
+        await hshow(q, "⚠️ سيتم حذف المرحلة مع كل موادها وملازمها. متأكد؟",
+                    M([[hb("✅ نعم احذف", f"a:hdsy:{sid}"), hb("❌ إلغاء", f"a:hbs:{sid}")]]))
+    elif a == "hdsy":
+        sid = int(parts[1])
+        hq("DELETE FROM h_files WHERE subject_id IN (SELECT id FROM h_subjects WHERE stage_id=?)", (sid,), False)
+        hq("DELETE FROM h_subjects WHERE stage_id=?", (sid,), False)
+        hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف المرحلة.", M([[hb("🔙 رجوع", "a:hb")]]))
+    elif a == "hbj":
+        jid = int(parts[1])
+        j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
+        if not j:
+            await hshow(q, "المادة غير موجودة.", M([[hb("🔙 رجوع", "a:hb")]]))
+            return
+        rows = hq("SELECT id, title, downloads FROM h_files WHERE subject_id=? ORDER BY id", (jid,))
+        kb = [[hb(f"📄 {trim(r[1], 30)} ({r[2]}⬇)", f"a:hh:{r[0]}")] for r in rows[:60]]
+        kb.append([hb("➕ إضافة ملزمة هنا", f"a:hadd:{jid}")])
+        kb.append([hb("✏️ تغيير اسم المادة", f"a:hrj:{jid}"), hb("🗑 حذف المادة", f"a:hdj:{jid}")])
+        kb.append([hb("🔙 رجوع", f"a:hbs:{j[0][1]}")])
+        await hshow(q, f"📖 {j[0][0]}\nالملازم ({len(rows)}):", M(kb))
+    elif a == "hrj":
+        ctx.user_data["admin_wait"] = f"hrnj:{parts[1]}"
+        await hshow(q, "✏️ أرسل الاسم الجديد للمادة.", M([[hb("🔙 رجوع", f"a:hbj:{parts[1]}")]]))
+    elif a == "hdj":
+        jid = parts[1]
+        await hshow(q, "⚠️ سيتم حذف المادة مع كل ملازمها. متأكد؟",
+                    M([[hb("✅ نعم احذف", f"a:hdjy:{jid}"), hb("❌ إلغاء", f"a:hbj:{jid}")]]))
+    elif a == "hdjy":
+        jid = int(parts[1])
+        j = hq("SELECT stage_id FROM h_subjects WHERE id=?", (jid,))
+        hq("DELETE FROM h_files WHERE subject_id=?", (jid,), False)
+        hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف المادة.", M([[hb("🔙 رجوع", f"a:hbs:{j[0][0]}" if j else "a:hb")]]))
+    elif a == "hadd":
+        ctx.user_data["admin_wait"] = f"htitle:{parts[1]}"
+        await hshow(q, "📄 أرسل عنوان الملزمة (مثال: ملزمة الفصل الأول - أ. أحمد).", M([[hb("🔙 رجوع", f"a:hbj:{parts[1]}")]]))
+    elif a == "hh":
+        hid = int(parts[1])
+        r = hq("SELECT title, downloads, subject_id FROM h_files WHERE id=?", (hid,))
+        if not r:
+            await hshow(q, "غير موجودة.", M([[hb("🔙 رجوع", "a:hb")]]))
+            return
+        kb = [[hb("✏️ تعديل العنوان", f"a:hrt:{hid}"), hb("🔄 استبدال الملف", f"a:hrf:{hid}")],
+              [hb("📥 استلام الملف", f"a:hget:{hid}"), hb("🗑 حذف", f"a:hdh:{hid}")],
+              [hb("🔙 رجوع", f"a:hbj:{r[0][2]}")]]
+        await hshow(q, f"📄 {r[0][0]}\nالتنزيلات: {r[0][1]}", M(kb))
+    elif a == "hget":
+        r = hq("SELECT title, file_id, kind FROM h_files WHERE id=?", (int(parts[1]),))
+        if r:
+            if r[0][2] == "photo":
+                await q.message.reply_photo(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
+            else:
+                await q.message.reply_document(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
+    elif a == "hrt":
+        ctx.user_data["admin_wait"] = f"hrnt:{parts[1]}"
+        await hshow(q, "✏️ أرسل العنوان الجديد.", M([[hb("🔙 رجوع", f"a:hh:{parts[1]}")]]))
+    elif a == "hrf":
+        ctx.user_data["admin_wait"] = f"hrep:{parts[1]}"
+        await hshow(q, "🔄 أرسل الملف الجديد (PDF أو صورة).", M([[hb("🔙 رجوع", f"a:hh:{parts[1]}")]]))
+    elif a == "hdh":
+        hid = parts[1]
+        await hshow(q, "⚠️ حذف هذه الملزمة؟", M([[hb("✅ نعم احذف", f"a:hdhy:{hid}"), hb("❌ إلغاء", f"a:hh:{hid}")]]))
+    elif a == "hdhy":
+        hid = int(parts[1])
+        r = hq("SELECT subject_id FROM h_files WHERE id=?", (hid,))
+        hq("DELETE FROM h_files WHERE id=?", (hid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف الملزمة.", M([[hb("🔙 رجوع", f"a:hbj:{r[0][0]}" if r else "a:hb")]]))
+    else:
+        await hshow(q, "📚 إدارة الملازم", M([[hb("🔙 رجوع", "a:hm")]]))
+
+def file_of(msg):
+    if msg.document:
+        return msg.document.file_id, "document"
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo"
+    return None, None
+
+async def hadmin_input(update, ctx, act, msg, text):
+    parts = act.split(":")
+    a = parts[0]
+    def kbk(cb):
+        return M([[hb("🔙 رجوع", cb)]])
+    if a in ("hstage", "hsub", "hrst", "hrnj", "hrnt", "htitle") and not text:
+        ctx.user_data["admin_wait"] = act
+        await msg.reply_text("أرسل نصاً من فضلك.")
+        return True
+    if a == "hstage":
+        hq("INSERT INTO h_stages(name) VALUES(?)", (text,), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة المرحلة: {text}", reply_markup=kbk("a:hb"))
+    elif a == "hsub":
+        hq("INSERT INTO h_subjects(stage_id,name) VALUES(?,?)", (int(parts[1]), text), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة المادة: {text}", reply_markup=kbk(f"a:hbs:{parts[1]}"))
+    elif a == "hrst":
+        hq("UPDATE h_stages SET name=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تغيير الاسم.", reply_markup=kbk(f"a:hbs:{parts[1]}"))
+    elif a == "hrnj":
+        hq("UPDATE h_subjects SET name=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تغيير الاسم.", reply_markup=kbk(f"a:hbj:{parts[1]}"))
+    elif a == "hrnt":
+        hq("UPDATE h_files SET title=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تعديل العنوان.", reply_markup=kbk(f"a:hh:{parts[1]}"))
+    elif a == "htitle":
+        ctx.user_data["hnew_title"] = text
+        ctx.user_data["admin_wait"] = f"hfile:{parts[1]}"
+        await msg.reply_text(f"📎 العنوان: {text}\nالآن أرسل الملف (PDF أو صورة).", reply_markup=kbk(f"a:hbj:{parts[1]}"))
+    elif a == "hfile":
+        fid, kind = file_of(msg)
+        if not fid:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل الملف نفسه (PDF أو صورة) وليس نصاً.")
+            return True
+        title = ctx.user_data.pop("hnew_title", None) or (msg.document.file_name if msg.document else "ملزمة")
+        hq("INSERT INTO h_files(subject_id,title,file_id,kind,added) VALUES(?,?,?,?,?)",
+           (int(parts[1]), title, fid, kind, time.time()), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة الملزمة: {title}\nلإضافة أخرى اضغط ➕ مجدداً.",
+                             reply_markup=M([[hb("➕ إضافة ملزمة أخرى", f"a:hadd:{parts[1]}")], [hb("📖 المادة", f"a:hbj:{parts[1]}")]]))
+    elif a == "hrep":
+        fid, kind = file_of(msg)
+        if not fid:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل الملف نفسه.")
+            return True
+        hq("UPDATE h_files SET file_id=?, kind=? WHERE id=?", (fid, kind, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم استبدال الملف.", reply_markup=kbk(f"a:hh:{parts[1]}"))
+    else:
+        return False
+    return True
+
+async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle admin free-text input for pending panel actions. True if consumed."""
+    if not is_admin(update):
+        return False
+    act = ctx.user_data.get("admin_wait")
+    if not act:
+        return False
+    msg = update.message
+    ctx.user_data.pop("admin_wait", None)
+    text = (msg.text or msg.caption or "").strip()
+    s = store
+    if act.startswith("ie:"):
+        return await ing_edit_input(update, ctx, act)
+    if act.startswith("ks"):
+        return await stamp_input(update, ctx, act)
+    if act.startswith("wa"):
+        return await watch_input(update, ctx, act)
+    if act.startswith("h"):
+        return await hadmin_input(update, ctx, act, msg, text)
+    back = {"welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}
+    if act == "bc":
+        ids = s.all_user_ids()
+        await msg.reply_text(f"⏳ جاري الإذاعة إلى {len(ids)} مستخدم...")
+        ok = fail = 0
+        for uid in ids:
+            try:
+                await msg.copy(uid)
+                ok += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.05)
+        await msg.reply_text(f"✅ انتهت الإذاعة\nنجح: {ok}\nفشل: {fail}", reply_markup=back_admin())
+        return True
+    if act == "cfoot":
+        s.set("h_footer", "" if text == "-" else (msg.text or "").strip()[:700])
+        await msg.reply_text("✅ تم حفظ كليشة الملازم." if text != "-" else "🗑 تم حذف الكليشة.", reply_markup=back_admin("main"))
+        return True
+    if act in ("welcome", "gmsg", "maintmsg"):
+        key = {"welcome": "welcome", "gmsg": "gate_msg", "maintmsg": "maintenance_msg"}[act]
+        s.set(key, "" if text == "-" else text)
+        await msg.reply_text("✅ تم الحفظ.", reply_markup=back_admin(back[act]))
+        return True
+    if act == "gch":
+        ch = text if text.startswith("@") else "@" + text
+        try:
+            c = await ctx.bot.get_chat(ch)
+            me = await ctx.bot.get_chat_member(c.id, ctx.bot.id)
+            if me.status not in ("administrator", "creator"):
+                raise ValueError("not admin")
+        except Exception:
+            await msg.reply_text("❌ تعذر التحقق: تأكد أن اليوزر صحيح وأن البوت مشرف في القناة.", reply_markup=back_admin("sub"))
+            return True
+        s.set("gate_channel", ch)
+        await msg.reply_text(f"✅ تم تحديد القناة {ch}", reply_markup=back_admin("sub"))
+        return True
+    if act in ("ban", "unban"):
+        if not text.lstrip("-").isdigit():
+            await msg.reply_text("❌ أرسل آيدي رقمي صحيح.", reply_markup=back_admin("users"))
+            return True
+        uid = int(text)
+        if act == "ban" and uid in ADMIN_IDS:
+            await msg.reply_text("❌ لا يمكن حظر أدمن.", reply_markup=back_admin("users"))
+            return True
+        s.set_ban(uid, act == "ban")
+        await msg.reply_text("🚫 تم الحظر." if act == "ban" else "✅ تم فك الحظر.", reply_markup=back_admin("users"))
+        return True
+    return False
+
+# ---------------- handout search ----------------
+def all_files():
+    rows = store.q("SELECT f.id, f.title, f.teacher, f.ftype, f.year, f.quality, j.name, s.name FROM h_files f "
+                   "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id ORDER BY f.id DESC", fetch=True)
+    out = []
+    for fid, title, teacher, ftype, year, quality, jn, sn in rows:
+        t = eff_teacher(teacher, title)
+        y = eff_type(ftype, title)
+        fields = (title, jn, sn, "" if t == GENERAL else t, y, year or "", quality or "")
+        out.append({"id": fid, "title": title, "teacher": t, "type": y, "year": year or "", "subject": jn, "stage": sn,
+                    "doc": " ".join(nrm(x) for x in fields), "ntitle": nrm(title),
+                    "sk": sid_of(nrm(jn)), "gk": sid_of(nrm(sn)), "tk": sid_of(t)})
+    return out
+
+def tok_variants(tok):
+    v = {tok}
+    if tok == "ملازم":
+        v.add("ملزم")
+    if len(tok) >= 4:
+        v.add(tok[:-1])
+    if len(tok) >= 5 and tok.endswith(("ات", "ون", "ين")):
+        v.add(tok[:-2])
+    return v
+
+def search_files(query, stage=None, subject=None, teacher=None, limit=25):
+    """query: free text (may be empty); stage/subject/teacher: normalized-name keys (sid_of) or None."""
+    toks = [t for t in (nrm(w) for w in (query or "").split()) if t]
+    res = []
+    for f in all_files():
+        if stage and f["gk"] != stage or subject and f["sk"] != subject or teacher and f["tk"] != teacher:
+            continue
+        score = 0
+        ok = True
+        for t in toks:
+            vs = tok_variants(t)
+            if not any(v in f["doc"] for v in vs):
+                ok = False
+                break
+            score += 2 if any(v in f["ntitle"] for v in vs) else 1
+        if ok:
+            res.append((score, f))
+    res.sort(key=lambda x: -x[0])
+    return [f for _, f in res[:limit]], len(res)
+
+def log_search(uid, q):
+    q = " ".join(nrm(w) for w in (q or "").split() if nrm(w))[:60]
+    if len(q) >= 2:
+        store.q("INSERT INTO searches(ts,user_id,q) VALUES(?,?,?)", (time.time(), uid, q))
+
+def results_markup(files, total, back="h:q"):
+    kb = [[B(f"📄 {trim(f['title'], 40)} · {trim(f['stage'], 18)}", callback_data=f"h:d:{f['id']}")] for f in files]
+    kb.append([B("🔎 بحث جديد", callback_data="h:q"), B("🔙 المكتبة", callback_data="h:s")])
+    return M(kb)
+
+def uniq_options(files, key, label):
+    seen = {}
+    for f in files:
+        k = f[key]
+        e = seen.setdefault(k, [f[label], 0])
+        e[1] += 1
+    return [(k, v[0], v[1]) for k, v in sorted(seen.items(), key=lambda kv: (kv[1][0] == GENERAL, kv[1][0]))]
+
+async def guided_view(q, step, S, T, C):
+    """step 0 subject, 1 stage, 2 teacher, 3 results. S/T/C: chosen key or '-'."""
+    key = lambda x: None if x == "-" else x
+    files, total = search_files("", stage=key(T), subject=key(S), teacher=key(C), limit=60)
+    chosen = any(x != "-" for x in (S, T, C))
+    if step >= 3 or (chosen and total <= 6):
+        txt = f"🔍 النتائج ({total})" if files else "😕 لا توجد نتائج بهذه الاختيارات."
+        await hshow(q, txt, results_markup(files[:25], total))
+        return
+    spec = {0: ("sk", "subject", "📖", "اختر المادة"), 1: ("gk", "stage", "🎓", "اختر المرحلة"), 2: ("tk", "teacher", "👨‍🏫", "اختر الأستاذ")}[step]
+    opts = uniq_options(files, spec[0], spec[1])
+    def nxt(val):
+        ch = [S, T, C]
+        ch[step] = val
+        return f"h:g:{step + 1}:{ch[0]}:{ch[1]}:{ch[2]}"
+    kb = [[B(f"{spec[2]} {trim(n, 35)} ({c})", callback_data=nxt(k))] for k, n, c in opts[:40]]
+    row = [B("⏭ تخطي", callback_data=nxt("-"))]
+    if chosen:
+        row.append(B(f"📄 عرض النتائج ({total})", callback_data=f"h:g:3:{S}:{T}:{C}"))
+    kb.append(row)
+    kb.append([B("🔙 رجوع", callback_data="h:q")])
+    await hshow(q, f"🧭 بحث موجّه ({step + 1}/3)\n{spec[3]}:" if opts else "لا توجد ملازم بعد.", M(kb))
+
+# ---------------- handout library tree (stage > subject > teacher > type > files) ----------------
+TYPES = ["ملازم", "وزاريات", "أسئلة", "ملخصات", "اختبارات"]
+GENERAL = "عام"
+
+def classify_type(text):
+    n = nrm(text)
+    for kw, t in (("وزاري", "وزاريات"), ("اختبار", "اختبارات"), ("امتحان", "اختبارات"), ("كويز", "اختبارات"),
+                  ("سؤال", "أسئلة"), ("اسئل", "أسئلة"), ("ملخص", "ملخصات"), ("مختصر", "ملخصات")):
+        if kw in n:
+            return t
+    return "ملازم"
+
+def eff_teacher(teacher, title):
+    t = (teacher or "").strip()
+    if not t:
+        m = re.search(r" - أ\. (.+)$", title or "")
+        t = m.group(1).strip() if m else ""
+    return t or GENERAL
+
+def eff_type(ftype, title):
+    return (ftype or "").strip() or classify_type(title)
+
+def sid_of(name):
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:6]
+
+def lib_tree(jid):
+    """[{name, id, n, types:[{name, id, n, files:[{id,title}]}]}] for one subject."""
+    teachers = {}
+    for fid, title, teacher, ftype in store.q("SELECT id, title, teacher, ftype FROM h_files WHERE subject_id=? ORDER BY id", (jid,), fetch=True):
+        t = eff_teacher(teacher, title)
+        y = eff_type(ftype, title)
+        teachers.setdefault(t, {}).setdefault(y, []).append({"id": fid, "title": title})
+    out = []
+    for t in sorted(teachers, key=lambda x: (x == GENERAL, x)):
+        tys = teachers[t]
+        order = sorted(tys, key=lambda y: (TYPES.index(y) if y in TYPES else len(TYPES), y))
+        types = [{"name": y, "id": sid_of(y), "n": len(tys[y]), "files": tys[y]} for y in order]
+        out.append({"name": t, "id": sid_of(t), "n": sum(x["n"] for x in types), "types": types})
+    return out
+
+# ---------------- handout caption ----------------
+def stage_for(stage):
+    st = (stage or "").strip()
+    if re.search(r"(الإعدادي|الاعدادي)\s+(العلمي|الأدبي|الادبي)", st):
+        st = re.sub(r"\s*(الإعدادي|الاعدادي)", "", st)
+    st = re.sub(r"^ال", "لل", st) if st.startswith("ال") else "ل" + st
+    return st
+
+def hcaption(hid):
+    r = hq("SELECT f.title, f.teacher, f.year, f.quality, j.name, s.name FROM h_files f "
+           "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
+    if not r:
+        return ""
+    title, teacher, year, quality, subj, stage = [(x or "").strip() for x in r[0]]
+    base = title
+    if teacher and base.endswith(f" - أ. {teacher}"):
+        base = base[: -len(f" - أ. {teacher}")].strip()
+    if subj and nrm(subj) not in nrm(base):
+        base = f"{base} - {subj}"
+    lines = [f"💡➖ {base}", f"⭕️➖ {stage_for(stage)}"]
+    if teacher:
+        lines.append(f"🛎➖ للاستاذ {teacher}")
+    if year:
+        lines.append(f"✏️➖ لسنــــة : {year}")
+    if quality:
+        lines.append(f"✅➖ دقة : {quality}")
+    head = "\n".join(lines)
+    foot = (store.get("h_footer", "") or "").strip()
+    if not foot:
+        return head[:1024]
+    room = 1024 - len(head) - 2
+    if room < 10:
+        return head[:1024]
+    if len(foot) > room:
+        foot = foot[: room - 1] + "…"
+    return head + "\n\n" + foot
+
+# ---------------- auto handout ingest (admin sends a PDF, AI files it) ----------------
+ING_LOCK = asyncio.Lock()
+PENDING = {}      # bot message id -> record waiting for an answer / confirmation
+AUTO = set()      # ('s'|'j', id) created automatically, removed again if left empty
+MAX_DL = 20 * 1024 * 1024   # Telegram Bot API download limit
+
+ING_SYS = (
+    "أنت أمين مكتبة مدرسية عراقية. تقرأ بداية ملزمة (PDF) واسم الملف ووصفها، وتستخرج بياناتها للأرشفة. "
+    "أجب بـ JSON فقط بدون أي شرح أو علامات."
+)
+
+def nrm(s):
+    s = re.sub(r"[\u064B-\u065F\u0640]", "", s or "")
+    s = s.translate(str.maketrans("أإآىة", "ااايه")).lower()
+    s = re.sub(r"(^|\s)ال", r"\1", s)
+    return re.sub(r"[^\w]", "", s)
+
+def stem(fname):
+    s = re.sub(r"\.pdf$", "", fname or "", flags=re.I)
+    return re.sub(r"[_]+", " ", s).strip() or "ملزمة"
+
+def compose_title(title, teacher):
+    title = (title or "").strip() or "ملزمة"
+    teacher = (teacher or "").strip()
+    if teacher and nrm(teacher) not in nrm(title):
+        title = f"{title} - أ. {teacher}"
+    return title
+
+def get_stage(name, create=True):
+    n = nrm(name)
+    for sid, sname in hq("SELECT id, name FROM h_stages ORDER BY id"):
+        if nrm(sname) == n:
+            return sid
+    if not create:
+        return None
+    hq("INSERT INTO h_stages(name) VALUES(?)", (name.strip(),), False)
+    sid = hq("SELECT id FROM h_stages ORDER BY id DESC LIMIT 1")[0][0]
+    AUTO.add(("s", sid))
+    return sid
+
+def get_subject(sid, name):
+    n = nrm(name)
+    for jid, jname in hq("SELECT id, name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,)):
+        if nrm(jname) == n:
+            return jid
+    hq("INSERT INTO h_subjects(stage_id,name) VALUES(?,?)", (sid, name.strip()), False)
+    jid = hq("SELECT id FROM h_subjects ORDER BY id DESC LIMIT 1")[0][0]
+    AUTO.add(("j", jid))
+    return jid
+
+def cleanup_empty(jid):
+    r = hq("SELECT stage_id FROM h_subjects WHERE id=?", (jid,))
+    if not r:
+        return
+    sid = r[0][0]
+    if ("j", jid) in AUTO and not hq("SELECT 1 FROM h_files WHERE subject_id=? LIMIT 1", (jid,)):
+        hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+        AUTO.discard(("j", jid))
+    if ("s", sid) in AUTO and not hq("SELECT 1 FROM h_subjects WHERE stage_id=? LIMIT 1", (sid,)):
+        hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
+        AUTO.discard(("s", sid))
+
+def pdf_head(data, pages=3):
+    """First pages of a PDF: (text, small_pdf_bytes_or_None)."""
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        try:
+            r.decrypt("")
+        except Exception:
+            return "", None
+    sel = r.pages[:pages]
+    text = "\n".join((p.extract_text() or "") for p in sel).strip()
+    small = None
+    if len(text) < 80:   # scanned: let Gemini look at the pages themselves
+        w = PdfWriter()
+        for p in sel:
+            w.add_page(p)
+        buf = io.BytesIO()
+        w.write(buf)
+        if buf.tell() <= 7 * 1024 * 1024:
+            small = buf.getvalue()
+    return text[:3500], small
+
+async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
+    existing = []
+    for sid, sname in hq("SELECT id, name FROM h_stages ORDER BY id"):
+        subs = [r[0] for r in hq("SELECT name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,))]
+        existing.append(f"- {sname}: " + (("، ".join(subs)) or "(لا مواد بعد)"))
+    prompt = (
+        "استخرج من هذه الملزمة: المرحلة/الصف، المادة، اسم المدرّس، وعنواناً مناسباً.\n"
+        f"اسم الملف: {doc.file_name or ''}\nوصف الأدمن: {caption or '(لا يوجد)'}\n"
+        "المراحل والمواد الموجودة حالياً في المكتبة:\n" + ("\n".join(existing) or "(فارغة)") + "\n\n"
+        "القواعد: إذا كانت المرحلة أو المادة تطابق موجوداً فاستعمل اسمه حرفياً. "
+        "المرحلة بصيغة مثل: السادس الإعدادي العلمي، الثالث المتوسط، الرابع الإعدادي. "
+        "المادة مثل: الفيزياء، الرياضيات. اسم المدرّس بدون لقب (بدون أ. أو الأستاذ). "
+        "العنوان هو عنوان الملزمة فقط مثل «ملزمة الفصل الأول» أو «أسئلة وزارية» بدون اسم المدرّس وبدون المرحلة. "
+        "النوع type: واحد من (ملازم، وزاريات، أسئلة، ملخصات، اختبارات) حسب محتوى الملف، أو كلمة قصيرة أخرى إن لم ينطبق أي منها. "
+        "السنة year: سنة أو دورة الملزمة كما هي مكتوبة فعلاً (مثل 2027 أو 2026-2027). "
+        "الدقة quality: فقط إذا كُتبت صراحةً في الوصف أو اسم الملف (مثل سكنر، نسخة أصلية). "
+        "لا تخمّن ولا تخترع: إذا لم تجد قيمة مكتوبة بوضوح (خصوصاً المدرّس والسنة) اتركها نصاً فارغاً.\n"
+        'الصيغة: {"stage":"","subject":"","teacher":"","title":"","type":"","year":"","quality":""}'
+    )
+    if bulk:
+        prompt += ("\nملاحظة: الوصف أعلاه هو نص منشور قناة عامة، وهو المصدر الأساسي للمرحلة والمادة والمدرّس والسنة. "
+                   "تجاهل الروابط والإعلانات وأسماء القنوات. اكتب المرحلة بصيغتها الكاملة مثل السادس الإعدادي العلمي حتى لو كُتبت مختصرة (مثل: سادس علمي).")
+    parts = [{"text": prompt}]
+    size = doc.file_size or 0
+    text, small, scanned = "", None, False
+    if size and size <= MAX_DL and not no_file:
+        data = await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
+        try:
+            text, small = await asyncio.wait_for(asyncio.to_thread(pdf_head, data), 20)
+        except Exception:
+            log.exception("pdf_head failed")
+            text, small = "", None
+        del data
+        scanned = not text
+        if text:
+            parts.append({"text": "نص أول صفحات الملف:\n" + text})
+        elif small:
+            parts.append({"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(small).decode()}})
+    out = await asyncio.wait_for(gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024, fast=True), 45)
+    m = re.search(r"\{.*\}", out, re.S)
+    d = json.loads(m.group(0)) if m else {}
+    res = {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title", "type", "year", "quality")}
+    if res["year"] and not small:   # no visual source: the year must really appear in the name, caption or text
+        src = f"{doc.file_name or ''} {caption or ''} {text}"
+        if not all(y in src for y in re.findall(r"\d{4}", res["year"])) or not re.search(r"\d{4}", res["year"]):
+            res["year"] = ""
+    if not res["type"]:
+        res["type"] = classify_type(f"{res['title']} {doc.file_name or ''} {caption or ''}")
+    if not res["quality"] and scanned:
+        res["quality"] = "سكنر"
+    return res
+
+SUBJ_KW = [("انكليزي", "اللغة الإنكليزية"), ("انجليزي", "اللغة الإنكليزية"), ("english", "اللغة الإنكليزية"),
+           ("عربي", "اللغة العربية"), ("فيزياء", "الفيزياء"), ("كيمياء", "الكيمياء"), ("رياضيات", "الرياضيات"),
+           ("احياء", "الأحياء"), ("اسلامي", "التربية الإسلامية"), ("حاسوب", "الحاسوب"), ("جغرافي", "الجغرافية"),
+           ("تاريخ", "التاريخ"), ("فرنسي", "اللغة الفرنسية"), ("علوم", "العلوم")]
+ORD = ["الاول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس"]
+
+def guess_from_name(name, caption):
+    raw = f"{stem(name)} {caption or ''}"
+    n = nrm(raw.replace("_", " ").replace("-", " "))
+    g = {"stage": "", "subject": "", "teacher": "", "title": "", "type": classify_type(raw), "year": "", "quality": ""}
+    ym = re.search(r"(20\d\d)(?:\s*[-/]\s*(20\d\d))?", raw)
+    if ym:
+        g["year"] = ym.group(0).replace(" ", "")
+    if re.search(r"سكنر|سكانر|scan", raw, re.I):
+        g["quality"] = "سكنر"
+    for sid, sname in hq("SELECT id, name FROM h_subjects ORDER BY id"):
+        if nrm(sname) and nrm(sname) in n:
+            g["subject"] = sname
+            break
+    if not g["subject"]:
+        for kw, nm in SUBJ_KW:
+            if kw in n:
+                g["subject"] = nm
+                break
+    for o in ORD:
+        if nrm(o) in n:
+            if "متوسط" in n or o in ("الاول", "الثاني", "الثالث") and "اعدادي" not in n:
+                g["stage"] = f"{o} المتوسط".replace("الاول", "الأول")
+            else:
+                g["stage"] = f"{o} الإعدادي" + (" العلمي" if "علمي" in n else " الأدبي" if "ادبي" in n else "")
+            break
+    # teacher: first Arabic chunk of the file name that is not a subject, stage word or number
+    for part in re.split(r"[_\-|]+", re.sub(r"\.pdf$", "", name or "", flags=re.I)):
+        pn = nrm(part)
+        if not pn or pn.isdigit() or not re.search(r"[\u0600-\u06FF]", part):
+            continue
+        if any(kw in pn for kw, _ in SUBJ_KW) or any(nrm(o) in pn for o in ORD) or "ملزم" in pn or "متوسط" in pn or "اعدادي" in pn:
+            continue
+        if len(part.split()) <= 4:
+            g["teacher"] = part.strip()
+            break
+    year = re.search(r"(20\d\d)", stem(name))
+    if g["subject"]:
+        g["title"] = "ملزمة " + g["subject"] + (f" {year.group(1)}" if year else "")
+    return g
+
+def ing_summary(hid):
+    r = hq("SELECT f.title, f.teacher, j.name, s.name, f.year, f.quality, f.ftype FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
+           "JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
+    if not r:
+        return None, None
+    title, teacher, subj, stage, year, quality, ftype = r[0]
+    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}\n📅 السنة: {year or 'غير محددة'} › 🔎 الدقة: {quality or 'غير محددة'}\n🗂 النوع: {eff_type(ftype, title)}"
+    kb = M([[hb("✏️ تعديل", f"i:e:{hid}"), hb("🗑 حذف", f"i:d:{hid}")]])
+    return text, kb
+
+# ---------------- handout stamp (image on first + last page) ----------------
+
+STAMP_LOCK = asyncio.Lock()
+STAMPJOB = {"run": False, "stop": False}
+POS_LABEL = {"tl": "أعلى اليسار", "tc": "أعلى الوسط", "tr": "أعلى اليمين",
+             "bl": "أسفل اليسار", "bc": "أسفل الوسط", "br": "أسفل اليمين"}
+POS_ORDER = ["tc", "bc", "tr", "tl", "br", "bl"]
+SIZE_LABEL = {"s": "صغير", "m": "متوسط", "l": "كبير"}
+SIZE_ORDER = ["s", "m", "l"]
+OP_ORDER = ["100", "80", "60", "40"]
+
+def stamp_cfg():
+    import base64 as b64
+    s = store
+    f = s.get("stamp_img_f", "")
+    if not f:
+        try:
+            from stamp_default import DEFAULT_B64 as f   # shipped default image (optional file)
+        except Exception:
+            f = ""
+    if not f:
+        return None
+    l = s.get("stamp_img_l", "") or f
+    pf = s.get("stamp_pos_f", "") or "tc"
+    return {"on": s.on("stamp_on"), "img_f": b64.b64decode(f), "img_l": b64.b64decode(l), "has_l": bool(s.get("stamp_img_l", "")),
+            "pos_f": pf, "pos_l": s.get("stamp_pos_l", "") or pf,
+            "size": s.get("stamp_size", "") or "s", "op": int(s.get("stamp_op", "") or 100) / 100.0}
+
+def stamp_rect(pos, size, iw, ih, W, H):
+    frac = {"s": 0.30, "m": 0.50, "l": 0.75}[size]
+    cap = {"s": 0.07, "m": 0.11, "l": 0.16}[size]
+    w = W * frac
+    h = w * ih / iw
+    if h > H * cap:
+        h = H * cap
+        w = h * iw / ih
+    m = min(W, H) * 0.02
+    x = {"l": m, "c": (W - w) / 2, "r": W - w - m}[pos[1]]
+    y = {"t": H - h - m, "b": m}[pos[0]]
+    return x, y, w, h
+
+def prep_stamp_image(data):
+    from PIL import Image
+    im = Image.open(io.BytesIO(data))
+    im = im.convert("RGBA")
+    im.thumbnail((900, 900))
+    out = io.BytesIO()
+    im.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+def stamp_pdf(data, cfg):
+    """Return (stamped_bytes, pages_stamped). First and last page; one page once."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    if n == 0:
+        raise ValueError("empty pdf")
+    w = PdfWriter()
+    w.append(r)
+    del r
+    targets = [(0, "f")] if n == 1 else [(0, "f"), (n - 1, "l")]
+    imgs = {"f": Image.open(io.BytesIO(cfg["img_f"])).convert("RGBA"), "l": Image.open(io.BytesIO(cfg["img_l"])).convert("RGBA")}
+    done = 0
+    for idx, slot in targets:
+        page = w.pages[idx]
+        if (page.get("/Rotate", 0) or 0) % 360:
+            try:
+                page.transfer_rotation_to_content()
+            except Exception:
+                log.warning("rotate transfer failed")
+                continue
+        mb = page.cropbox
+        W, H = float(mb.width), float(mb.height)
+        im = imgs[slot]
+        x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(W, H))
+        c.setFillAlpha(cfg["op"])
+        c.drawImage(ImageReader(im), x, y, bw, bh, mask="auto")
+        c.save()
+        ov = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+        page.merge_transformed_page(ov, Transformation().translate(float(mb.left), float(mb.bottom)))
+        done += 1
+    if not done:
+        raise ValueError("no page could be stamped")
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue(), done
+
+def stamp_preview_png(cfg):
+    from PIL import Image, ImageDraw
+    W, H = 420, 594
+    pages = []
+    for slot, label in (("f", "الصفحة الأولى"), ("l", "الصفحة الأخيرة")):
+        pg = Image.new("RGBA", (W, H), "white")
+        d = ImageDraw.Draw(pg)
+        d.rectangle([0, 0, W - 1, H - 1], outline=(180, 180, 180, 255))
+        for i in range(24):
+            yy = 70 + i * 20
+            d.rectangle([40, yy, W - 40 - (i % 5) * 25, yy + 7], fill=(205, 205, 205, 255))
+        d.rectangle([40, 36, 220, 52], fill=(120, 120, 120, 255))
+        im = Image.open(io.BytesIO(cfg["img_" + slot])).convert("RGBA")
+        x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
+        st = im.resize((max(1, int(bw)), max(1, int(bh))))
+        a = st.getchannel("A").point(lambda v: int(v * cfg["op"]))
+        st.putalpha(a)
+        pg.alpha_composite(st, (int(x), int(H - y - bh)))
+        pages.append(pg)
+    sheet = Image.new("RGB", (W * 2 + 30, H + 20), (235, 235, 235))
+    sheet.paste(pages[0].convert("RGB"), (10, 10))
+    sheet.paste(pages[1].convert("RGB"), (W + 20, 10))
+    out = io.BytesIO()
+    sheet.save(out, "PNG")
+    return out.getvalue()
+
+STORE_OK = {"v": None}   # None = unverified, True = deleted-message file_ids work, False = keep messages
+
+async def store_doc(bot, out, fname):
+    """Upload bytes to get a bot file_id without leaving chat clutter: delete the message afterwards.
+    Verified once per process that a file_id still works after its message is deleted; if not, messages are kept."""
+    m = await bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=fname), disable_notification=True)
+    fid = m.document.file_id
+    if STORE_OK["v"] is None:
+        try:
+            t = await bot.send_document(ADMIN_BACKUP_CHAT, fid, disable_notification=True)
+            await bot.delete_message(ADMIN_BACKUP_CHAT, m.message_id)   # original gone; fid must still work (the test copy proves it below)
+            t2 = await bot.send_document(ADMIN_BACKUP_CHAT, fid, disable_notification=True)
+            for x in (t, t2):
+                try:
+                    await bot.delete_message(ADMIN_BACKUP_CHAT, x.message_id)
+                except Exception:
+                    pass
+            STORE_OK["v"] = True
+            log.info("store_doc: file_id works after message deletion, cleanup on")
+        except Exception:
+            STORE_OK["v"] = False
+            log.exception("store_doc: deleted-message file_id failed; keeping messages")
+            m = await bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=fname), disable_notification=True)
+            fid = m.document.file_id
+        return fid
+    if STORE_OK["v"]:
+        try:
+            await bot.delete_message(ADMIN_BACKUP_CHAT, m.message_id)
+        except Exception:
+            pass
+    return fid
+
+async def apply_stamp(ctx, rec):
+    """Stamp rec['fid'] (first + last page) and swap in the stamped file_id. Never raises. Returns a short note."""
+    cfg = stamp_cfg()
+    if not cfg or not cfg["on"]:
+        return ""
+    rec["stamped"] = 0
+    size = int(rec.get("fsize", 0) or 0)
+    if size > MAX_DL and (rec.get("fname") or "") in W.get("pre", {}):
+        rec["stamped"] = 1
+        return "🖼 ختم الصفحة الأولى والأخيرة (ملف كبير، عبر الحساب الثاني).\n"
+    if size > MAX_DL:
+        rec["stamp_fail"] = "كبير"
+        return "⚠️ أُضيفت بدون ختم (الملف أكبر من 20MB).\n"
+    try:
+        async with STAMP_LOCK:
+            data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
+            out, n = await asyncio.wait_for(asyncio.to_thread(stamp_pdf, data, cfg), 90)
+            del data
+            new_fid = await store_doc(ctx.bot, out, rec.get("fname") or "handout.pdf")
+            del out
+        rec["orig_fid"] = rec["fid"]
+        rec["fid"] = new_fid
+        rec["stamped"] = 1
+        return "🖼 تم ختم الصفحة الأولى والأخيرة.\n"
+    except Exception as e:
+        log.warning("stamp failed: %r", e)
+        rec["stamp_fail"] = "خطأ"
+        return "⚠️ أُضيفت بدون ختم (تعذّر الختم).\n"
+
+def stamp_menu():
+    cfg = stamp_cfg()
+    s = store
+    if not cfg:
+        t = "🖼 ختم الملازم\n\nلا توجد صورة بعد. أرسل صورة الختم (يُفضّل PNG شفاف كملف)."
+        return t, M([[hb("🖼 رفع صورة الختم", "k:i:f")], [hb("🔙 رجوع", "a:main")]])
+    n_st = hq("SELECT COUNT(*) FROM h_files WHERE stamped=1")[0][0]
+    n_all = hq("SELECT COUNT(*) FROM h_files WHERE kind='document'")[0][0]
+    t = (f"🖼 ختم الملازم: {'🟢 مفعّل' if cfg['on'] else '🔴 معطّل'}\n"
+         f"يُختم أول صفحة وآخر صفحة من كل ملزمة PDF جديدة (صفحة واحدة تُختم مرة).\n"
+         f"📊 المختومة: {n_st} من {n_all}")
+    kb = M([
+        [hb("🔴 إيقاف" if cfg["on"] else "🟢 تفعيل", "k:t")],
+        [hb("🖼 صورة الأولى", "k:i:f"), hb("🖼 صورة الأخيرة" + ("" if cfg["has_l"] else " (نفسها)"), "k:i:l")],
+        [hb("📍 الأولى: " + POS_LABEL[cfg["pos_f"]], "k:p:f"), hb("📍 الأخيرة: " + POS_LABEL[cfg["pos_l"]], "k:p:l")],
+        [hb("📏 الحجم: " + SIZE_LABEL[cfg["size"]], "k:z"), hb(f"🌫 الشفافية: {int(cfg['op'] * 100)}%", "k:o")],
+        [hb("👁 معاينة", "k:v"), hb("🧪 جرّب على ملف PDF", "k:x")],
+        [hb("♻️ ختم الملازم الموجودة", "k:r"), hb("🧹 إزالة الختم من الموجودة", "k:u")],
+        [hb("🧽 استبدال الأختام القديمة", "k:o:m")],
+        [hb("🔙 رجوع", "a:main")]])
+    return t, kb
+
+async def stamp_job(ctx, chat, mid):
+    if STAMPJOB["run"]:
+        return
+    STAMPJOB.update(run=True, stop=False)
+    rows = hq("SELECT id, file_id, fsize FROM h_files WHERE kind='document' AND COALESCE(stamped,0)=0 ORDER BY id")
+    total, done, ok, fail, last = len(rows), 0, 0, 0, 0.0
+    async def show(final=False):
+        nonlocal last
+        if not final and time.time() - last < 3:
+            return
+        try:
+            kb = None if final else M([[hb("⛔ إيقاف", "k:s")]])
+            await ctx.bot.edit_message_text(f"{'✅ انتهى' if final else '⏳'} ختم الملازم {done}/{total} · 🖼 {ok} · ⚠️ {fail} تعذّر", chat_id=chat, message_id=mid, reply_markup=kb)
+            last = time.time()
+        except Exception:
+            pass
+    try:
+        for hid, fid, fsize in rows:
+            if STAMPJOB["stop"]:
+                break
+            rec = {"fid": fid, "fsize": fsize or 0, "fname": "handout.pdf"}
+            fn = hq("SELECT fname FROM h_files WHERE id=?", (hid,))[0][0]
+            rec["fname"] = fn or "handout.pdf"
+            await apply_stamp(ctx, rec)
+            if rec.get("stamped"):
+                hq("UPDATE h_files SET file_id=?, orig_fid=?, stamped=1 WHERE id=?", (rec["fid"], rec["orig_fid"], hid), False)
+                ok += 1
+            else:
+                fail += 1
+            done += 1
+            await show()
+            await asyncio.sleep(0.5)
+    finally:
+        STAMPJOB["run"] = False
+        backup_soon()
+        await show(final=True)
+
+async def stamp_cb(update, ctx):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("للأدمن فقط", show_alert=True)
+        return
+    parts = q.data.split(":")
+    a = parts[1]
+    await q.answer()
+    s = store
+    cfg = stamp_cfg()
+    if a == "m":
+        pass
+    elif a == "o":
+        await old_cb(q, ctx, parts)
+        return
+    elif a == "i":
+        ctx.user_data["admin_wait"] = "ksi:" + parts[2]
+        extra = "\\nأرسل - لإلغاء صورة الأخيرة والعودة لنفس صورة الأولى." if parts[2] == "l" else ""
+        await q.message.reply_text("🖼 أرسل صورة الختم الآن (PNG شفاف كملف أفضل، أو صورة عادية)." + extra.replace("\\n", "\n"))
+        return
+    elif a == "t":
+        if cfg:
+            s.set("stamp_on", "0" if cfg["on"] else "1")
+    elif a == "p" and cfg:
+        k = "stamp_pos_" + parts[2]
+        cur = cfg["pos_" + parts[2]]
+        s.set(k, POS_ORDER[(POS_ORDER.index(cur) + 1) % len(POS_ORDER)])
+    elif a == "z" and cfg:
+        s.set("stamp_size", SIZE_ORDER[(SIZE_ORDER.index(cfg["size"]) + 1) % 3])
+    elif a == "o" and cfg:
+        cur = str(int(cfg["op"] * 100))
+        s.set("stamp_op", OP_ORDER[(OP_ORDER.index(cur) + 1) % 4] if cur in OP_ORDER else "100")
+    elif a == "v" and cfg:
+        png = await asyncio.to_thread(stamp_preview_png, cfg)
+        await q.message.reply_photo(png, caption="👁 معاينة (نموذج صفحة): الأولى يميناً... الأخيرة يساراً حسب العرض. الصفحة الحقيقية تأخذ نفس الموضع نسبياً.")
+        return
+    elif a == "x":
+        ctx.user_data["admin_wait"] = "ksx"
+        await q.message.reply_text("🧪 أرسل ملف PDF لأختمه لك كتجربة (لا يُحفظ في المكتبة).")
+        return
+    elif a == "r":
+        if STAMPJOB["run"]:
+            await q.message.reply_text("⏳ هناك عملية ختم جارية.")
+            return
+        if not cfg:
+            return
+        m = await q.message.reply_text("⏳ جاري بدء ختم الملازم الموجودة...", reply_markup=M([[hb("⛔ إيقاف", "k:s")]]))
+        asyncio.create_task(stamp_job(ctx, m.chat_id, m.message_id))
+        return
+    elif a == "s":
+        STAMPJOB["stop"] = True
+        return
+    elif a == "u":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE stamped=1 AND COALESCE(orig_fid,'')<>''")[0][0]
+        hq("UPDATE h_files SET file_id=orig_fid, stamped=0 WHERE stamped=1 AND COALESCE(orig_fid,'')<>''", (), False)
+        backup_soon()
+        await q.message.reply_text(f"🧹 أُعيدت النسخ الأصلية لـ {n} ملزمة. (الملازم الجديدة تُختم ما دام الختم مفعّلاً، عطّله من هنا.)")
+    t, kb = stamp_menu()
+    try:
+        await q.message.edit_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
+
+# ---------------- old manual stamp pages: detect and replace ----------------
+OLD_HAM = 24          # max differing bits (of 256) to count as the same old-stamp page
+OLDJOB = {"run": False, "stop": False}
+OLDC = {}             # candidate idx -> {"sig","count","fids"}
+OLDST = {"tested": False}
+AIST = {"on": True, "budget": 150}
+
+def img_sig(pim):
+    g = pim.convert("L").resize((17, 16))
+    px = list(g.getdata())
+    bits = 0
+    for r in range(16):
+        for c in range(16):
+            bits = (bits << 1) | (1 if px[r * 17 + c] > px[r * 17 + c + 1] else 0)
+    return "%064x:%.3f" % (bits, pim.width / max(1, pim.height))
+
+def sig_dist(a, b):
+    try:
+        ha, aa = a.split(":")
+        hb2, ab = b.split(":")
+        if abs(float(aa) - float(ab)) / max(float(ab), 0.01) > 0.15:
+            return 999
+        return bin(int(ha, 16) ^ int(hb2, 16)).count("1")
+    except Exception:
         return 999
 
 def page_sig(page):
@@ -2120,7 +4082,7 @@ def old_menu():
         [hb(("✅ " if store.get("old_ai", "1") == "1" else "⬜ ") + "فحص صفحات الصور بالذكاء (@ / إعلان)", "k:o:ai")],
         [hb("🧪 تجربة على ملف", "k:o:t"), hb("▶️ تطبيق على الكل", "k:o:g")],
         [hb("↩️ تراجع عن الاستبدال", "k:o:u")],
-        [hb("🔬 تشخيص علامة مائية (ملف)", "k:o:w")],
+        [hb("🧴 استبدال علامة ملازم", "k:o:wm")],
         [hb("🔙 رجوع", "k:m")]])
     return t, kb
 
@@ -2424,6 +4386,8 @@ async def old_auto_ingest(ctx, rec):
 
 async def old_cb(q, ctx, parts):
     x = parts[2] if len(parts) > 2 else ""
+    if x[:1] == "w" and x != "w" and await wm_cb(q, ctx, x, parts):
+        return
     chat = q.message.chat_id
     if x == "a":
         ctx.user_data["admin_wait"] = "kso:a"
@@ -2521,6 +4485,464 @@ async def old_cb(q, ctx, parts):
     except Exception:
         await q.message.reply_text(t, reply_markup=kb)
 
+WM_EMOJI = {
+    "🎓": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEXhqxtFRUWZmppJSUlYWFhfVDbopgZKSkrhpg+VdiGxiR8eHyHhpQ8yMjL//wD/fwB/fwD/AAD///8+QEJHOxywqQeMjIwoKCixYwChdQyYmJg4ODgAAP9DQT+ccAm7iQ2EhIDNr1wAAABCQkLjpxAkJCT9ySc6OjlkZGRXV1c5PEMdHR07OztUVFT/0iZ/f3+UCQUZAAAAMHRSTlP0ovpg4P8SIKH+/vtgHAECAgEB//8EnmADXxqHAXGBdX/+AP79/v7+/v3//goG/wJtbFwyAAAED0lEQVR42s2ZiXKbMBCGV9w+wHaOJuldCXFj3v/tupIAgw1Cdphpd5JpJilf/n8PCSlAVw74R8BKfqyp0EdesxIQUSFxHOJTWq8BrGllMxGObUJcAqJN22FtmIiEBXXUJ2wQAvkJYNO5vYTw/SiwHrodi6weANaitmwySHW/wpvkGfuGe9ya+J5RGBK2EHO+4U63i77hdtBuWkXnu14ANobyBr4bDRB/XXUHbnK+YcSrbXZvXA8jGBYjzw1TCUbJy7MsmycyO7wQe4Wa2j6zTA9kJBwrrLSDUbjOAm/oWynU1LYoXNg6Ti6V6sKuJBHoE8pjGnnb5AwFK54L5i6IfGsV6tyyLZwTcAvXZS7+Y9DnEOrdns8gWAmgzkUg+qZAWKp1u3E3KFJ+URj0uQ2WlafptNsE3W7QM/IMcSyz4atlObcipdsEQYkIgTPh5RnxgdZfLCu7QiIu6QOTaKQuz3IcGRAzh8h8gCyKTXJWMFliQ1wmF3GgjWhES6TyIq/HbQ1xOJxiVho1KYgUvlUqC9bJO4MxLs/EwlhdRq/1jans5RmrS4VbTN5TPVxtnhrl21Hy8PMOdZ3b8fLV4IvMb+tPclef9G79qS3gK6V7KQ82uBaY4nLEPdXTe0pUB3LI3CJlj7id2EYDYRfXvfw5NWoVlr5d78wj4DGIAVzuskFX6tymnL81uo3+gMDYLXnqTA74FY7xsuTf6AIwjl92+B9R482Aj5MncSkjWiBajgGBnJc8t+YWttZtyZGXO6EO+NoDESl9T6Wycyt+lDuV9mVJAHcK2Pq+SaVyy7nkLQE96BWmaed7lErE5WlZtjgB9OeBR1mTeMtRo5x64SsbLmxt8krefyPTAD3qxTLcXfuAEFkOWmjstgWGGuBeATe7/gnpW7WQdMsHbhWQzOfwfaDwstjJFpK+u1YZFSkj4s1jJoeR1+Vw+EznW7UKT69KbmteiY/0Y4vxstuNn5JIPoFTQF8H3GC410DlewK3BHynPyVw4smU8ymeBFazwAP9JSxvJh+dnurMqTXLl0dlUWDHDRdsnJNac5KK5ORhfOxMjxS2rzua9Y29//7D7IQSTt28jIBKYWByGJVniUp/eIyCDviKuz554OA4AvYpjAHFUv0hEtXN3bfApa17YBSdpJuQTL7OE1GLqlm6Ijh0a0MMHspV+fbtK+sOUZVtlu8cDl2RBfDQ33rRyvdtQsTdF0FYpd6CTG5Fjj0w7oGIu8lUVRteBEVqThTQW+NC8gQdcL8G8IRFhjWBXrSHtrFXAtIgaIGwBvBw8uL9msBXbBqvA8ph/hxQlCSgF+Dx8zl83WMWAQuNpVkFKGIfYOsEXrBKlSmuMGLn+wTqVuHBQ6tR5EUr/i0gOpz+t79W/AVjgi2gM1uBKgAAAABJRU5ErkJggg==",
+    "📚": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUAAABVs1Cj0t5UVVXz9PQIW583hjHOKCYAj+hlZ2VomqZOYDqSuc0AWJ06ODekpqqtyqxCjjsxR1ypMy9ZW1nyQzYDenwDWJxRVFEDWZ0Bestuqce2YmTDVFYNKnQAAP9HPTxSrlAA/wBRPUiTTC4jayQ+ojqXN0fyDApVtlBawVT3//f09fZUtE4+hjh18HKJ1N7GAAAAMHRSTlMA/v79/vr+/f4N/f3+FP79/v75/5X9BmRkm/7+/vwHAf4WAf7/FRf/CmX/AlGcpwWDAGhqAAAEY0lEQVR42q2Y6ZaiMBCFA2HRyNJutAooo6PdPb29/9tNqgIhJMEFvOdMzx/763urUqGEkF4dp+L/KXmKpsDZrFar6XOYfzhlQ1GAHEn8Pbe4BjmC+Yf/6u+HQ1Why0HI4/SXI78dLmoiH8/KS0c+vp1/jmNHfj7EPELeD6fBjXR5nB4FThMdVsvjhWDp/jnOU5C8dJce3IDg0IjLx7dzTQ+4PB6NTox1aenEHcgNID9tvO+b5h4MfjfO7tJQ4DwmS/Au9mc+DonBjwrw8hMET3DZMenMg/l4l5L5Sb48J3gCUgLPX573MhqpBL9w4LOQmJgg8ClI9HgmXqPRSCBeAsfzxiOTpOL/OJGPyovnjUMCjlLGCHb7p+NwAHIekBllLohRCpED52U4cg5jlrq1aLURszcUCVPL3FbQFr510NkwpI6rHZ4JPQ1AYtYuDmq4h7NN6elRJOBY6hq8FW5VsGedaC+yB6fRIkar+o6YklV90O9yOQ8suJTRhOKxFtuqnJ2bLueAN3AUcKuz5EEZG+JVl91T15aO48hZeQ6oxP72BJg10nFOQBZ0c9Z33JVC7EE6xjFBXDCfkbP+LN2T/UwSk55auq4dtwxD60bSvStttdTPSYML12sLz1/MbiLVxsLkzf4K3FolHvDnZDIxiGZ7OllV3DoM3yUxBtoEiVTTQnPZxdW0UOid1Mh40mhnACld/lWQZulCKSIdbiXQDM0VhhKp4aRK5LRAf3eNWIQNstsJ1LIsxNio3X31fYnc+WboYt0gHVk6YBUFkTPYnRIgNkhbaFF3QDZZOUqb5/K9jUxIRphE2onCE9dbWaaROTFuyZusePzyIunSPDu0LllBSOr2KA2Vr/6fuNs0SP3sJEmyDHntI/eqyqXyReMgliVEdkJXsBBQlrq3VYaF+LYqkPUgCJeSmCDLdstoedOi5CWRa2e8bYcVkX7D47SbMGRhxyDOii/Grz5TLxRAosWK3uULYG/Lqkp47QluX1s/6t56kSAm7JqvgtQsuuAf5zSWRvxBOuPL0tbXiV7u89s2sfYiSlPpi1JfaFEvX25EZ1NeQt9EssQERjxjXbC3ExhrxFhnWSIxzp6GTJOKiY5glxVfp9rXbrcTuEjbvviNvbcgeZNThPGdoNB9iZkC5d0QYnnIrC7h4cfE8rysi6/cIogjuVYV/vHmKWBxCVPHRRdN8dt7E8Oy3NggKrndZDaXKUpjSZyxQeA+oijuaY/HxIxPlKx+7pr7TUUX3W3ksL+K3ElzRun4iU4AF+vvNQ7ZVWR96kzcgocFnE3xDaRRupzBpJAM+molZr0uI2aYc3P8K3DwyHTf+6ap16Ud9xqTPnfSJbRnayK10sEHtq93vke2BzdwYC473Pc+MW5cuiYwJ03WOLv/fSe2B5Ak6gJzkZXjDvGDr2Q1lxouG/DOuG2PuBeV0pHDsJfaLTKPciaPSTYQJ2d820we4kbQRCmxPdv61MUZGS+8NmJoxM2s/wFEpW8fyY/UmAAAAABJRU5ErkJggg==",
+    "📌": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUAAAD0QjbJKSj8cVTyEhEseIqLtMb+bmP+saCvzt72WyAOcHXKKCfzQTW0FRNimavEJSWSnqx/AwNoqq/yQTQrdoj+c1P9inMlc5AA//8rdodqY2x6sMSrU1OBrL3///+OsM47gpV2dnZwpNB/////dVT/wK6aTVOBq71/f/9+qr2DrsD//wAAqqpVVap9qrx7Ff/oAAAAMHRSTlMA/f38Cfv7Df7+EgVhogn9pvsCDWSoYP4cAV7//gOoART/AhACrf//ZwKdpwEDA1XK+KB7AAADk0lEQVR42q2YDVOjMBCGN2EllQKlBRHurK1t1fP7//+7SyAhEQIEys44492Mz7z7kXcTAOZFAMgY478whrBAMGDPnuc95xXzel4AuaciZ0vo0zwukwHurs2Xc+41Mge4ppDIeYSsXlYrxSRJfAURGRJCibdqkIRSivOJAQSEVEjOFEjBo3S+RgnkSEruOdGDCpgg7OaWUAIFU4j0aE2M9/M0YgCRJopa1kAazk0aUQOFSKlwPhEhIyaREkVEtpvXFFOhhNZlnNOXWPCoHUhndJrbFgeIaV5GYj0z9Xnr6Kv6MvHUQah4vLltWj3e03hZdeS0QtoO7P1bFZ+o56+aF08LpN2w58yY5V/89EdijA2BFmBiN1AQ2vI8Z2oRqfEb41FqaySw/NlweLmIkLjwqG0wck/YkjbkahE58sIec+J2/PIb6cbrjM0na+y4rdKFx32704+s8RDJrAfOWJsDvO5mQdM8Ka2Q0u+IS75xd2RaZ97weEp7eGGYyH5YrAHbxiQWUUMkVp6Y+pifI6thM9IxT+/FM/7cwsM60Rit9hRZiH09kDyhDRFd9oVKu5+XjCwmZixdm8d3ePuRZYzIognEpC/TkZz7iC6XLuwMzgDRNsiWtRa5Et0uXIgBcSPGLvpMfxghoiNP3/80xL6BnTfmL4mUvr7aiJPuCOZ9jcKDv9UiZyn8dUfdPvi3t1ugXYm4d5e4b5KueLdPf2mXiBOeZKhMR/Jubl67ZZx0X63OC9U8GzCJcdo1VenjuBsjZfN2OYXIy1jxfMmj3fmedF1N+Y/m2Q/MFIUHSB/9Pp4ihu4KUzgP8SYD02F9iug8Nwc4foj29vOI035ScTkdHxveXdRvZI4KSwCt766AaADoUsPylBr61vx/sj6g09gcUtD9uFuX3/LpZCM6DfYR/vlbv9FX1o+xyAZMXFbARfC2/kby1upREFqALiVM4cf3G1550m/4jkjxRWCU9wZHzSuqfPXLpYV0ackF0q3fzldbLmQmMoTPKfr+gKmvRu546g0yw3F7PYgDrHjr0vrEggCziEfgMIIneOcNrngFfPd9pDJLMBxnPjD+ZmMpXxvKr+cOHz8uDY+Xb339F8Y3AN6Op7p8C/BOcPZrXrGEPN7f9N2X5fta4pPvGWreMuUTDfmRvLJcgsdXUsVbpnxiJZ0Fb3j6JgGPgrdU+UR8LMxLN6J8BSwXwku/FuSti2K5dHn8B+CfNgxM5wlJAAAAAElFTkSuQmCC",
+    "📖": "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",
+    "✨": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEX7zyT+4kz+6VD/6U7voAr+6Ez71CfztAL/qlV/fwCvrwC4cQD/////f3/zrgD5yBr/VQD/qqr3wBH//6oAAAD82DT2tgH//wD+6lL+4jf/9Vj7xA7/fwD7qgD82DT/AAD0tQL/1zD//lT92DP//3n8vAH81zT0tgL81zT1twT0tgPztQL81zT91zT//z3/vj07MPU1AAAAMHRSTlMSIJ9bB+X6kQMCAwMBAlRiAwOHAwD+/AH7/v3+AgfPAc0QAy8CCK+ubC9Pbk6OBATGBT3YAAAFNUlEQVR42p2Zi5KiOhCGg4rO7OztnBNoFEK4CgLq+7/d6YQgBALCUFu1NVX42enr35HQ7Q/IfzMPWfgggxnegdFvAc3PB03D0ML/NgNZnZuO9qDN2dvTw1bgJ735Nc1NJ76fvR21tgIDevJPYOI9rs55RzhsBDIauRGbnhkocRzHs2iyDQiQR657MwFTBF42Axn97bpujSefuKIUwP1WIKE1Agv6wxQTBO425iH/oicERgFM0zBEoGdvTBsAhi5EJ35+jQ2MHREUL94ABHYAWgkeOhHyfGhlQpsWaNFsJRBEMv+4SQNdtxJlmweD90sJRCcmqy0Mqrpwu6eoq1wrPBETCXysAgb0VkSu7/aP70ZF1eUjUOsqgbY90x5GQM6w4oY4ifQjxvkwJmihl5qdSCZpxn6fRsCiPnQWJjQVBjq2h6lNVqfNrep9GNW3w/D7yh6YrYyy/PwryuKPA+h10kaFJ2st5AEwelN5mAdatWSho4B2jD1zdaV8BqpSYFR7xFHAudSe7zYnDHY0al/A0xfwYsEW4EF2mxPXu03SuVAAd8ZhOttgpRMrvR9iFoY90LO2zZQvdOJoBBBozr0PMXGem2ZK4Rc55VpPo9chcAdbgAGtcIzCdJy0j92amKwHYg1G+oyC4OVBZaJtJbBFihz0t5+q7F5AY1Ncr22egwN3QJym1gYg6JKGDA7cEb0JcZ2FgPWc6jwJlMRMK88VQEhEb24cndcRMdSU/nwEq4GBGB0kvTrTRxHtvTh1lq0AAgAm9iEtw4l5r9QRSG+3F2MaMlgEtnWQ3mdor/wWCXmxd3uZCkCWIkukbfO4YdWgqTvLWrIQSHl13sL089v7ZASMyXgcbXsupQb8Re9eN8wQ6HyD+IeM+udQYjT3LcgjCoSizonWsWLnbA9HRdxg/r2PiuMLtRFVt0wPCghZMFAEDxHypLku5Q0aJvVPUZO2QenAUgIfgwENys7zPE3YJjBcVLxuIccOf9nFWjLyD5HfqQmpRFVBEPKSpbqFoVGbypJpwjFRiZ9aKFJm6jZqpbkYFAEPGCXXs4GHYyIAbm5fD6l2bRxmpgH+oLFmo/IeGW+RA2CSSBsunnm9Ho2A1sAJbwD8aPU9AvdmtasNKWmgf6JsdkgBZO2RcJZ9ZD/N7bF3ozowmxujIh9fUlKI08Q4+1P9xNXUwBYI+PF4oKvEnMimWo2/9KsE+kVGTFIEPkR+l30IBXFnye+B8eRvuhIRBv6ZrpZIEuUSI+6s9UoxJjIpCM1y7tiG2Czn0rszrStPtXQYC84+yIUmzfqxMd/nPc9ufiZ6nNMeWBkLgJRL7e54H290cQ+8Tdd9ASSNYU7KholL3omMq+ZX+AISM1D2u3s4bUuRvobqiw++UvwH5qBAywx1XkHiqULE7KStykb76/ldD55o+6MrK79tSqiy8+mm1C2PskyWlkfMYUsRhXmMMmMIZSaqlwiFxbUiUK/iu1FuuvNSedOeRCxZAV/eU56te46iqc8LFHVFINI6f7PRA8gGi8B8/v5StXUE/kvZuyuCp3z3iN8Ni9eRLfA28xYZtzvfrXgwD+SchPIYbNVFUCiA5pLqTUTHHN1ozc0SrnIIjPKlI6MauItvPa25TAvEFMLBA4siXswy369mYjIVS/jqYfkSO239sgqIzemNC9ta8bFO/q4CXo9FwBb3Fk5xmPrFP6sudTNaHivj5Ym2mZdn04Q3ATk17egTAdGczTfc5k0qeP/TAgkjMpsKZLx2rvmxIraMA++bPy4o58w9/wO3WhKrqFILqQAAAABJRU5ErkJggg==",
+    "⭐": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUAAAD82DT//wD+4zf0tAH//o381zP82DT81zT91jH81zP81zT81zP/fwD9vz7//1X6yzP95VP4xRn/qlX/AAD+83P//zr5zCT//3/97GL/qgD/f3/93kMA/wDfvx//4jh/fwCqqlW/vz/MzDP/VQD/fz//mTPzrwD/vwD4yS7/4hz/4DUAAAAAAAAAAAAAAAAfeg9HAAAAMHRSTlMA/gH+/v8w0K4TUI9wAgQDC/7+AwH+BP4C/gMC/wEICQIDBAUDBAX/BCYJbQAAAACJokR2AAADrElEQVR42q1Z6ZqrIAwNUAXEBbvYbebO3df3f7+bFNuitYjVfN/8mI49nkMOIWQAYoLTzxYWCw46TZeDgzOkkjGlOV+MnxSMiRw2SwFmiMeEtLAQRUDBhJjBYQm0A6TMhVyGYAWKFLM3xrIlNPOW4DGpheLVEoDmQnCX7BhL4ccCnnELuEuQouFf5gPmopVMFPV27ipy7jzD6iRJyNwzAUvI2B2wZtLymfwa5xkHuCPnlHMANzdTs7eEKAq1mVUirp6hIMAjOmc7o0TwrWbMB8S0mDlpqa6eaY1IaWH6dUR+sLIHuCOKL++/xhVCHzDBmqN58RrellvlAR4TpxnN/aJz+OeUeVEnrWY0N3/RMz7BFjB5o8p9mgJT8E1VllXBoUPwCljTKuIWqsoKPR7gygnHNvcM8lR2AN8cIHpbGH1/qmy+lRWy6FDyX1RoPNSzLDeK9WJ3BcRlNHmeZWmqtc/I4bQW+OtQjFKSiAmMPmB9lXz/u5RKGUPYupWG/Yr+ZxxI+9wDUIfisfOJ8L5A2Bky1vI5wgPHug4/IMwnr5wsEimoRfHQo4sz1GoRxP16tacODbsfuwDH9Wq1+rUWjA5F7HTNTHIrFwJPsBOnMgo5E7PIUayFTNu6hvslleLVlWtjL5TXj/JJ9n4gh3EpGNxvEOzkZHtwKyrjUHRP9GJiajy4NaWjXxnx9+xFvP09HR3E74goplrlIldpsEM1+wR/olNzW8A1puPj2dHfxO/Dm/sY7o7nrcQJTmbSGrJLOgLnPj/jroleRJSL6bAj7cyUZA+nN9RxjVc/HtEF62iCCr6OAxbx+xqvLTrudhzL0MT0YYdeSxOU3MSsYafLXCIpE85Bkca0x+8y3oc5nEf7YNATjK1iXDOlLMr3mKvJlDo7fmlpYNLhMjqFmHj+jVt7E2/rdjePXCV/TrE11S8NRdyIIX6vlGG838M5edZ7o7VtGNAOKzN0zRCDWTmHbT2QE8HcRSdVQ6/6CBqneFxCwVSK9rSWwzYbsJQdAeyXGiEzcH0LR4PYh04SC04RBOxywCYXfeG1faS7C5mHAHm31Di1vi1oOtfVjdYuQpUhG1Tra8CXdnTL0DjaejlBtRaKYuitXd2BY4Df7/BoFVRbbZ885usODK/wwRaQegzYPNWCCS9vunMsec+LoXED5ryA8KACSWnjINPA7BjbEKJIavlox0JLKRgbmyg2Wd6zylPICj7Rw3z03xIQO5apbt8IT1niB1E0/+h/9h+XdSlAmXdXUgAAAABJRU5ErkJggg==",
+    "🔥": "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",
+    "📝": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEWj0eP3oRDY3+D81jPvVlT66K3+/v2rusO03fJzxvmos7Z7w/D4hYbSdyr41lxiYmH7dXPgtFP/AAD3Y2Kxw6aY0OqmnnN69PT7ngAS///3bm6Uz975owztlgn/oaE/v/9/AAB/f/9/st6/AACqVVWqqqrrTjrJdIDUqn//goL+/v4AAABpvfCEyPHU6fX+wQZpJdbLAAAAMHRSTlP+/v///f8C/iz9/rj8////FPgBUP5O/wINA6qlTqUEBAIC/wQDAw3oBpL/AP70///VEVEYAAADaElEQVR42u3Z6XKbMBAAYLGIS3Ex+GyStul9REF+/7fr6gAkLOEgMv3VnYmHcewvWtiVBCHH7mVNVN1xV+Y7PgQh1cs68U4yzUCS7qUi8dFV1V3TNN9404xg97wiqq+/6IY+7HGQ+ZuABaV0g/GAI/z0FiClRtz8aXizHtzQUdwocR0IlNriHrNeBQ7eKDZrQNhQOiH3a0ZIiAMqkf6MBwWZimjSMWUAEBgAhOCh+gbIXgAVwjdADDqN/QASxlhRFPhC5A8heFzIV3yLMfB71+IIChBqKKAGiw5Rx3rk4E3YJwavMty8In045zH+KlszDhu9h+g6zFp7EhsG2XzexYFQJwdbLDTZ8O+RKddp6oqkYPIExk4OWZpeiWiWuy9xIKQKTNhEPPJzHFgbMDk53iPP4ybYzHgXJO20y/uzA8pOeR6b5jpR817vJZeLM8gjL501hag2lm1mulpPC0MhF/ItjEOf8EVGkrw7WSfQBuW3EcW5QEtE/YUBBKJ+XxSOJ8EkadmBPJ7P955l1BkU+PK2ElYgehgfy5LnUQs91D4veW/tbZaBk4SN94H/zuPAzPGGhHnsCCH1J7zbRYKhhK0BLgKz64rBaO93uR/sSwYE2IvIUD3+imnvcu4FwSx5qlHGihZ6DUQ18ydMgiDRvSJbDtsPhrXDdEjh91gVAueXOwB/xbTVTXBZi4ho0J9wFg36E64hFgy0CG6uIkF/whANTidVcwJfCQpVkWKMwKTaql+GwX53SeR6ojeFOopDGkx4DjSbTNkoegXsQwQq5hYohO6IV1ZMa87H8osSrphIcDbhCDDYIrFgPZvwchBmKkZFtxSs504gFsYMqG6cQN+ayCOz9cjqdtoienekvDAo5D5JFbZ+gX4vg5EqbZz19Uf03VoQBDM4Ynqlv8gKTJyESZ/uLBiqGhm1DdbC9paCKmMUrYRdLxJEMsv6VcTxokEZY4tYn1gIZk7UdSYm3kIQTg5oJvLneDDbOp64Gt9SkG23U2768GEZeNr2IniHtxjcyjgxZobn+0gYHG9RzKMMPNjqYCHt5uQg95tqHVU7T2Ca890AvQLE2UPvLNX9njpi2ptdcm6dQ/vODFnGbj1u6WL3h//BfwuuedJOrhf6N/hfwBO3wSPpVgU58h8OyPNyVdjpyvgLiUIImzViCywAAAAASUVORK5CYII=",
+    "🧪": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUI688M7eqh5+Zr1eBYmtwZy7V54fd80vgZxLcLsq+X0/vR7vz27f8azbEAkXgKqpIA/38lzsZksu4Af3+A0/lE0Lxsz+uC0vp/f/8JwasA68wBvaYBvaUA/wBfr69cod8AAP8AtGo/v/9/f3+avOcAfwAAf/9VVar/qv8AAAAAvqQExKuD1PqX5NqH1fnW8P2s2BOEAAAAMHRSTlP3DPPe1O8OurIMFOMEHP/7AqgQAmj/VpECX15qkgEDUQEDBAILAgIDBgD++7r/xeUcQArHAAAELUlEQVR42q3YW3uqOhAGYAImGIUlaqu1p3Xeew8J8P//3Z5MAoKChthc9LEXfZ9vMpMgjSBosQxX90v3A1cEDyzhPPb6aj0pQ8Hd4fC0AvhkxnuNcL1CQSmDQAZpXdfakBiSRbRYAZCHJcxgpWut00Q/CfjsQIBTqWQI+AK7pNZpHNeJXsFL7sCf8Mb5Wxj4fbFI6qZBsX6Cdg9zkO/veRCYIbhYNE2zrtP6gLu43TLsSfDY7IDAxRrFOK2faHqMx6RkAeAKhE5IjJt1g+JRfIgCggeboYc9Hog7+BEM7sjDKUys2DS1qbo7iFGQp9M0tSFj0xiNvRZhoKCZRiFG1YroaY29FiHgp/VqrDROnbjQtASO52zQ5avXNILaiYn5UGvxI5sLCto/460tmCQ90W1jNGf+bD7EaFpsqa2IEUn0B3+7fMajQ4cBMaJutxEjzroPZbd/xmuMp5QqIxLbiDNA0eWjFeNlGKFXqoQm3IEv3mC/H2vj1SZgiSBGbEWaxWh+f90MagtiQlO0eSSszCZGs+fPeQiVuIkEYsRUH/2bsut5XT5jKsWNVx+/78TKPZojLy8deIlbZrDJ29lnv+fRkyDQ02b/6Io+6uHC+xV+/StefG+bX6ZejBPblUTnZXMeRXd1+YDMPXYdGF2t7X/d1xofML/hcY5N3shBvnugBIZ/xC89omgKuYA9+IPocTpecVVVcaXcKu1S6O2G9d4BmcnXelXSQhajfNfeLVD2vdh4vKp4D12urr0b4LBe46kKx+bs4f5de9NgPsxHW4Zg1e3gctSbBH/afGWbj1pBJasb9U6DbOjhtUebd+4w1ivBH3T9Lc/18n6PMd+fy/m7CX7281VJebkm650AB/mq516lt/sxBTLIh95VvmzaGwHzQb28vNzA6X6Mg9Lle3aeKrm5Dgb17sEfdOej5ym6YJRHP8bAdv+ecVrieLMxZ6UPYr4PCf5g21/nfftmRH4Gb/fjGsT9w3qV8SryCFScc3V/XkZACbI9ss4jcDDPBfiD9vwq6yXkWdBd0sbbgz9o96/11IYqHp6PDwb+oK238/DTZrMp1eB83M93Bu28nD0qVA3vF498HTj0ypHzK/w8B8q7XubpWTB38zftrUCCP3i/3pVXP1qw6M1fNeEx8AcZE7w9HyPXKfVDwgxwD0uakkkvm5EPwQJOnccf64cFP+wXhHjaK2AWSAWrZMrL4J95r+gR3QjJdD4GM0Gzgzwe85TaZrM9iGzFiRrJt52fD0E+QnXeHkJBNeIF1NuWXH5VvQZ8GwNVaD4EpRrtR6iHc/iuvq5eOin5VcQH8tHlcLGL6iEPE0p4Hzze1MH8j+YBENOczt/uFT/A3/B87TNFLkv7Xrg8ZCHH4/KphzeoPC2Xy1OewcXrbxjYu5NlBl8BYtn7oij2jMGj63/9sI7vp7ElGwAAAABJRU5ErkJggg==",
+    "💡": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUAAAD+1gL+/JH/7wBimqsveImFssT86V7+++jfmQWPsKizaQT/1QD/1QB6rcv/fwCUz97/sgBDQ0SxtnM4Xmc5gZN2dnZyr7fEeQAA////AAALZ2dgmKn////Mpkx7sctgmaqSpq+BrL6HsckzfaYtd4dAQUF///+DrsAAAP8uYW0udoczmZlXFRJCPT1BQUIBsl3IAAAAMHRSTlMA/f4M/f78/v/+/f9aoP4C/wPy/vj/BxH+AQEFUwH/E6gVkDANX5sCYQFlvQUXa2rOVrj8AAADy0lEQVR42q2YCXeiMBDHB9ImnCpSFe+qvbbdbr//t9vJgSaQhSTuvD6eqfLzPxeZCDBghEzFtZBGCBFLAmEmby/KSLOy4P+swnicFvWtxC8KEMnvsuGkTH+RqEDhGLOqhMpL5BQqEToWc7MhCy+3KyDlFcfNStwQd3+JgbMTywpIMM/qdQnVJpRnBSJx6pIPwuPX4cX2+ilcnCaiXmIHgWhknGh1+B8CudOjwKoq3Xnc6WqsAgunDN+cng5q3ExFRbvzxiT2IziMk8+eoZrZdDwe440legpmD4/z0OeB6iYbEulAB95wu0zBAEqefo2YH1DmpM2yuJklSSKvrF10bBhYaEDxMokjRMUJ/xOL2AdYKSC7OYw0yWRJpNAeaW6B0a3fEr7gpOguILsmmDMUkKmFVwxJ9+NdYC+Gw09ZYgMiA5kqhgnzAspO0S02s8wSr07B97rTAhJkinnw4rhfNWQE2PdZ5DVhqrBZf4Yg4JcV0RyqRZLEd58iFp9j2YGqb3oeVyNDl8Xn65VZioY47aJ6moU2ieo/Gxz20W4UD4IlnjaYnjT13Ua7lZPmItG8Drm8xgQSUjmMroZELomJBmax4vsJ7EYxNyVFuSnQCWhI7AANhYXjgGhITA2iuSLEaT7ko25pZ5i8wvkoUG2IVVVu8Epwn9qJ+RRTHDPDkc8RrVs6zbWCwgRiGA2JVqDfGVLM2UZx94FOE7vef+w629iAJfFymZfibbNvbEC/EykekrTxoc1yY252Gy+FRE047FYuRtn4JVntLYpoBRZ+QPS5HWVZbliTylASTyCXmDZ5mh5STuEYXDaNpKaOxzzNVmvIan4rmrhoL/Icsmzlx9vDKqMTmmX14XDQgYdDnWX41uwMfsj9aUdpNhGGXGUTZRlF3LufxiWcaVbXdWZaXQOL6gnd4Qc8g7gHmv3jJJFRetnvvX+5+aA8ht3hiGUiuEdYe/9wc0IhImDS1foaRZrR83rrLfCdS0SRVGI5SBhPMj16hxDzvDw+P1iNYkpOAT+m/Ybd4tE0xaOn/XsAcAm7vjbu8+TBPyXSLvz+GTeq4iewi+cw3hJWLW9GpUIZgsUOtkEC19Bm5RrEhXD8DPsg4BZeNYwWRQgoGuUzZ0y0IFLu+/MFfgUCL1jXszYrrfuL18AQoowjYuiMTrSMYC3u1qswIJY2LLp1jX33AaHAl/VOp7Vur5YQatuXr4VeMWLxGRpCUYkvX512fnyFewxb7OlJxz19wvIu4ha+5/On1uZz+F7B3fYH5srw5X+x7c/b23z+9rN0ycZfLuk6tqqwdxMAAAAASUVORK5CYII=",
+}
+
+def wm_mask(im):
+    """Magenta/pink brand-watermark pixels in the top/bottom bands of a page image."""
+    from PIL import Image, ImageChops
+    r, g, b = im.convert("RGB").split()
+    m = ImageChops.multiply(r.point(lambda v: 255 if v > 150 else 0), b.point(lambda v: 255 if v > 120 else 0))
+    m = ImageChops.multiply(m, ImageChops.subtract(r, g).point(lambda v: 255 if v > 70 else 0))
+    m = ImageChops.multiply(m, ImageChops.subtract(b, g).point(lambda v: 255 if v > 50 else 0))
+    w, h = im.size
+    zone = Image.new("L", (w, h), 0)
+    zone.paste(255, (int(w * 0.03), 0, int(w * 0.97), int(h * 0.08)))
+    zone.paste(255, (int(w * 0.03), int(h * 0.90), int(w * 0.97), h))
+    return ImageChops.multiply(m, zone)
+
+# ---------------- Framed-label watermark replacement ----------------
+WM_KEYS = ("tl", "tr", "bl", "br")
+WM_NAMES = {"tl": "أعلى اليسار", "tr": "أعلى اليمين", "bl": "أسفل اليسار", "br": "أسفل اليمين"}
+WM_DEF = {"tl": "🎓 @TalibIQBot", "tr": "Talib AI | طالب AI 🎓", "bl": "📚 | @TalibIQBot", "br": "نسخة خاصة من 🎓 Talib AI | طالب AI"}
+WM_PH = "◆★●■▲▼♦♣♠♥"   # neutral placeholder symbols that stand in for emoji while the bidi order is computed
+WMJOB = {"run": False, "stop": False}
+WMST = {"tested": False}
+_WMEMO = {}
+
+def wm_texts():
+    return {k: (store.get("wm_t_" + k, "") or WM_DEF[k]) for k in WM_KEYS}
+
+def _wm_emoji_img(e):
+    from PIL import Image
+    if e not in _WMEMO:
+        _WMEMO[e] = Image.open(io.BytesIO(base64.b64decode(WM_EMOJI[e]))).convert("RGBA")
+    return _WMEMO[e]
+
+def wm_label(text, w, h, S=4):
+    """Rounded framed label as an RGBA image of (w*S, h*S) pixels. w, h in page points."""
+    from PIL import Image, ImageDraw, ImageFont
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    W, H = int(round(w * S)), int(round(h * S))
+    t = "".join(c for c in (text or "") if c not in "\ufe0f\u200d")
+    emos, s = [], ""
+    for c in t:
+        if c in WM_EMOJI and len(emos) < len(WM_PH):
+            s += WM_PH[len(emos)]
+            emos.append(c)
+        elif ord(c) > 0x2000 and c not in WM_PH and not ("\u2010" <= c <= "\u206f"):
+            continue
+        else:
+            s += c
+    rtl = any("\u0600" <= c <= "\u06ff" for c in s)
+    vis = get_display(arabic_reshaper.reshape(s), base_dir="R" if rtl else "L")
+    size = h * 0.52 * S
+    def layout(sz):
+        font = ImageFont.truetype(FONT_PATH, int(sz), layout_engine=ImageFont.Layout.BASIC)
+        parts, x = [], 0.0
+        run = ""
+        def flush():
+            nonlocal run, x
+            if run:
+                parts.append(("t", x, run)); x += font.getlength(run); run = ""
+        for c in vis:
+            if c in WM_PH and WM_PH.index(c) < len(emos):
+                flush()
+                es = sz * 1.0
+                parts.append(("e", x, emos[WM_PH.index(c)], es)); x += es * 1.05
+            else:
+                run += c
+        flush()
+        return font, parts, x
+    font, parts, tw = layout(size)
+    maxw = W - 14 * S * 0.9
+    while tw > maxw and size > 5 * S:
+        size *= 0.93
+        font, parts, tw = layout(size)
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    r = int(min(H * 0.32, 8 * S))
+    bw = max(2, int(0.9 * S))
+    inset = int(0.5 * S)
+    grad = Image.new("RGBA", (W, H))
+    gd = ImageDraw.Draw(grad)
+    for y in range(H):
+        k = y / max(1, H - 1)
+        gd.line([(0, y), (W, y)], fill=(int(255 - 14 * k), int(255 - 19 * k), 255, 255))
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([inset, inset, W - 1 - inset, H - 1 - inset], radius=r, fill=255)
+    im.paste(grad, (0, 0), mask)
+    d.rounded_rectangle([inset, inset, W - 1 - inset, H - 1 - inset], radius=r, outline=(124, 92, 252, 255), width=bw)
+    x0 = (W - tw) / 2
+    asc, desc = font.getmetrics()
+    ty = (H - (asc + desc)) / 2
+    for p in parts:
+        if p[0] == "t":
+            d.text((x0 + p[1], ty), p[2], font=font, fill=(59, 42, 120, 255), stroke_width=max(1, int(size / 38)), stroke_fill=(59, 42, 120, 255))
+        else:
+            e = _wm_emoji_img(p[2]).resize((int(p[3]), int(p[3])), Image.LANCZOS)
+            im.alpha_composite(e, (int(x0 + p[1]), int((H - e.height) / 2)))
+    return im
+
+def wm_find(p):
+    """Brand-colored (magenta) text regions on one page image: [(key, x0, x1, y0, y1)] in raster px."""
+    from PIL import ImageChops
+    w, h = p.size
+    m = wm_mask(p)
+    out = []
+    for band, (y0, y1) in (("t", (0, int(h * 0.08))), ("b", (int(h * 0.90), h))):
+        mm = m.crop((0, y0, w, y1)).point(lambda v: 255 if v else 0)
+        col = mm.resize((w, 1), 2).tobytes()   # BOX
+        cols = [x for x in range(w) if col[x]]
+        if not cols:
+            continue
+        runs, s, pv = [], cols[0], cols[0]
+        for c in cols[1:]:
+            if c - pv > 60:
+                runs.append((s, pv)); s = c
+            pv = c
+        runs.append((s, pv))
+        side = {"l": [], "r": []}
+        for a, b in runs:
+            side["l" if (a + b) / 2 < w / 2 else "r"].append((a, b))
+        for sd, rs in side.items():
+            if not rs:
+                continue
+            a, b = min(r[0] for r in rs), max(r[1] for r in rs)
+            bb = mm.crop((a, 0, b + 1, y1 - y0)).getbbox()
+            cnt = sum(1 for v in mm.crop((a, 0, b + 1, y1 - y0)).getdata() if v)
+            if b - a < 25 or cnt < 120 or not bb:
+                continue
+            out.append((band + sd, a, b + 1, bb[1] + y0, bb[3] + y0))
+    return out
+
+def wm_layout(reg, texts):
+    """Label rectangle (cx, cy, w, h) in raster px (1px = 1pt of the reference raster)."""
+    key, a, b, ya, yb = reg
+    bh = yb - ya
+    if key[0] == "t":
+        h = min(26, max(22, bh + 6)); cy = (ya + yb) / 2
+    else:
+        h = min(21, max(19, bh + 2)); cy = (ya + yb) / 2 - 1.5
+    return key, (a + b) / 2, cy, max(b - a + 8, 60), h
+
+def wm_best_image(pg):
+    best = None
+    for im in pg.images:
+        try:
+            xo = im.indirect_reference.get_object()
+        except Exception:
+            xo = None
+        if xo is not None and "/SMask" in xo:
+            continue
+        pi = im.image
+        if best is None or pi.width * pi.height > best.width * best.height:
+            best = pi
+    return best
+
+def wm_process(data, texts, previews=0):
+    """Cover every brand watermark region with a framed label. Returns (pdf_bytes|None, pages_changed, pages_total, previews)."""
+    from pypdf import PdfReader, PdfWriter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    w = PdfWriter()
+    w.append(r)
+    cache, changed, prev = {}, 0, []
+    def lab(key, lw, lh):
+        k = (key, texts[key], round(lw), round(lh))
+        if k not in cache:
+            im = wm_label(texts[key], round(lw), round(lh), 4)
+            q = im.quantize(colors=64, method=Image.Quantize.FASTOCTREE)
+            b = io.BytesIO(); q.save(b, "PNG", optimize=True)
+            cache[k] = (im, Image.open(io.BytesIO(b.getvalue())).convert("RGBA"))
+        return cache[k]
+    for pi, pg in enumerate(w.pages):
+        try:
+            p = wm_best_image(pg)
+            if p is None:
+                continue
+            p = p.convert("RGB")
+            regs = wm_find(p)
+            if not regs:
+                continue
+            W, H = float(pg.mediabox.width), float(pg.mediabox.height)
+            cms = re.findall(rb"([\d.\-]+) 0 0 ([\d.\-]+) ([\d.\-]+) ([\d.\-]+) cm\s*/\S+ Do", pg.get_contents().get_data())
+            if cms:
+                iw, ih, ix, iy = [float(v) for v in max(cms, key=lambda t: float(t[1]))]
+            else:
+                iw, ih, ix, iy = W, H, 0.0, 0.0
+            sx, sy = iw / p.width, ih / p.height
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=(W, H))
+            after = None
+            if pi < previews:
+                after = p.resize((p.width * 2, p.height * 2), Image.LANCZOS).convert("RGBA")
+            for reg in regs:
+                key, cx, cy, lw, lh = wm_layout(reg, texts)
+                full, small = lab(key, lw, lh)
+                c.drawImage(ImageReader(small), ix + (cx - lw / 2) * sx, iy + ih - (cy + lh / 2) * sy, lw * sx, lh * sy, mask="auto")
+                if after is not None:
+                    after.alpha_composite(full.resize((int(lw * 2), int(lh * 2)), Image.LANCZOS), (int((cx - lw / 2) * 2), int((cy - lh / 2) * 2)))
+            c.save()
+            pg.merge_page(PdfReader(io.BytesIO(buf.getvalue())).pages[0])
+            changed += 1
+            if after is not None:
+                prev.append((p.resize((p.width * 2, p.height * 2), Image.LANCZOS), after.convert("RGB")))
+        except Exception as e:
+            log.warning("wm page %s failed: %r", pi + 1, e)
+    if not changed:
+        return None, 0, len(w.pages), []
+    o = io.BytesIO()
+    w.write(o)
+    return o.getvalue(), changed, len(w.pages), prev
+
+def wm_preview_images(prev):
+    """JPEG bytes: side-by-side pages (before | after) and a band zoom of the first page."""
+    from PIL import Image
+    outs = []
+    for b, a in prev[:3]:
+        W, H = b.size
+        s = Image.new("RGB", (W * 2 + 16, H), "white")
+        s.paste(b, (0, 0)); s.paste(a, (W + 16, 0))
+        s = s.resize((int(s.width * 0.8), int(s.height * 0.8)), Image.LANCZOS)
+        buf = io.BytesIO(); s.save(buf, "JPEG", quality=88); outs.append(buf.getvalue())
+    if prev:
+        b, a = prev[0]
+        W, H = b.size
+        def bands(im):
+            t = im.crop((0, 0, W, int(H * 0.085))); bo = im.crop((0, int(H * 0.9), W, H))
+            c = Image.new("RGB", (W, t.height + bo.height + 6), "red"); c.paste(t, (0, 0)); c.paste(bo, (0, t.height + 6)); return c
+        zb, za = bands(b), bands(a)
+        z = Image.new("RGB", (W, zb.height * 2 + 12), "blue"); z.paste(zb, (0, 0)); z.paste(za, (0, zb.height + 12))
+        buf = io.BytesIO(); z.save(buf, "PNG", optimize=True); outs.append(buf.getvalue())
+    return outs
+
+def wm_db_init():
+    for col in ("wm_done INTEGER", "wprev_fid TEXT", "wprev_orig TEXT", "wprev_st INTEGER"):
+        try:
+            hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
+        except Exception:
+            pass
+
+def wm_menu():
+    tx = wm_texts()
+    done = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(wm_done,0)=1")[0][0]
+    total = hq("SELECT COUNT(*) FROM h_files")[0][0]
+    t = ("🧴 استبدال علامة ملازم (إطارات أنيقة)\n"
+         "تُغطّى كتابة العلامة الوردية القديمة (اللون الوردي فقط، أعلى وأسفل الصفحة) بإطار أبيض بحواف دائرية وفيه النص الجديد. محتوى الصفحة لا يُمسّ.\n\n"
+         + "\n".join(f"• {WM_NAMES[k]}: {tx[k]}" for k in WM_KEYS)
+         + f"\n\nالمعالجة: {done} من {total} ملزمة."
+         + ("\nالتجربة: ✅ تمّت" if WMST["tested"] else "\nالتسلسل: عدّل النصوص ← 🧪 تجربة على ملف ← ▶️ تطبيق على الكل. ويمكن التراجع."))
+    kb = M([
+        [hb("✏️ " + WM_NAMES[k], "k:o:we:" + k) for k in ("tl", "tr")],
+        [hb("✏️ " + WM_NAMES[k], "k:o:we:" + k) for k in ("bl", "br")],
+        [hb("🧪 تجربة على ملف", "k:o:wt"), hb("▶️ تطبيق على الكل", "k:o:wg")],
+        [hb("↩️ تراجع عن الاستبدال", "k:o:wu")],
+        [hb(("✅ " if store.get("wm_auto", "0") == "1" else "⬜ ") + "تلقائي للملازم الجديدة", "k:o:wa")],
+        [hb("🔙 رجوع", "k:o:m")]])
+    return t, kb
+
+async def wm_fix_one(data, cfg, st=0):
+    """(cleaned, final_or_None, pages_changed, pages_total) or None when no watermark was found."""
+    out, ch, n, _ = await asyncio.to_thread(wm_process, data, wm_texts(), 0)
+    if not out:
+        return None
+    final = None
+    if cfg and (cfg["on"] or st):
+        final, _ = await asyncio.to_thread(stamp_pdf, out, cfg)
+    return out, final, ch, n
+
+async def wm_apply(ctx, chat, mid):
+    if WMJOB["run"]:
+        return
+    WMJOB.update(run=True, stop=False)
+    rows = hq("SELECT id FROM h_files WHERE COALESCE(wm_done,0)=0 AND COALESCE(fsize,0)<=? ORDER BY id", (MAX_DL,))
+    ids = [r[0] for r in rows]
+    done = ok = skip = fail = 0
+    last = 0.0
+    t0 = time.time()
+    async def show(final=False):
+        nonlocal last
+        if not final and time.time() - last < 4:
+            return
+        el = int(time.time() - t0)
+        try:
+            await ctx.bot.edit_message_text(f"{'✅ انتهى' if final else '⏳'} استبدال علامة ملازم {done}/{len(ids)} · ✔ {ok} · بدون علامة {skip} · ⚠️ {fail} · {el // 60}د {el % 60}ث",
+                                            chat_id=chat, message_id=mid, reply_markup=None if final else M([[hb("⛔ إيقاف", "k:o:ws")]]))
+            last = time.time()
+        except Exception:
+            pass
+    try:
+        for hid in ids:
+            if WMJOB["stop"]:
+                break
+            try:
+                fid, st, orig, fn = hq("SELECT file_id, COALESCE(stamped,0), COALESCE(orig_fid,''), COALESCE(fname,'') FROM h_files WHERE id=?", (hid,))[0]
+                cfg = stamp_cfg()
+                async with STAMP_LOCK:
+                    data = await asyncio.wait_for(fetch_file(ctx, src_fid(fid, st, orig)), 90)
+                    res = await asyncio.wait_for(wm_fix_one(data, cfg, st), 600)
+                    del data
+                    if not res:
+                        hq("UPDATE h_files SET wm_done=2 WHERE id=?", (hid,), False)
+                        skip += 1
+                        done += 1
+                        continue
+                    cleaned, final, ch, n = res
+                    fname = fn or "handout.pdf"
+                    cfid = await store_doc(ctx.bot, cleaned, fname)
+                    if final:
+                        ffid = await store_doc(ctx.bot, final, fname)
+                        hq("UPDATE h_files SET wprev_fid=?, wprev_orig=?, wprev_st=?, file_id=?, orig_fid=?, stamped=1, wm_done=1 WHERE id=?", (fid, orig, st, ffid, cfid, hid), False)
+                    else:
+                        hq("UPDATE h_files SET wprev_fid=?, wprev_orig=?, wprev_st=?, file_id=?, orig_fid='', stamped=0, wm_done=1 WHERE id=?", (fid, orig, st, cfid, hid), False)
+                    log.info("wm apply %s: %d/%d pages", hid, ch, n)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                log.warning("wm apply failed %s: %r", hid, e)
+            done += 1
+            await show()
+            await asyncio.sleep(0.3)
+    finally:
+        WMJOB["run"] = False
+        backup_soon()
+        await show(True)
+
+async def wm_auto_ingest(ctx, rec):
+    try:
+        if store.get("wm_auto", "0") != "1" or int(rec.get("fsize", 0) or 0) > MAX_DL:
+            return
+        async with STAMP_LOCK:
+            data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
+            res = await asyncio.wait_for(wm_fix_one(data, None), 300)
+            del data
+            if not res:
+                return
+            rec["fid"] = await store_doc(ctx.bot, res[0], rec.get("fname") or "handout.pdf")
+            rec["wm_new"] = 1
+    except Exception as e:
+        log.warning("wm auto ingest failed: %r", e)
+
+async def wm_cb(q, ctx, x, parts):
+    """Callbacks k:o:w* for the framed-label flow. Returns True when handled."""
+    if x == "wm":
+        t, kb = wm_menu()
+        try:
+            await q.message.edit_text(t, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(t, reply_markup=kb)
+        return True
+    if x == "we":
+        k = parts[3] if len(parts) > 3 else ""
+        if k in WM_KEYS:
+            ctx.user_data["admin_wait"] = "kso:wx:" + k
+            await q.message.reply_text(f"✏️ اكتب النص الجديد لإطار «{WM_NAMES[k]}» (الحالي: {wm_texts()[k]}).\nيمكنك استخدام إيموجي مثل 🎓 📚 📌 📖 ✨ ⭐ 🔥 📝 🧪 💡. أرسل - لإرجاع النص الافتراضي. النص الطويل يُصغَّر تلقائياً ليناسب الإطار.")
+        return True
+    if x == "wt":
+        ctx.user_data["admin_wait"] = "kso:wf"
+        await q.message.reply_text("🧪 أرسل ملف PDF واحد للتجربة (حتى 20MB). سأرجع لك صور قبل/بعد وملف النتيجة، ولن يتغير شيء في المكتبة.")
+        return True
+    if x == "wa":
+        store.set("wm_auto", "0" if store.get("wm_auto", "0") == "1" else "1")
+        t, kb = wm_menu()
+        await q.message.edit_text(t, reply_markup=kb)
+        return True
+    if x == "wg":
+        if not WMST["tested"]:
+            await q.message.reply_text("جرّب على ملف أولاً (🧪 تجربة على ملف) ووافق على النتيجة.")
+            return True
+        n = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(wm_done,0)=0 AND COALESCE(fsize,0)<=?", (MAX_DL,))[0][0]
+        await q.message.reply_text(f"سيتم فحص {n} ملزمة وتغطية العلامة القديمة بالإطارات (الملازم بدون علامة تُترك). تعمل بالخلفية وتقدر توقفها. النسخة السابقة تبقى ويمكن التراجع. متأكد؟",
+                                   reply_markup=M([[hb("✅ نعم، طبّق", "k:o:wg1"), hb("إلغاء", "k:o:wm")]]))
+        return True
+    if x == "wg1":
+        if WMJOB["run"] or not WMST["tested"]:
+            await q.message.reply_text("⏳ لا يمكن البدء الآن.")
+            return True
+        m = await q.message.reply_text("⏳ جاري الاستبدال...", reply_markup=M([[hb("⛔ إيقاف", "k:o:ws")]]))
+        asyncio.create_task(wm_apply(ctx, m.chat_id, m.message_id))
+        return True
+    if x == "ws":
+        WMJOB["stop"] = True
+        return True
+    if x == "wu":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(wprev_fid,'')<>''")[0][0]
+        await q.message.reply_text(f"↩️ سيعاد الوضع السابق لـ {n} ملزمة (قبل استبدال العلامة). متأكد؟", reply_markup=M([[hb("✅ نعم، تراجع", "k:o:wu1"), hb("إلغاء", "k:o:wm")]]))
+        return True
+    if x == "wu1":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(wprev_fid,'')<>''")[0][0]
+        hq("UPDATE h_files SET file_id=wprev_fid, orig_fid=COALESCE(wprev_orig,''), stamped=COALESCE(wprev_st,0), wprev_fid='', wm_done=0 WHERE COALESCE(wprev_fid,'')<>''", (), False)
+        backup_soon()
+        await q.message.reply_text(f"↩️ أُعيدت {n} ملزمة لوضعها السابق.")
+        return True
+    return False
+
+async def wm_input(update, ctx, act):
+    msg = update.message
+    if act.startswith("kso:wx:"):
+        k = act.split(":")[2]
+        tx = (msg.text or "").strip()
+        if k in WM_KEYS and tx:
+            store.set("wm_t_" + k, "" if tx == "-" else tx[:80])
+            WMST["tested"] = False
+            await msg.reply_text("✅ تم الحفظ. أعد التجربة على ملف قبل التطبيق.")
+        t, kb = wm_menu()
+        await msg.reply_text(t, reply_markup=kb)
+        return True
+    if act == "kso:wf":
+        d = msg.document
+        if not d or not ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل ملف PDF.")
+            return True
+        if (d.file_size or 0) > MAX_DL:
+            await msg.reply_text("الملف أكبر من 20MB.")
+            return True
+        st = await msg.reply_text("⏳ جاري المعالجة...")
+        try:
+            data = await fetch_file(ctx, d.file_id)
+            t0 = time.time()
+            async with STAMP_LOCK:
+                out, ch, n, prev = await asyncio.wait_for(asyncio.to_thread(wm_process, data, wm_texts(), 3), 600)
+            el = time.time() - t0
+            del data
+            if not out:
+                await st.edit_text("ما لقيت علامة وردية بأعلى/أسفل صفحات هذا الملف، لم يتغير شيء.")
+                return True
+            imgs = await asyncio.to_thread(wm_preview_images, prev)
+            for i, b in enumerate(imgs):
+                cap = ("قبل | بعد (يسار قبل، يمين بعد)" if i < len(imgs) - 1 else "تكبير: الأعلى والأسفل (الأحمر = قبل، الأزرق = بعد)")
+                if i < len(imgs) - 1:
+                    await msg.reply_photo(io.BytesIO(b), caption=f"{cap} · صفحة {i + 1}")
+                else:
+                    await msg.reply_document(InputFile(io.BytesIO(b), filename="zoom.png"), caption=cap)
+            await msg.reply_document(InputFile(io.BytesIO(out), filename="wm_test_" + (d.file_name or "test.pdf")),
+                                     caption=f"🧪 غُطّيت العلامة في {ch} من {n} صفحة · الزمن {el:.1f} ثانية · الحجم {len(out) // 1024}KB\nإذا النتيجة صحيحة اضغط ▶️ تطبيق على الكل.")
+            WMST["tested"] = True
+            log.info("wm test: %d/%d pages in %.1fs", ch, n, el)
+            await st.delete()
+        except Exception as e:
+            log.exception("wm test")
+            await st.edit_text("تعذّرت المعالجة (%s: %s)" % (type(e).__name__, str(e)[:100]))
+        return True
+    return False
+
 def wm_diag(data):
     from pypdf import PdfReader
     r = PdfReader(io.BytesIO(data))
@@ -2561,6 +4983,8 @@ def wm_diag(data):
 async def old_input(update, ctx, act):
     msg = update.message
     chat = msg.chat_id
+    if act.startswith("kso:w") and act != "kso:w":
+        return await wm_input(update, ctx, act)
     if act == "kso:w":
         d = msg.document
         if not d or (d.file_size or 0) > MAX_DL:
@@ -2736,6 +5160,7 @@ async def ing_finalize(status, rec, ctx):
         await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {dup[1]}")
         return
     rec["note"] = rec.get("note", "") + await old_auto_ingest(ctx, rec)
+    await wm_auto_ingest(ctx, rec)
     rec["note"] = rec.get("note", "") + await apply_stamp(ctx, rec)
     hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
@@ -2855,6 +5280,7 @@ async def bulk_save(rec, ctx):
         cleanup_empty(jid)
         return "dup"
     await old_auto_ingest(ctx, rec)
+    await wm_auto_ingest(ctx, rec)
     await apply_stamp(ctx, rec)
     hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
@@ -3772,6 +6198,7 @@ async def post_init(app):
     await restore_backup(app)
     store = Store(DB_PATH)
     old_db_init()
+    wm_db_init()
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
     async def _ws():
@@ -3976,7 +6403,7 @@ async def serve(url):
     import signal
     async def _bye():
         try:
-            if _backup_dirty:
+            if _backup_dirty or time.time() - _last_backup > 60:
                 await asyncio.wait_for(do_backup(), 20)
                 log.info("shutdown backup done")
         except Exception:
