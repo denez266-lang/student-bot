@@ -172,6 +172,8 @@ def is_admin(update: Update):
 def tick(on):
     return "✅" if on else "❌"
 
+FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash,gemini-3.5-flash-lite").split(",") if m.strip()]
+
 async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     body = {
         "contents": [{"role": "user", "parts": parts}],
@@ -179,11 +181,27 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     }
     if system:
         body["system_instruction"] = {"parts": [{"text": system}]}
+    models = [MODEL] + [m.strip() for m in FALLBACKS if m.strip() != MODEL]
+    r = None
     async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(GURL, params={"key": GKEY}, json=body)
-    if r.status_code != 200:
-        log.warning("gemini %s: %s", r.status_code, r.text[:300])
-        if r.status_code in (429, 503):
+        for attempt, m in enumerate(models + models[:1]):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+            try:
+                r = await c.post(url, params={"key": GKEY}, json=body)
+            except httpx.HTTPError as e:
+                log.warning("gemini network %s: %s", m, e)
+                r = None
+                await asyncio.sleep(2)
+                continue
+            if r.status_code == 200:
+                break
+            log.warning("gemini %s (%s): %s", r.status_code, m, r.text[:200])
+            if r.status_code in (429, 500, 503, 404):
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            break
+    if r is None or r.status_code != 200:
+        if r is not None and r.status_code in (429, 503):
             raise RuntimeError("الخدمة مزدحمة حالياً، حاول بعد دقيقة.")
         raise RuntimeError("تعذر الاتصال بالذكاء الاصطناعي، حاول لاحقاً.")
     data = r.json()
