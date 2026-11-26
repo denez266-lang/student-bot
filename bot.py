@@ -50,6 +50,11 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
+        for col in ("teacher TEXT", "file_uid TEXT"):
+            try:
+                self.q("ALTER TABLE h_files ADD COLUMN " + col)
+            except sqlite3.OperationalError:
+                pass
 
     def q(self, sql, args=(), fetch=None):
         with self.lock:
@@ -668,6 +673,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     store.upsert_user(u)
     if await admin_input(update, ctx):
         return
+    if is_admin(update):
+        if msg.reply_to_message and await ing_reply(update, ctx):
+            return
+        d = msg.document
+        if d and not ctx.user_data.get("mode") and ((d.mime_type or "") == "application/pdf" or (d.file_name or "").lower().endswith(".pdf")):
+            await ingest_pdf(update, ctx)
+            return
     if not await gate_ok(update, ctx):
         return
     mode = ctx.user_data.get("mode")
@@ -799,6 +811,7 @@ async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 هذا الأمر للأدمن فقط.\nآيديك: {u.id}\n(إن كنت صاحب البوت فأرسل هذا الآيدي لإعداد الصلاحية.)")
         return
     ctx.user_data.pop("admin_wait", None)
+    ctx.user_data.pop("mode", None)
     t, kb = screen("main")
     await update.message.reply_text(t, reply_markup=kb)
 
@@ -1102,6 +1115,8 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("admin_wait", None)
     text = (msg.text or msg.caption or "").strip()
     s = store
+    if act.startswith("ie:"):
+        return await ing_edit_input(update, ctx, act)
     if act.startswith("h"):
         return await hadmin_input(update, ctx, act, msg, text)
     back = {"welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}
@@ -1148,6 +1163,273 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🚫 تم الحظر." if act == "ban" else "✅ تم فك الحظر.", reply_markup=back_admin("users"))
         return True
     return False
+
+# ---------------- auto handout ingest (admin sends a PDF, AI files it) ----------------
+ING_LOCK = asyncio.Lock()
+PENDING = {}      # bot message id -> record waiting for an answer / confirmation
+AUTO = set()      # ('s'|'j', id) created automatically, removed again if left empty
+MAX_DL = 20 * 1024 * 1024   # Telegram Bot API download limit
+
+ING_SYS = (
+    "أنت أمين مكتبة مدرسية عراقية. تقرأ بداية ملزمة (PDF) واسم الملف ووصفها، وتستخرج بياناتها للأرشفة. "
+    "أجب بـ JSON فقط بدون أي شرح أو علامات."
+)
+
+def nrm(s):
+    s = re.sub(r"[\u064B-\u065F\u0640]", "", s or "")
+    s = s.translate(str.maketrans("أإآىة", "ااايه")).lower()
+    s = re.sub(r"(^|\s)ال", r"\1", s)
+    return re.sub(r"[^\w]", "", s)
+
+def stem(fname):
+    s = re.sub(r"\.pdf$", "", fname or "", flags=re.I)
+    return re.sub(r"[_]+", " ", s).strip() or "ملزمة"
+
+def compose_title(title, teacher):
+    title = (title or "").strip() or "ملزمة"
+    teacher = (teacher or "").strip()
+    if teacher and nrm(teacher) not in nrm(title):
+        title = f"{title} - أ. {teacher}"
+    return title
+
+def get_stage(name, create=True):
+    n = nrm(name)
+    for sid, sname in hq("SELECT id, name FROM h_stages ORDER BY id"):
+        if nrm(sname) == n:
+            return sid
+    if not create:
+        return None
+    hq("INSERT INTO h_stages(name) VALUES(?)", (name.strip(),), False)
+    sid = hq("SELECT id FROM h_stages ORDER BY id DESC LIMIT 1")[0][0]
+    AUTO.add(("s", sid))
+    return sid
+
+def get_subject(sid, name):
+    n = nrm(name)
+    for jid, jname in hq("SELECT id, name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,)):
+        if nrm(jname) == n:
+            return jid
+    hq("INSERT INTO h_subjects(stage_id,name) VALUES(?,?)", (sid, name.strip()), False)
+    jid = hq("SELECT id FROM h_subjects ORDER BY id DESC LIMIT 1")[0][0]
+    AUTO.add(("j", jid))
+    return jid
+
+def cleanup_empty(jid):
+    r = hq("SELECT stage_id FROM h_subjects WHERE id=?", (jid,))
+    if not r:
+        return
+    sid = r[0][0]
+    if ("j", jid) in AUTO and not hq("SELECT 1 FROM h_files WHERE subject_id=? LIMIT 1", (jid,)):
+        hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+        AUTO.discard(("j", jid))
+    if ("s", sid) in AUTO and not hq("SELECT 1 FROM h_subjects WHERE stage_id=? LIMIT 1", (sid,)):
+        hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
+        AUTO.discard(("s", sid))
+
+def pdf_head(data, pages=3):
+    """First pages of a PDF: (text, small_pdf_bytes_or_None)."""
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        try:
+            r.decrypt("")
+        except Exception:
+            return "", None
+    sel = r.pages[:pages]
+    text = "\n".join((p.extract_text() or "") for p in sel).strip()
+    small = None
+    if len(text) < 80:   # scanned: let Gemini look at the pages themselves
+        w = PdfWriter()
+        for p in sel:
+            w.add_page(p)
+        buf = io.BytesIO()
+        w.write(buf)
+        if buf.tell() <= 7 * 1024 * 1024:
+            small = buf.getvalue()
+    return text[:3500], small
+
+async def analyze_pdf(ctx, doc, caption):
+    existing = []
+    for sid, sname in hq("SELECT id, name FROM h_stages ORDER BY id"):
+        subs = [r[0] for r in hq("SELECT name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,))]
+        existing.append(f"- {sname}: " + (("، ".join(subs)) or "(لا مواد بعد)"))
+    prompt = (
+        "استخرج من هذه الملزمة: المرحلة/الصف، المادة، اسم المدرّس، وعنواناً مناسباً.\n"
+        f"اسم الملف: {doc.file_name or ''}\nوصف الأدمن: {caption or '(لا يوجد)'}\n"
+        "المراحل والمواد الموجودة حالياً في المكتبة:\n" + ("\n".join(existing) or "(فارغة)") + "\n\n"
+        "القواعد: إذا كانت المرحلة أو المادة تطابق موجوداً فاستعمل اسمه حرفياً. "
+        "المرحلة بصيغة مثل: السادس الإعدادي العلمي، الثالث المتوسط، الرابع الإعدادي. "
+        "المادة مثل: الفيزياء، الرياضيات. اسم المدرّس بدون لقب (بدون أ. أو الأستاذ). "
+        "العنوان هو عنوان الملزمة فقط مثل «ملزمة الفصل الأول» أو «أسئلة وزارية» بدون اسم المدرّس وبدون المرحلة. "
+        "لا تخمّن: إذا لم تجد قيمة بوضوح اتركها نصاً فارغاً.\n"
+        'الصيغة: {"stage":"","subject":"","teacher":"","title":""}'
+    )
+    parts = [{"text": prompt}]
+    size = doc.file_size or 0
+    if size and size <= MAX_DL:
+        data = await fetch_file(ctx, doc.file_id)
+        try:
+            text, small = await asyncio.to_thread(pdf_head, data)
+        except Exception:
+            log.exception("pdf_head failed")
+            text, small = "", None
+        del data
+        if text:
+            parts.append({"text": "نص أول صفحات الملف:\n" + text})
+        elif small:
+            parts.append({"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(small).decode()}})
+    out = await gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024)
+    m = re.search(r"\{.*\}", out, re.S)
+    d = json.loads(m.group(0)) if m else {}
+    return {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title")}
+
+def ing_summary(hid):
+    r = hq("SELECT f.title, f.teacher, j.name, s.name FROM h_files f JOIN h_subjects j ON f.subject_id=j.id "
+           "JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
+    if not r:
+        return None, None
+    title, teacher, subj, stage = r[0]
+    text = f"✅ {title}\n🎓 {stage} › 📘 {subj} › 👨‍🏫 {teacher or 'غير محدد'}"
+    kb = M([[hb("✏️ تعديل", f"i:e:{hid}"), hb("🗑 حذف", f"i:d:{hid}")]])
+    return text, kb
+
+async def ing_finalize(status, rec, ctx):
+    """Save the record if complete, otherwise ask for the missing field (reply to this message)."""
+    for need, label in (("stage", "المرحلة (مثال: السادس الإعدادي العلمي)"), ("subject", "المادة (مثال: الفيزياء)")):
+        if not rec.get(need):
+            rec["need"] = need
+            PENDING[status.message_id] = rec
+            await status.edit_text(f"❓ لم أستطع تحديد {label} للملف:\n📄 {trim(rec['name'], 60)}\n\n↩️ اكتب الجواب بالرد على هذه الرسالة.")
+            return
+    rec.pop("need", None)
+    sid = get_stage(rec["stage"])
+    jid = get_subject(sid, rec["subject"])
+    title = compose_title(rec["title"] or stem(rec["name"]), rec["teacher"])
+    if not rec.get("force"):
+        dup = hq("SELECT id FROM h_files WHERE file_uid=? AND file_uid<>'' LIMIT 1", (rec["uid"],))
+        if not dup:
+            n = nrm(title)
+            dup = [(i,) for i, t in hq("SELECT id, title FROM h_files WHERE subject_id=?", (jid,)) if nrm(t) == n]
+        if dup:
+            PENDING[status.message_id] = rec
+            cleanup_empty(jid)
+            await status.edit_text(f"⚠️ موجودة مسبقاً، لم أكررها:\n📄 {title}",
+                                   reply_markup=M([[hb("➕ أضفها رغم ذلك", "i:f")]]))
+            return
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid) VALUES(?,?,?,?,?,?,?)",
+       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"]), False)
+    backup_soon()
+    hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
+    PENDING.pop(status.message_id, None)
+    text, kb = ing_summary(hid)
+    await status.edit_text(text, reply_markup=kb)
+
+async def ingest_pdf(update, ctx):
+    msg = update.message
+    doc = msg.document
+    cap = (msg.caption or "").strip()
+    status = await msg.reply_text(f"⏳ جاري قراءة: {trim(doc.file_name or 'ملف', 50)}")
+    info = {"stage": "", "subject": "", "teacher": "", "title": ""}
+    async with ING_LOCK:
+        try:
+            info = await analyze_pdf(ctx, doc, cap)
+        except Exception as e:
+            log.warning("ingest analyze failed: %r", e)
+    rec = dict(info, fid=doc.file_id, uid=doc.file_unique_id or "", name=doc.file_name or "ملزمة")
+    await ing_finalize(status, rec, ctx)
+
+async def ing_reply(update, ctx):
+    msg = update.message
+    rep = msg.reply_to_message
+    rec = PENDING.get(rep.message_id) if rep else None
+    if not rec or not rec.get("need") or not msg.text:
+        return False
+    rec[rec["need"]] = msg.text.strip()[:80]
+    await ing_finalize(rep, rec, ctx)
+    return True
+
+async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("للأدمن فقط", show_alert=True)
+        return
+    parts = q.data.split(":")
+    a = parts[1]
+    await q.answer()
+    if a == "f":
+        rec = PENDING.get(q.message.message_id)
+        if not rec:
+            await q.message.edit_text("انتهت صلاحية هذا الطلب، أعد إرسال الملف.")
+            return
+        rec["force"] = True
+        await ing_finalize(q.message, rec, ctx)
+        return
+    hid = int(parts[2])
+    if a == "b":
+        text, kb = ing_summary(hid)
+        if not text:
+            await q.message.edit_text("🗑 هذه الملزمة محذوفة.")
+            return
+        await q.message.edit_text(text, reply_markup=kb)
+    elif a == "e":
+        await q.message.edit_reply_markup(M([
+            [hb("✏️ العنوان", f"i:w:title:{hid}"), hb("👨‍🏫 المعلم", f"i:w:teacher:{hid}")],
+            [hb("🎓 المرحلة", f"i:w:stage:{hid}"), hb("📘 المادة", f"i:w:subject:{hid}")],
+            [hb("🔙 رجوع", f"i:b:{hid}")]]))
+    elif a == "w":
+        field, hid = parts[2], int(parts[3])
+        ctx.user_data["admin_wait"] = f"ie:{field}:{hid}"
+        names = {"title": "العنوان الجديد", "teacher": "اسم المعلم الجديد", "stage": "اسم المرحلة الجديد", "subject": "اسم المادة الجديد"}
+        await q.message.reply_text(f"✏️ أرسل {names[field]}:")
+    elif a == "d":
+        r = hq("SELECT title FROM h_files WHERE id=?", (hid,))
+        if not r:
+            await q.message.edit_text("🗑 هذه الملزمة محذوفة.")
+            return
+        await q.message.edit_text(f"⚠️ حذف «{r[0][0]}» نهائياً؟",
+                                  reply_markup=M([[hb("🗑 نعم، احذف", f"i:x:{hid}"), hb("↩️ تراجع", f"i:b:{hid}")]]))
+    elif a == "x":
+        r = hq("SELECT title, subject_id FROM h_files WHERE id=?", (hid,))
+        if r:
+            hq("DELETE FROM h_files WHERE id=?", (hid,), False)
+            cleanup_empty(r[0][1])
+            backup_soon()
+            await q.message.edit_text(f"🗑 تم حذف: {r[0][0]}")
+        else:
+            await q.message.edit_text("🗑 هذه الملزمة محذوفة.")
+
+async def ing_edit_input(update, ctx, act):
+    msg = update.message
+    _, field, hid = act.split(":")
+    hid = int(hid)
+    text = (msg.text or "").strip()[:100]
+    r = hq("SELECT title, teacher, subject_id FROM h_files WHERE id=?", (hid,))
+    if not text or not r:
+        await msg.reply_text("أرسل نصاً صحيحاً، أو الملزمة محذوفة.")
+        return True
+    title, teacher, jid = r[0]
+    if field == "title":
+        hq("UPDATE h_files SET title=? WHERE id=?", (text, hid), False)
+    elif field == "teacher":
+        if teacher and teacher in title:
+            title = title.replace(teacher, text)
+        else:
+            title = compose_title(title, text)
+        hq("UPDATE h_files SET title=?, teacher=? WHERE id=?", (title, text, hid), False)
+    else:
+        sid, subj = hq("SELECT stage_id, name FROM h_subjects WHERE id=?", (jid,))[0]
+        if field == "stage":
+            sid = get_stage(text)
+        else:
+            subj = text
+        new_j = get_subject(sid, subj)
+        hq("UPDATE h_files SET subject_id=? WHERE id=?", (new_j, hid), False)
+        if new_j != jid:
+            cleanup_empty(jid)
+    backup_soon()
+    t, kb = ing_summary(hid)
+    await msg.reply_text("تم التعديل:\n" + t, reply_markup=kb)
+    return True
 
 # ---------------- main ----------------
 
@@ -1207,6 +1489,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(verify_cb, pattern=r"^g:verify$"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(handout_cb, pattern=r"^h:"))
+    app.add_handler(CallbackQueryHandler(ing_cb, pattern=r"^i:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
