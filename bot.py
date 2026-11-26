@@ -50,7 +50,7 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
-        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT"):
+        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER"):
             try:
                 self.q("ALTER TABLE h_files ADD COLUMN " + col)
             except sqlite3.OperationalError:
@@ -1416,24 +1416,35 @@ async def ing_finalize(status, rec, ctx):
     sid = get_stage(rec["stage"])
     jid = get_subject(sid, rec["subject"])
     title = compose_title(rec["title"] or stem(rec["name"]), rec["teacher"])
-    if not rec.get("force"):
-        dup = hq("SELECT id FROM h_files WHERE file_uid=? AND file_uid<>'' LIMIT 1", (rec["uid"],))
-        if not dup:
-            n = nrm(title)
-            dup = [(i,) for i, t in hq("SELECT id, title FROM h_files WHERE subject_id=?", (jid,)) if nrm(t) == n]
-        if dup:
-            PENDING[status.message_id] = rec
-            cleanup_empty(jid)
-            await status.edit_text(f"⚠️ موجودة مسبقاً، لم أكررها:\n📄 {title}",
-                                   reply_markup=M([[hb("➕ أضفها رغم ذلك", "i:f")]]))
-            return
-    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality) VALUES(?,?,?,?,?,?,?,?,?)",
-       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", "")), False)
+    dup = find_dup(rec["uid"], rec.get("fname", ""), rec.get("fsize", 0))
+    if not dup:
+        n = nrm(title)
+        dup = next(((i, t) for i, t in hq("SELECT id, title FROM h_files WHERE subject_id=?", (jid,)) if nrm(t) == n), None)
+    if dup:
+        PENDING.pop(status.message_id, None)
+        cleanup_empty(jid)
+        await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {dup[1]}")
+        return
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+       (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
+        rec.get("fname", ""), int(rec.get("fsize", 0) or 0)), False)
     backup_soon()
     hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
     PENDING.pop(status.message_id, None)
     text, kb = ing_summary(hid)
     await status.edit_text(rec.get("note", "") + text, reply_markup=kb)
+
+def find_dup(uid, fname, fsize):
+    """Existing handout id for the same Telegram file, or the same file name and size."""
+    if uid:
+        r = hq("SELECT id, title FROM h_files WHERE file_uid=? LIMIT 1", (uid,))
+        if r:
+            return r[0]
+    if fname and fsize:
+        r = hq("SELECT id, title FROM h_files WHERE fname=? AND fsize=? LIMIT 1", (fname, int(fsize)))
+        if r:
+            return r[0]
+    return None
 
 async def ingest_pdf(update, ctx):
     msg = update.message
@@ -1444,17 +1455,22 @@ async def ingest_pdf(update, ctx):
     note = ""
     try:
         async with ING_LOCK:
+            d = find_dup(doc.file_unique_id or "", doc.file_name or "", doc.file_size or 0)
+            if d:
+                await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {d[1]}")
+                return
             try:
                 info = await asyncio.wait_for(analyze_pdf(ctx, doc, cap), 100)
             except Exception as e:
                 log.warning("ingest analyze failed: %r", e)
                 note = "⚠️ تعذرت قراءة الملف بالذكاء الاصطناعي، اعتمدت على اسم الملف.\n"
-        g = guess_from_name(doc.file_name or "", cap)
-        for k in info:
-            if not info[k]:
-                info[k] = g[k]
-        rec = dict(info, fid=doc.file_id, uid=doc.file_unique_id or "", name=doc.file_name or "ملزمة", note=note)
-        await ing_finalize(status, rec, ctx)
+            g = guess_from_name(doc.file_name or "", cap)
+            for k in info:
+                if not info[k]:
+                    info[k] = g[k]
+            rec = dict(info, fid=doc.file_id, uid=doc.file_unique_id or "", name=doc.file_name or "ملزمة", note=note,
+                       fname=doc.file_name or "", fsize=doc.file_size or 0)
+            await ing_finalize(status, rec, ctx)
     except Exception:
         log.exception("ingest failed")
         try:
@@ -1480,14 +1496,6 @@ async def ing_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     a = parts[1]
     await q.answer()
-    if a == "f":
-        rec = PENDING.get(q.message.message_id)
-        if not rec:
-            await q.message.edit_text("انتهت صلاحية هذا الطلب، أعد إرسال الملف.")
-            return
-        rec["force"] = True
-        await ing_finalize(q.message, rec, ctx)
-        return
     if a == "p":
         rec = PENDING.get(q.message.message_id)
         need = rec.get("need") if rec else None
