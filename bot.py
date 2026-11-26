@@ -1938,6 +1938,7 @@ OLD_HAM = 24          # max differing bits (of 256) to count as the same old-sta
 OLDJOB = {"run": False, "stop": False}
 OLDC = {}             # candidate idx -> {"sig","count","fids"}
 OLDST = {"tested": False}
+AIST = {"on": True, "budget": 150}
 
 def img_sig(pim):
     g = pim.convert("L").resize((17, 16))
@@ -1982,15 +1983,74 @@ def page_sig(page):
         return ""
     return img_sig(best[1])
 
-def pdf_sigs(data):
+HANDLE_RE = re.compile(r"(?:(?<![\w.])@[A-Za-z][A-Za-z0-9_]{3,31}\b|(?:https?://)?(?:t|telegram)\.me/[\w+/\-]+|(?:tg://\S+))", re.I)
+
+def text_verdict(page):
+    """'p' = mostly a promo page (handle + little text), 'r' = handle but real content (review only), '' = none."""
+    try:
+        txt = page.extract_text() or ""
+    except Exception:
+        return ""
+    if not HANDLE_RE.search(txt):
+        return ""
+    rest = HANDLE_RE.sub(" ", txt)
+    words = len(re.findall(r"\w{2,}", rest))
+    return "p" if words <= 60 else "r"
+
+def page_jpeg(page):
+    best = None
+    try:
+        for im in list(page.images):
+            try:
+                p = im.image
+                a = p.width * p.height
+                if best is None or a > best[0]:
+                    best = (a, p)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    if not best:
+        return None
+    p = best[1].convert("RGB")
+    p.thumbnail((700, 700))
+    bio = io.BytesIO()
+    p.save(bio, "JPEG", quality=60)
+    return bio.getvalue()
+
+def pdf_scan(data):
     from pypdf import PdfReader
     r = PdfReader(io.BytesIO(data))
     if r.is_encrypted:
         r.decrypt("")
     n = len(r.pages)
-    sf = page_sig(r.pages[0]) if n else ""
-    sl = page_sig(r.pages[n - 1]) if n > 1 else ""
-    return n, sf, sl
+    out = {"n": n, "sf": "", "sl": "", "tf": "", "tl": "", "jf": None, "jl": None}
+    for k, idx in (("f", 0), ("l", n - 1)):
+        if idx < 0 or (k == "l" and n < 2):
+            continue
+        pg = r.pages[idx]
+        out["s" + k] = page_sig(pg)
+        out["t" + k] = text_verdict(pg)
+        if out["s" + k]:
+            out["j" + k] = page_jpeg(pg)
+    return out
+
+def pdf_sigs(data):
+    o = pdf_scan(data)
+    return o["n"], o["sf"], o["sl"]
+
+AI_PROMPT = ("This is a first or last page of a study handout PDF. Is the page MAINLY an advertisement or promo page "
+             "(channel/bot promotion, Telegram handles, QR code, logo banner) with NO study content (no lecture, exam or questions)? "
+             "Answer with exactly one letter: P if it is promo only, N otherwise (including if unsure).")
+
+async def ai_promo(jpeg):
+    """'p' / 'n', or None when AI is unavailable (quota)."""
+    try:
+        t = await gemini([img_part(jpeg), {"text": AI_PROMPT}], system="", temperature=0, max_tokens=200, fast=True)
+    except Exception as e:
+        log.warning("ai promo unavailable: %s", str(e)[:80])
+        return None
+    return "p" if t.strip().upper().startswith("P") else "n"
 
 def old_refs():
     try:
@@ -2033,6 +2093,11 @@ def old_db_init():
             hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
         except Exception:
             pass
+    for col in ("tf TEXT", "tl TEXT", "af TEXT", "al TEXT"):
+        try:
+            hq("ALTER TABLE h_sig ADD COLUMN " + col, (), False)
+        except Exception:
+            pass
 
 def src_fid(fid, stamped, orig):
     return orig if (stamped and orig) else fid
@@ -2041,12 +2106,13 @@ def old_menu():
     n = len(old_refs())
     t = (f"🧹 استبدال الأختام اليدوية القديمة\n"
          f"النماذج المحفوظة: {n}\n\n"
-         "كيف يشتغل: أي صفحة أولى/أخيرة تكون صورة فقط (بدون نص) وتشبه أحد النماذج تُحذف، ثم يوضع الختم الجديد على الصفحات الحقيقية. "
-         "لا يُحذف شيء إلا بتطابق مع نموذج. التسلسل الآمن: أضف نماذج ← فحص ← تجربة على ملف ← تطبيق. ويمكن التراجع.")
+         "يُحذف تلقائياً فقط: (1) صفحة أولى/أخيرة نصية فيها @ أو t.me مع كلام قليل (إعلان)، (2) صفحة صورة تشبه نموذجاً أكّدته، (3) صفحة صورة يحكم الذكاء أنها إعلان بدون محتوى دراسي. "
+         "الصفحة التي فيها @ لكن لها محتوى حقيقي تُعرض للمراجعة فقط ولا تُحذف. بعد الحذف يوضع الختم الجديد. التسلسل الآمن: أضف نماذج ← فحص ← تجربة على ملف ← تطبيق. ويمكن التراجع.")
     kb = M([
         [hb("🔎 اكتشاف الأختام القديمة تلقائياً", "k:o:c")],
         [hb("➕ إضافة نموذج يدوي", "k:o:a"), hb(f"🗑 مسح النماذج ({n})", "k:o:dx")],
         [hb("🔍 فحص (بدون تغيير)", "k:o:d")],
+        [hb(("✅ " if store.get("old_ai", "1") == "1" else "⬜ ") + "فحص صفحات الصور بالذكاء (@ / إعلان)", "k:o:ai")],
         [hb("🧪 تجربة على ملف", "k:o:t"), hb("▶️ تطبيق على الكل", "k:o:g")],
         [hb("↩️ تراجع عن الاستبدال", "k:o:u")],
         [hb("🔙 رجوع", "k:m")]])
@@ -2057,13 +2123,15 @@ async def old_scan(ctx, chat, mid, after):
     if OLDJOB["run"]:
         return
     OLDJOB.update(run=True, stop=False)
+    AIST.update(on=True, budget=150)
     rows = hq("SELECT id, file_id, COALESCE(stamped,0), COALESCE(orig_fid,''), COALESCE(fsize,0) FROM h_files WHERE kind='document'")
     todo = []
     for hid, fid, st, orig, fs in rows:
         sf = src_fid(fid, st, orig)
         if (fs or 0) > MAX_DL:
             continue
-        if not hq("SELECT 1 FROM h_sig WHERE fid=?", (sf,)):
+        r0 = hq("SELECT tf FROM h_sig WHERE fid=?", (sf,))
+        if not r0 or r0[0][0] is None:
             todo.append(sf)
     done, bad, last = 0, 0, 0.0
     async def show(final=False):
@@ -2082,13 +2150,29 @@ async def old_scan(ctx, chat, mid, after):
                 break
             try:
                 data = await asyncio.wait_for(fetch_file(ctx, sf), 60)
-                n, a, b = await asyncio.wait_for(asyncio.to_thread(pdf_sigs, data), 90)
+                o = await asyncio.wait_for(asyncio.to_thread(pdf_scan, data), 90)
                 del data
-                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl) VALUES(?,?,?,?)", (sf, n, a, b), False)
+                af = al = ""
+                refs = old_refs()
+                if AIST["on"] and store.get("old_ai", "1") == "1" and AIST["budget"] > 0:
+                    for k in ("f", "l"):
+                        j = o["j" + k]
+                        if j and not old_match(o["s" + k], refs)[1] and not o["t" + k]:
+                            v = await ai_promo(j)
+                            AIST["budget"] -= 1
+                            if v is None:
+                                AIST["on"] = False
+                                break
+                            if k == "f":
+                                af = v
+                            else:
+                                al = v
+                            await asyncio.sleep(0.5)
+                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl,tf,tl,af,al) VALUES(?,?,?,?,?,?,?,?)", (sf, o["n"], o["sf"], o["sl"], o["tf"], o["tl"], af, al), False)
             except Exception as e:
                 bad += 1
                 log.warning("old scan failed: %r", e)
-                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl) VALUES(?,?,?,?)", (sf, 0, "", ""), False)
+                hq("INSERT OR REPLACE INTO h_sig(fid,pages,sf,sl,tf,tl,af,al) VALUES(?,?,?,?,?,?,?,?)", (sf, 0, "", "", "", "", "", ""), False)
             done += 1
             await show()
             await asyncio.sleep(0.3)
@@ -2104,25 +2188,29 @@ async def old_scan(ctx, chat, mid, after):
     except Exception:
         log.exception("old after-scan")
 
-def old_hits():
+def old_hits(review=False):
+    """Pages to remove: confirmed shape, or promo text page (handle + little text), or AI-judged promo image page.
+    review=True returns files with a handle on first/last page but real content (never removed)."""
     refs = old_refs()
     out = []
     for hid, title, fid, st, orig in hq("SELECT id, title, file_id, COALESCE(stamped,0), COALESCE(orig_fid,'') FROM h_files WHERE kind='document'"):
-        r = hq("SELECT pages, sf, sl FROM h_sig WHERE fid=?", (src_fid(fid, st, orig),))
+        r = hq("SELECT pages, sf, sl, COALESCE(tf,''), COALESCE(tl,''), COALESCE(af,''), COALESCE(al,'') FROM h_sig WHERE fid=?", (src_fid(fid, st, orig),))
         if not r:
             continue
-        n, a, b = r[0]
-        mf = old_match(a, refs)[1]
-        ml = old_match(b, refs)[1]
+        n, a, b, tf, tl, af, al = r[0]
+        if review:
+            if (tf == "r" or tl == "r") and not (tf == "p" or tl == "p"):
+                out.append((hid, title))
+            continue
+        mf = old_match(a, refs)[1] or tf == "p" or af == "p"
+        ml = n > 1 and (old_match(b, refs)[1] or tl == "p" or al == "p")
         if mf or ml:
             out.append((hid, title, mf, ml, n))
     return out
 
 async def old_dry(ctx, chat):
-    if not old_refs():
-        await ctx.bot.send_message(chat, "أضف نموذجاً واحداً على الأقل أولاً.")
-        return
     hits = old_hits()
+    rv = old_hits(True)
     nf = sum(1 for h in hits if h[2])
     nl = sum(1 for h in hits if h[3])
     total = hq("SELECT COUNT(*) FROM h_sig")[0][0]
@@ -2131,6 +2219,12 @@ async def old_dry(ctx, chat):
         t += f"• {trim(title, 40)} ({'أولى' if mf else ''}{' + ' if mf and ml else ''}{'أخيرة' if ml else ''})\n"
     if len(hits) > 15:
         t += f"… و{len(hits) - 15} أخرى\n"
+    if rv:
+        t += f"\n👀 للمراجعة فقط (فيها @ أو t.me لكن لها محتوى حقيقي، لن تُحذف): {len(rv)}\n"
+        for hid, title in rv[:8]:
+            t += f"• {trim(title, 40)}\n"
+    if not AIST["on"]:
+        t += "\n⚠️ حصة الذكاء امتلأت أثناء الفحص: بعض الصفحات الصورية لم تُفحص بالذكاء. أعد 🔍 فحص لاحقاً لإكمالها.\n"
     t += "\nالخطوة التالية: 🧪 تجربة على ملف ثم ▶️ تطبيق."
     await ctx.bot.send_message(chat, t)
 
@@ -2185,11 +2279,23 @@ async def old_cands(ctx, chat):
             await ctx.bot.send_message(chat, f"الشكل {i + 1}: يتكرر في {len(c['fids'])} ملف (تعذّر عرض الصورة)",
                                        reply_markup=M([[hb("✅ هذا ختم قديم", f"k:o:p:{i}"), hb("❌ لا", f"k:o:n:{i}")]]))
 
-async def old_fix_one(ctx, data, cfg):
+async def old_fix_one(ctx, data, cfg, live_ai=False, cache=None):
     """Returns (cleaned_bytes, final_bytes_or_None, removed_first, removed_last) or None when nothing matches."""
-    n, a, b = await asyncio.to_thread(pdf_sigs, data)
+    o = await asyncio.to_thread(pdf_scan, data)
     refs = old_refs()
-    mf, ml = old_match(a, refs)[1], old_match(b, refs)[1]
+    af = al = ""
+    if live_ai and store.get("old_ai", "1") == "1":
+        for k in ("f", "l"):
+            if o["j" + k] and not old_match(o["s" + k], refs)[1] and not o["t" + k]:
+                v = await ai_promo(o["j" + k])
+                if k == "f":
+                    af = v or ""
+                else:
+                    al = v or ""
+    elif cache:
+        af, al = cache
+    mf = old_match(o["sf"], refs)[1] or o["tf"] == "p" or af == "p"
+    ml = o["n"] > 1 and (old_match(o["sl"], refs)[1] or o["tl"] == "p" or al == "p")
     if not (mf or ml):
         return None
     cleaned = await asyncio.to_thread(clean_pdf, data, mf, ml)
@@ -2223,7 +2329,8 @@ async def old_apply(ctx, chat, mid):
                 cfg = stamp_cfg()
                 async with STAMP_LOCK:
                     data = await asyncio.wait_for(fetch_file(ctx, src_fid(fid, st, orig)), 60)
-                    res = await asyncio.wait_for(old_fix_one(ctx, data, cfg), 240)
+                    cr = hq("SELECT COALESCE(af,''), COALESCE(al,'') FROM h_sig WHERE fid=?", (src_fid(fid, st, orig),))
+                    res = await asyncio.wait_for(old_fix_one(ctx, data, cfg, cache=(cr[0] if cr else None)), 240)
                     del data
                     if not res:
                         fail += 1
@@ -2259,6 +2366,8 @@ async def old_cb(q, ctx, parts):
     if x == "dx":
         store.set("old_refs", "[]")
         OLDST["tested"] = False
+    elif x == "ai":
+        store.set("old_ai", "0" if store.get("old_ai", "1") == "1" else "1")
     elif x == "c":
         if OLDJOB["run"]:
             await q.message.reply_text("⏳ هناك عملية جارية.")
@@ -2267,9 +2376,6 @@ async def old_cb(q, ctx, parts):
         asyncio.create_task(old_scan(ctx, m.chat_id, m.message_id, "c"))
         return
     elif x == "d":
-        if not old_refs():
-            await q.message.reply_text("أضف نموذجاً واحداً على الأقل أولاً.")
-            return
         if OLDJOB["run"]:
             await q.message.reply_text("⏳ هناك عملية جارية.")
             return
@@ -2392,14 +2498,14 @@ async def old_input(update, ctx, act):
             n, a, b = await asyncio.to_thread(pdf_sigs, data)
             da, ma = old_match(a)
             db_, mb = old_match(b)
-            res = await old_fix_one(ctx, data, stamp_cfg()) if (ma or mb) else None
+            res = await old_fix_one(ctx, data, stamp_cfg(), live_ai=True)
         except Exception as e:
             log.exception("old test")
             await msg.reply_text("تعذّرت المعالجة (%s: %s)" % (type(e).__name__, str(e)[:100]))
             return True
         if not res:
             fmt = lambda s, d_: ("ليست صورة فقط" if not s else f"فرق {d_}/256")
-            await msg.reply_text(f"ما لقيت ختماً قديماً يطابق النماذج. الصفحة الأولى: {fmt(a, da)} · الأخيرة: {fmt(b, db_)} (المطابقة تحتاج ≤ {OLD_HAM}). أضف نموذجاً أقرب.")
+            await msg.reply_text(f"ما لقيت صفحة ختم/إعلان للحذف (لا تطابق نموذجاً، ولا صفحة نصية فيها @ أو t.me مع محتوى قليل، ولا حكم الذكاء). الصفحة الأولى: {fmt(a, da)} · الأخيرة: {fmt(b, db_)} (المطابقة تحتاج ≤ {OLD_HAM}). أضف نموذجاً أقرب.")
             return True
         cleaned, final, mf, ml = res
         out = final or cleaned
