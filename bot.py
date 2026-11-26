@@ -45,6 +45,10 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS events(
             ts REAL, user_id INTEGER, kind TEXT)""")
         self.q("""CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_stages(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_subjects(id INTEGER PRIMARY KEY AUTOINCREMENT, stage_id INTEGER, name TEXT)""")
+        self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
+            title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
 
     def q(self, sql, args=(), fetch=None):
         with self.lock:
@@ -258,6 +262,7 @@ def menu_markup():
         [B("📚 أنشئ أسئلة", callback_data="m:questions"), B("🧠 اختبرني", callback_data="m:quiz")],
         [B("📅 جدول دراستي", callback_data="m:schedule"), B("🎤 حوّل صوتاً إلى نص", callback_data="m:voice")],
         [B("📄 أنشئ PDF", callback_data="m:pdf"), B("🧮 حل المسائل", callback_data="m:solve")],
+        [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
     ])
 
@@ -603,7 +608,7 @@ FEAT_NAMES = {
     "join": "انضمام", "chat": "سؤال مباشر", "explain": "شرح صورة", "summary": "ملخص",
     "questions": "أسئلة", "quiz": "اختبار", "schedule": "جدول", "voice": "صوت إلى نص",
     "pdf": "PDF", "solve": "حل المسائل", "simple": "شرح مبسّط", "cards": "بطاقات حفظ",
-    "check": "تصحيح إجابة", "translate": "ترجمة", "formulas": "ورقة قوانين", "timer": "مؤقت",
+    "check": "تصحيح إجابة", "translate": "ترجمة", "formulas": "ورقة قوانين", "timer": "مؤقت", "handout": "تنزيل ملزمة",
 }
 
 # ---------------- message flow ----------------
@@ -674,7 +679,7 @@ def screen(name):
             [B("📊 الإحصائيات", callback_data="a:stats"), B("👥 المستخدمون", callback_data="a:users")],
             [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
             [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
-            [B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("📚 إدارة الملازم", callback_data="a:hm"), B("💾 نسخة احتياطية", callback_data="a:backup")],
         ]
         return "🎛 لوحة الأدمن", M(rows)
     if name == "settings":
@@ -716,6 +721,10 @@ def stats_text():
         t += f"• {FEAT_NAMES.get(k, k)}: {n} / {day.get(k, 0)}\n"
     if not any(k != "join" for k, _ in feats):
         t += "لا استخدام بعد.\n"
+    n_h, n_d = store.q("SELECT COUNT(*), COALESCE(SUM(downloads),0) FROM h_files", fetch=True)[0]
+    t += f"\n📚 الملازم: {n_h} ملزمة | {n_d} تنزيل\n"
+    for title, d in store.q("SELECT title, downloads FROM h_files WHERE downloads>0 ORDER BY downloads DESC LIMIT 5", fetch=True):
+        t += f"  ◦ {title}: {d}\n"
     return t
 
 def uline(r):
@@ -731,8 +740,15 @@ WAIT_PROMPTS = {
     "unban": "✅ أرسل آيدي المستخدم (رقم) لفك حظره.",
 }
 
+async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(f"🆔 آيديك: {u.id}\nاليوزر: @{u.username or '—'}")
+
 async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    log.info("ADMIN_CMD from id=%s username=%s admin=%s", u.id, u.username, is_admin(update))
     if not is_admin(update):
+        await update.message.reply_text(f"🚫 هذا الأمر للأدمن فقط.\nآيديك: {u.id}\n(إن كنت صاحب البوت فأرسل هذا الآيدي لإعداد الصلاحية.)")
         return
     ctx.user_data.pop("admin_wait", None)
     t, kb = screen("main")
@@ -747,6 +763,9 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     act = q.data.split(":", 1)[1]
     ctx.user_data.pop("admin_wait", None)
     s = store
+    if act.startswith("h"):
+        await hadmin_cb(q, ctx, act)
+        return
     if act in ("main", "settings", "sub", "users"):
         t, kb = screen(act)
     elif act == "stats":
@@ -782,6 +801,248 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await q.message.reply_text(t, reply_markup=kb)
 
+
+# ---------------- handouts (ملازم) ----------------
+
+def hq(sql, args=(), fetch=True):
+    return store.q(sql, args, fetch=fetch)
+
+def trim(t, n=40):
+    t = (t or "").strip()
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+async def hshow(q, text, kb):
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb)
+
+HOME = [B("🔙 القائمة الرئيسية", callback_data="m:menu")]
+
+async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    store.upsert_user(q.from_user)
+    if not await gate_ok(update, ctx):
+        return
+    parts = q.data.split(":")
+    act = parts[1]
+    if act == "s":
+        rows = hq("SELECT s.id, s.name, (SELECT COUNT(*) FROM h_files f JOIN h_subjects j ON f.subject_id=j.id WHERE j.stage_id=s.id) FROM h_stages s ORDER BY s.id")
+        kb = [[B(f"🎓 {trim(r[1])} ({r[2]})", callback_data=f"h:t:{r[0]}")] for r in rows[:50]]
+        kb.append(HOME)
+        await hshow(q, "📚 الملازم\nاختر المرحلة الدراسية:" if rows else "📚 الملازم\nلا توجد ملازم بعد، سنضيفها قريباً.", M(kb))
+    elif act == "t":
+        sid = int(parts[2])
+        st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
+        rows = hq("SELECT j.id, j.name, (SELECT COUNT(*) FROM h_files f WHERE f.subject_id=j.id) FROM h_subjects j WHERE j.stage_id=? ORDER BY j.id", (sid,))
+        kb = [[B(f"📖 {trim(r[1])} ({r[2]})", callback_data=f"h:j:{r[0]}")] for r in rows[:50]]
+        kb.append([B("🔙 رجوع", callback_data="h:s")])
+        await hshow(q, f"🎓 {st[0][0] if st else ''}\nاختر المادة:" if rows else "لا توجد مواد في هذه المرحلة بعد.", M(kb))
+    elif act == "j":
+        jid = int(parts[2])
+        j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
+        rows = hq("SELECT id, title FROM h_files WHERE subject_id=? ORDER BY id", (jid,))
+        kb = [[B(f"📄 {trim(r[1], 50)}", callback_data=f"h:d:{r[0]}")] for r in rows[:60]]
+        kb.append([B("🔙 رجوع", callback_data=f"h:t:{j[0][1]}" if j else "h:s")])
+        await hshow(q, f"📖 {j[0][0] if j else ''}\nاختر الملزمة لتصلك:" if rows else "لا توجد ملازم في هذه المادة بعد.", M(kb))
+    elif act == "d":
+        hid = int(parts[2])
+        r = hq("SELECT title, file_id, kind, subject_id FROM h_files WHERE id=?", (hid,))
+        if not r:
+            await q.message.reply_text("هذه الملزمة لم تعد متوفرة.")
+            return
+        title, fid, kind, jid = r[0]
+        try:
+            if kind == "photo":
+                await q.message.reply_photo(fid, caption=f"📄 {title}")
+            else:
+                await q.message.reply_document(fid, caption=f"📄 {title}")
+        except Exception:
+            log.exception("send handout failed")
+            await q.message.reply_text("تعذر إرسال الملف حالياً، حاول لاحقاً.")
+            return
+        store.q("UPDATE h_files SET downloads=downloads+1 WHERE id=?", (hid,))
+        store.event(q.from_user.id, "handout")
+
+# --- admin side ---
+
+def hb(text, cb):
+    return B(text, callback_data=cb)
+
+async def hadmin_cb(q, ctx, act):
+    parts = act.split(":")
+    a = parts[0]
+    back = [hb("🔙 رجوع", "a:main")]
+    if a == "hm":
+        n_s, n_j, n_h = [hq(f"SELECT COUNT(*) FROM {t}")[0][0] for t in ("h_stages", "h_subjects", "h_files")]
+        kb = [[hb("➕ إضافة ملزمة", "a:hb"), hb("📋 استعراض وتعديل", "a:hb")],
+              [hb("🗂 مراحل جديدة", "a:hns")], back]
+        await hshow(q, f"📚 إدارة الملازم\nالمراحل: {n_s} | المواد: {n_j} | الملازم: {n_h}\n\nلإضافة ملزمة: افتح المرحلة ثم المادة ثم اضغط ➕ إضافة ملزمة هنا.", M(kb))
+    elif a == "hns":
+        ctx.user_data["admin_wait"] = "hstage"
+        await hshow(q, "🗂 أرسل اسم المرحلة الجديدة (مثال: السادس الإعدادي العلمي).", M([[hb("🔙 رجوع", "a:hm")]]))
+    elif a == "hb":
+        rows = hq("SELECT id, name FROM h_stages ORDER BY id")
+        kb = [[hb(f"🎓 {trim(r[1])}", f"a:hbs:{r[0]}")] for r in rows[:50]]
+        kb.append([hb("➕ مرحلة جديدة", "a:hns")])
+        kb.append([hb("🔙 رجوع", "a:hm")])
+        await hshow(q, "اختر المرحلة:" if rows else "لا توجد مراحل. أضف مرحلة أولاً.", M(kb))
+    elif a == "hbs":
+        sid = int(parts[1])
+        st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
+        rows = hq("SELECT id, name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,))
+        kb = [[hb(f"📖 {trim(r[1])}", f"a:hbj:{r[0]}")] for r in rows[:50]]
+        kb.append([hb("➕ مادة جديدة", f"a:hnj:{sid}")])
+        kb.append([hb("✏️ تغيير اسم المرحلة", f"a:hrs:{sid}"), hb("🗑 حذف المرحلة", f"a:hds:{sid}")])
+        kb.append([hb("🔙 رجوع", "a:hb")])
+        await hshow(q, f"🎓 {st[0][0] if st else ''}\nالمواد:", M(kb))
+    elif a == "hnj":
+        ctx.user_data["admin_wait"] = f"hsub:{parts[1]}"
+        await hshow(q, "📖 أرسل اسم المادة الجديدة (مثال: الفيزياء).", M([[hb("🔙 رجوع", f"a:hbs:{parts[1]}")]]))
+    elif a == "hrs":
+        ctx.user_data["admin_wait"] = f"hrst:{parts[1]}"
+        await hshow(q, "✏️ أرسل الاسم الجديد للمرحلة.", M([[hb("🔙 رجوع", f"a:hbs:{parts[1]}")]]))
+    elif a == "hds":
+        sid = parts[1]
+        await hshow(q, "⚠️ سيتم حذف المرحلة مع كل موادها وملازمها. متأكد؟",
+                    M([[hb("✅ نعم احذف", f"a:hdsy:{sid}"), hb("❌ إلغاء", f"a:hbs:{sid}")]]))
+    elif a == "hdsy":
+        sid = int(parts[1])
+        hq("DELETE FROM h_files WHERE subject_id IN (SELECT id FROM h_subjects WHERE stage_id=?)", (sid,), False)
+        hq("DELETE FROM h_subjects WHERE stage_id=?", (sid,), False)
+        hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف المرحلة.", M([[hb("🔙 رجوع", "a:hb")]]))
+    elif a == "hbj":
+        jid = int(parts[1])
+        j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
+        if not j:
+            await hshow(q, "المادة غير موجودة.", M([[hb("🔙 رجوع", "a:hb")]]))
+            return
+        rows = hq("SELECT id, title, downloads FROM h_files WHERE subject_id=? ORDER BY id", (jid,))
+        kb = [[hb(f"📄 {trim(r[1], 30)} ({r[2]}⬇)", f"a:hh:{r[0]}")] for r in rows[:60]]
+        kb.append([hb("➕ إضافة ملزمة هنا", f"a:hadd:{jid}")])
+        kb.append([hb("✏️ تغيير اسم المادة", f"a:hrj:{jid}"), hb("🗑 حذف المادة", f"a:hdj:{jid}")])
+        kb.append([hb("🔙 رجوع", f"a:hbs:{j[0][1]}")])
+        await hshow(q, f"📖 {j[0][0]}\nالملازم ({len(rows)}):", M(kb))
+    elif a == "hrj":
+        ctx.user_data["admin_wait"] = f"hrnj:{parts[1]}"
+        await hshow(q, "✏️ أرسل الاسم الجديد للمادة.", M([[hb("🔙 رجوع", f"a:hbj:{parts[1]}")]]))
+    elif a == "hdj":
+        jid = parts[1]
+        await hshow(q, "⚠️ سيتم حذف المادة مع كل ملازمها. متأكد؟",
+                    M([[hb("✅ نعم احذف", f"a:hdjy:{jid}"), hb("❌ إلغاء", f"a:hbj:{jid}")]]))
+    elif a == "hdjy":
+        jid = int(parts[1])
+        j = hq("SELECT stage_id FROM h_subjects WHERE id=?", (jid,))
+        hq("DELETE FROM h_files WHERE subject_id=?", (jid,), False)
+        hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف المادة.", M([[hb("🔙 رجوع", f"a:hbs:{j[0][0]}" if j else "a:hb")]]))
+    elif a == "hadd":
+        ctx.user_data["admin_wait"] = f"htitle:{parts[1]}"
+        await hshow(q, "📄 أرسل عنوان الملزمة (مثال: ملزمة الفصل الأول - أ. أحمد).", M([[hb("🔙 رجوع", f"a:hbj:{parts[1]}")]]))
+    elif a == "hh":
+        hid = int(parts[1])
+        r = hq("SELECT title, downloads, subject_id FROM h_files WHERE id=?", (hid,))
+        if not r:
+            await hshow(q, "غير موجودة.", M([[hb("🔙 رجوع", "a:hb")]]))
+            return
+        kb = [[hb("✏️ تعديل العنوان", f"a:hrt:{hid}"), hb("🔄 استبدال الملف", f"a:hrf:{hid}")],
+              [hb("📥 استلام الملف", f"a:hget:{hid}"), hb("🗑 حذف", f"a:hdh:{hid}")],
+              [hb("🔙 رجوع", f"a:hbj:{r[0][2]}")]]
+        await hshow(q, f"📄 {r[0][0]}\nالتنزيلات: {r[0][1]}", M(kb))
+    elif a == "hget":
+        r = hq("SELECT title, file_id, kind FROM h_files WHERE id=?", (int(parts[1]),))
+        if r:
+            if r[0][2] == "photo":
+                await q.message.reply_photo(r[0][1], caption=r[0][0])
+            else:
+                await q.message.reply_document(r[0][1], caption=r[0][0])
+    elif a == "hrt":
+        ctx.user_data["admin_wait"] = f"hrnt:{parts[1]}"
+        await hshow(q, "✏️ أرسل العنوان الجديد.", M([[hb("🔙 رجوع", f"a:hh:{parts[1]}")]]))
+    elif a == "hrf":
+        ctx.user_data["admin_wait"] = f"hrep:{parts[1]}"
+        await hshow(q, "🔄 أرسل الملف الجديد (PDF أو صورة).", M([[hb("🔙 رجوع", f"a:hh:{parts[1]}")]]))
+    elif a == "hdh":
+        hid = parts[1]
+        await hshow(q, "⚠️ حذف هذه الملزمة؟", M([[hb("✅ نعم احذف", f"a:hdhy:{hid}"), hb("❌ إلغاء", f"a:hh:{hid}")]]))
+    elif a == "hdhy":
+        hid = int(parts[1])
+        r = hq("SELECT subject_id FROM h_files WHERE id=?", (hid,))
+        hq("DELETE FROM h_files WHERE id=?", (hid,), False)
+        backup_soon()
+        await hshow(q, "🗑 تم حذف الملزمة.", M([[hb("🔙 رجوع", f"a:hbj:{r[0][0]}" if r else "a:hb")]]))
+    else:
+        await hshow(q, "📚 إدارة الملازم", M([[hb("🔙 رجوع", "a:hm")]]))
+
+def file_of(msg):
+    if msg.document:
+        return msg.document.file_id, "document"
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo"
+    return None, None
+
+async def hadmin_input(update, ctx, act, msg, text):
+    parts = act.split(":")
+    a = parts[0]
+    def kbk(cb):
+        return M([[hb("🔙 رجوع", cb)]])
+    if a in ("hstage", "hsub", "hrst", "hrnj", "hrnt", "htitle") and not text:
+        ctx.user_data["admin_wait"] = act
+        await msg.reply_text("أرسل نصاً من فضلك.")
+        return True
+    if a == "hstage":
+        hq("INSERT INTO h_stages(name) VALUES(?)", (text,), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة المرحلة: {text}", reply_markup=kbk("a:hb"))
+    elif a == "hsub":
+        hq("INSERT INTO h_subjects(stage_id,name) VALUES(?,?)", (int(parts[1]), text), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة المادة: {text}", reply_markup=kbk(f"a:hbs:{parts[1]}"))
+    elif a == "hrst":
+        hq("UPDATE h_stages SET name=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تغيير الاسم.", reply_markup=kbk(f"a:hbs:{parts[1]}"))
+    elif a == "hrnj":
+        hq("UPDATE h_subjects SET name=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تغيير الاسم.", reply_markup=kbk(f"a:hbj:{parts[1]}"))
+    elif a == "hrnt":
+        hq("UPDATE h_files SET title=? WHERE id=?", (text, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم تعديل العنوان.", reply_markup=kbk(f"a:hh:{parts[1]}"))
+    elif a == "htitle":
+        ctx.user_data["hnew_title"] = text
+        ctx.user_data["admin_wait"] = f"hfile:{parts[1]}"
+        await msg.reply_text(f"📎 العنوان: {text}\nالآن أرسل الملف (PDF أو صورة).", reply_markup=kbk(f"a:hbj:{parts[1]}"))
+    elif a == "hfile":
+        fid, kind = file_of(msg)
+        if not fid:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل الملف نفسه (PDF أو صورة) وليس نصاً.")
+            return True
+        title = ctx.user_data.pop("hnew_title", None) or (msg.document.file_name if msg.document else "ملزمة")
+        hq("INSERT INTO h_files(subject_id,title,file_id,kind,added) VALUES(?,?,?,?,?)",
+           (int(parts[1]), title, fid, kind, time.time()), False)
+        backup_soon()
+        await msg.reply_text(f"✅ تمت إضافة الملزمة: {title}\nلإضافة أخرى اضغط ➕ مجدداً.",
+                             reply_markup=M([[hb("➕ إضافة ملزمة أخرى", f"a:hadd:{parts[1]}")], [hb("📖 المادة", f"a:hbj:{parts[1]}")]]))
+    elif a == "hrep":
+        fid, kind = file_of(msg)
+        if not fid:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل الملف نفسه.")
+            return True
+        hq("UPDATE h_files SET file_id=?, kind=? WHERE id=?", (fid, kind, int(parts[1])), False)
+        backup_soon()
+        await msg.reply_text("✅ تم استبدال الملف.", reply_markup=kbk(f"a:hh:{parts[1]}"))
+    else:
+        return False
+    return True
+
 async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle admin free-text input for pending panel actions. True if consumed."""
     if not is_admin(update):
@@ -793,6 +1054,8 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("admin_wait", None)
     text = (msg.text or msg.caption or "").strip()
     s = store
+    if act.startswith("h"):
+        return await hadmin_input(update, ctx, act, msg, text)
     back = {"welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}
     if act == "bc":
         ids = s.all_user_ids()
@@ -891,9 +1154,11 @@ def build_app():
     app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^a:"))
     app.add_handler(CallbackQueryHandler(verify_cb, pattern=r"^g:verify$"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(handout_cb, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
