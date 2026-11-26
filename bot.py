@@ -172,7 +172,7 @@ def is_admin(update: Update):
 def tick(on):
     return "✅" if on else "❌"
 
-FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash,gemini-3.5-flash-lite").split(",") if m.strip()]
+FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-2.5-flash-lite").split(",") if m.strip()]
 
 async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192):
     body = {
@@ -792,6 +792,29 @@ async def keepalive():
                 log.warning("keepalive failed: %s", e)
             await asyncio.sleep(540)
 
+async def list_models():
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get("https://generativelanguage.googleapis.com/v1beta/models", params={"key": GKEY, "pageSize": 100})
+        if r.status_code != 200:
+            log.warning("LISTMODELS %s: %s", r.status_code, r.text[:200])
+            return
+        names = [m["name"].replace("models/", "") for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        log.info("LISTMODELS ok: %s", ",".join(names))
+        # probe each fallback once so logs show real status codes
+        async with httpx.AsyncClient(timeout=60) as c:
+            for m in [MODEL] + FALLBACKS:
+                try:
+                    pr = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                                      params={"key": GKEY}, json={"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                                      "generationConfig": {"maxOutputTokens": 16}})
+                    log.info("PROBE %s -> %s", m, pr.status_code)
+                except Exception as e:
+                    log.info("PROBE %s -> error %s", m, e)
+    except Exception as e:
+        log.warning("LISTMODELS error %s", e)
+
 async def post_init(app):
     global store, APP
     APP = app
@@ -799,6 +822,7 @@ async def post_init(app):
     store = Store(DB_PATH)
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
+    asyncio.create_task(list_models())
 
 async def on_error(update, ctx):
     log.warning("handler error: %r", ctx.error)
