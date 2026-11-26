@@ -51,7 +51,7 @@ class Store:
         self.q("""CREATE TABLE IF NOT EXISTS h_files(id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER,
             title TEXT, file_id TEXT, kind TEXT, downloads INTEGER DEFAULT 0, added REAL)""")
         self.q("""CREATE TABLE IF NOT EXISTS searches(ts REAL, user_id INTEGER, q TEXT)""")
-        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER", "ftype TEXT"):
+        for col in ("teacher TEXT", "file_uid TEXT", "year TEXT", "quality TEXT", "fname TEXT", "fsize INTEGER", "ftype TEXT", "stamped INTEGER DEFAULT 0", "orig_fid TEXT"):
             try:
                 self.q("ALTER TABLE h_files ADD COLUMN " + col)
             except sqlite3.OperationalError:
@@ -795,7 +795,7 @@ def screen(name):
             [B("📢 إذاعة", callback_data="a:bc"), B("👋 رسالة الترحيب", callback_data="a:welcome")],
             [B("🔐 الاشتراك الإجباري", callback_data="a:sub"), B("⚙️ الإعدادات", callback_data="a:settings")],
             [B("📚 إدارة الملازم", callback_data="a:hm"), B("📝 كليشة الملازم", callback_data="a:cfoot")],
-            [B("💾 نسخة احتياطية", callback_data="a:backup")],
+            [B("🖼 ختم الملازم", callback_data="k:m"), B("💾 نسخة احتياطية", callback_data="a:backup")],
             [B("🏠 قائمة الطالب", callback_data="m:menu")],
         ]
         return "🎛 لوحة الأدمن", M(rows)
@@ -1214,6 +1214,8 @@ async def admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = store
     if act.startswith("ie:"):
         return await ing_edit_input(update, ctx, act)
+    if act.startswith("ks"):
+        return await stamp_input(update, ctx, act)
     if act.startswith("h"):
         return await hadmin_input(update, ctx, act, msg, text)
     back = {"welcome": "main", "gch": "sub", "gmsg": "sub", "maintmsg": "settings"}
@@ -1619,6 +1621,320 @@ def ing_summary(hid):
     kb = M([[hb("✏️ تعديل", f"i:e:{hid}"), hb("🗑 حذف", f"i:d:{hid}")]])
     return text, kb
 
+# ---------------- handout stamp (image on first + last page) ----------------
+
+STAMP_LOCK = asyncio.Lock()
+STAMPJOB = {"run": False, "stop": False}
+POS_LABEL = {"tl": "أعلى اليسار", "tc": "أعلى الوسط", "tr": "أعلى اليمين",
+             "bl": "أسفل اليسار", "bc": "أسفل الوسط", "br": "أسفل اليمين"}
+POS_ORDER = ["tc", "bc", "tr", "tl", "br", "bl"]
+SIZE_LABEL = {"s": "صغير", "m": "متوسط", "l": "كبير"}
+SIZE_ORDER = ["s", "m", "l"]
+OP_ORDER = ["100", "80", "60", "40"]
+
+def stamp_cfg():
+    import base64 as b64
+    s = store
+    f = s.get("stamp_img_f", "")
+    if not f:
+        try:
+            from stamp_default import DEFAULT_B64 as f   # shipped default image (optional file)
+        except Exception:
+            f = ""
+    if not f:
+        return None
+    l = s.get("stamp_img_l", "") or f
+    pf = s.get("stamp_pos_f", "") or "tc"
+    return {"on": s.on("stamp_on"), "img_f": b64.b64decode(f), "img_l": b64.b64decode(l), "has_l": bool(s.get("stamp_img_l", "")),
+            "pos_f": pf, "pos_l": s.get("stamp_pos_l", "") or pf,
+            "size": s.get("stamp_size", "") or "s", "op": int(s.get("stamp_op", "") or 100) / 100.0}
+
+def stamp_rect(pos, size, iw, ih, W, H):
+    frac = {"s": 0.30, "m": 0.50, "l": 0.75}[size]
+    cap = {"s": 0.07, "m": 0.11, "l": 0.16}[size]
+    w = W * frac
+    h = w * ih / iw
+    if h > H * cap:
+        h = H * cap
+        w = h * iw / ih
+    m = min(W, H) * 0.02
+    x = {"l": m, "c": (W - w) / 2, "r": W - w - m}[pos[1]]
+    y = {"t": H - h - m, "b": m}[pos[0]]
+    return x, y, w, h
+
+def prep_stamp_image(data):
+    from PIL import Image
+    im = Image.open(io.BytesIO(data))
+    im = im.convert("RGBA")
+    im.thumbnail((900, 900))
+    out = io.BytesIO()
+    im.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+def stamp_pdf(data, cfg):
+    """Return (stamped_bytes, pages_stamped). First and last page; one page once."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    if n == 0:
+        raise ValueError("empty pdf")
+    w = PdfWriter()
+    w.append(r)
+    del r
+    targets = [(0, "f")] if n == 1 else [(0, "f"), (n - 1, "l")]
+    imgs = {"f": Image.open(io.BytesIO(cfg["img_f"])).convert("RGBA"), "l": Image.open(io.BytesIO(cfg["img_l"])).convert("RGBA")}
+    done = 0
+    for idx, slot in targets:
+        page = w.pages[idx]
+        if (page.get("/Rotate", 0) or 0) % 360:
+            continue
+        mb = page.mediabox
+        W, H = float(mb.width), float(mb.height)
+        im = imgs[slot]
+        x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(W, H))
+        c.setFillAlpha(cfg["op"])
+        c.drawImage(ImageReader(im), x, y, bw, bh, mask="auto")
+        c.save()
+        ov = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+        page.merge_transformed_page(ov, Transformation().translate(float(mb.left), float(mb.bottom)))
+        done += 1
+    if not done:
+        raise ValueError("no page could be stamped")
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue(), done
+
+def stamp_preview_png(cfg):
+    from PIL import Image, ImageDraw
+    W, H = 420, 594
+    pages = []
+    for slot, label in (("f", "الصفحة الأولى"), ("l", "الصفحة الأخيرة")):
+        pg = Image.new("RGBA", (W, H), "white")
+        d = ImageDraw.Draw(pg)
+        d.rectangle([0, 0, W - 1, H - 1], outline=(180, 180, 180, 255))
+        for i in range(24):
+            yy = 70 + i * 20
+            d.rectangle([40, yy, W - 40 - (i % 5) * 25, yy + 7], fill=(205, 205, 205, 255))
+        d.rectangle([40, 36, 220, 52], fill=(120, 120, 120, 255))
+        im = Image.open(io.BytesIO(cfg["img_" + slot])).convert("RGBA")
+        x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
+        st = im.resize((max(1, int(bw)), max(1, int(bh))))
+        a = st.getchannel("A").point(lambda v: int(v * cfg["op"]))
+        st.putalpha(a)
+        pg.alpha_composite(st, (int(x), int(H - y - bh)))
+        pages.append(pg)
+    sheet = Image.new("RGB", (W * 2 + 30, H + 20), (235, 235, 235))
+    sheet.paste(pages[0].convert("RGB"), (10, 10))
+    sheet.paste(pages[1].convert("RGB"), (W + 20, 10))
+    out = io.BytesIO()
+    sheet.save(out, "PNG")
+    return out.getvalue()
+
+async def apply_stamp(ctx, rec):
+    """Stamp rec['fid'] (first + last page) and swap in the stamped file_id. Never raises. Returns a short note."""
+    cfg = stamp_cfg()
+    if not cfg or not cfg["on"]:
+        return ""
+    rec["stamped"] = 0
+    size = int(rec.get("fsize", 0) or 0)
+    if size > MAX_DL:
+        rec["stamp_fail"] = "كبير"
+        return "⚠️ أُضيفت بدون ختم (الملف أكبر من 20MB).\n"
+    try:
+        async with STAMP_LOCK:
+            data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
+            out, n = await asyncio.wait_for(asyncio.to_thread(stamp_pdf, data, cfg), 90)
+            del data
+            m = await ctx.bot.send_document(ADMIN_BACKUP_CHAT, InputFile(io.BytesIO(out), filename=(rec.get("fname") or "handout.pdf")),
+                                            disable_notification=True)
+            del out
+        rec["orig_fid"] = rec["fid"]
+        rec["fid"] = m.document.file_id
+        rec["stamped"] = 1
+        return "🖼 تم ختم الصفحة الأولى والأخيرة.\n"
+    except Exception as e:
+        log.warning("stamp failed: %r", e)
+        rec["stamp_fail"] = "خطأ"
+        return "⚠️ أُضيفت بدون ختم (تعذّر الختم).\n"
+
+def stamp_menu():
+    cfg = stamp_cfg()
+    s = store
+    if not cfg:
+        t = "🖼 ختم الملازم\n\nلا توجد صورة بعد. أرسل صورة الختم (يُفضّل PNG شفاف كملف)."
+        return t, M([[hb("🖼 رفع صورة الختم", "k:i:f")], [hb("🔙 رجوع", "a:main")]])
+    n_st = hq("SELECT COUNT(*) FROM h_files WHERE stamped=1")[0][0]
+    n_all = hq("SELECT COUNT(*) FROM h_files WHERE kind='document'")[0][0]
+    t = (f"🖼 ختم الملازم: {'🟢 مفعّل' if cfg['on'] else '🔴 معطّل'}\n"
+         f"يُختم أول صفحة وآخر صفحة من كل ملزمة PDF جديدة (صفحة واحدة تُختم مرة).\n"
+         f"📊 المختومة: {n_st} من {n_all}")
+    kb = M([
+        [hb("🔴 إيقاف" if cfg["on"] else "🟢 تفعيل", "k:t")],
+        [hb("🖼 صورة الأولى", "k:i:f"), hb("🖼 صورة الأخيرة" + ("" if cfg["has_l"] else " (نفسها)"), "k:i:l")],
+        [hb("📍 الأولى: " + POS_LABEL[cfg["pos_f"]], "k:p:f"), hb("📍 الأخيرة: " + POS_LABEL[cfg["pos_l"]], "k:p:l")],
+        [hb("📏 الحجم: " + SIZE_LABEL[cfg["size"]], "k:z"), hb(f"🌫 الشفافية: {int(cfg['op'] * 100)}%", "k:o")],
+        [hb("👁 معاينة", "k:v"), hb("🧪 جرّب على ملف PDF", "k:x")],
+        [hb("♻️ ختم الملازم الموجودة", "k:r"), hb("🧹 إزالة الختم من الموجودة", "k:u")],
+        [hb("🔙 رجوع", "a:main")]])
+    return t, kb
+
+async def stamp_job(ctx, chat, mid):
+    if STAMPJOB["run"]:
+        return
+    STAMPJOB.update(run=True, stop=False)
+    rows = hq("SELECT id, file_id, fsize FROM h_files WHERE kind='document' AND COALESCE(stamped,0)=0 ORDER BY id")
+    total, done, ok, fail, last = len(rows), 0, 0, 0, 0.0
+    async def show(final=False):
+        nonlocal last
+        if not final and time.time() - last < 3:
+            return
+        try:
+            kb = None if final else M([[hb("⛔ إيقاف", "k:s")]])
+            await ctx.bot.edit_message_text(f"{'✅ انتهى' if final else '⏳'} ختم الملازم {done}/{total} · 🖼 {ok} · ⚠️ {fail} تعذّر", chat_id=chat, message_id=mid, reply_markup=kb)
+            last = time.time()
+        except Exception:
+            pass
+    try:
+        for hid, fid, fsize in rows:
+            if STAMPJOB["stop"]:
+                break
+            rec = {"fid": fid, "fsize": fsize or 0, "fname": "handout.pdf"}
+            fn = hq("SELECT fname FROM h_files WHERE id=?", (hid,))[0][0]
+            rec["fname"] = fn or "handout.pdf"
+            await apply_stamp(ctx, rec)
+            if rec.get("stamped"):
+                hq("UPDATE h_files SET file_id=?, orig_fid=?, stamped=1 WHERE id=?", (rec["fid"], rec["orig_fid"], hid), False)
+                ok += 1
+            else:
+                fail += 1
+            done += 1
+            await show()
+            await asyncio.sleep(0.5)
+    finally:
+        STAMPJOB["run"] = False
+        backup_soon()
+        await show(final=True)
+
+async def stamp_cb(update, ctx):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("للأدمن فقط", show_alert=True)
+        return
+    parts = q.data.split(":")
+    a = parts[1]
+    await q.answer()
+    s = store
+    cfg = stamp_cfg()
+    if a == "m":
+        pass
+    elif a == "i":
+        ctx.user_data["admin_wait"] = "ksi:" + parts[2]
+        extra = "\\nأرسل - لإلغاء صورة الأخيرة والعودة لنفس صورة الأولى." if parts[2] == "l" else ""
+        await q.message.reply_text("🖼 أرسل صورة الختم الآن (PNG شفاف كملف أفضل، أو صورة عادية)." + extra.replace("\\n", "\n"))
+        return
+    elif a == "t":
+        if cfg:
+            s.set("stamp_on", "0" if cfg["on"] else "1")
+    elif a == "p" and cfg:
+        k = "stamp_pos_" + parts[2]
+        cur = cfg["pos_" + parts[2]]
+        s.set(k, POS_ORDER[(POS_ORDER.index(cur) + 1) % len(POS_ORDER)])
+    elif a == "z" and cfg:
+        s.set("stamp_size", SIZE_ORDER[(SIZE_ORDER.index(cfg["size"]) + 1) % 3])
+    elif a == "o" and cfg:
+        cur = str(int(cfg["op"] * 100))
+        s.set("stamp_op", OP_ORDER[(OP_ORDER.index(cur) + 1) % 4] if cur in OP_ORDER else "100")
+    elif a == "v" and cfg:
+        png = await asyncio.to_thread(stamp_preview_png, cfg)
+        await q.message.reply_photo(png, caption="👁 معاينة (نموذج صفحة): الأولى يميناً... الأخيرة يساراً حسب العرض. الصفحة الحقيقية تأخذ نفس الموضع نسبياً.")
+        return
+    elif a == "x":
+        ctx.user_data["admin_wait"] = "ksx"
+        await q.message.reply_text("🧪 أرسل ملف PDF لأختمه لك كتجربة (لا يُحفظ في المكتبة).")
+        return
+    elif a == "r":
+        if STAMPJOB["run"]:
+            await q.message.reply_text("⏳ هناك عملية ختم جارية.")
+            return
+        if not cfg:
+            return
+        m = await q.message.reply_text("⏳ جاري بدء ختم الملازم الموجودة...", reply_markup=M([[hb("⛔ إيقاف", "k:s")]]))
+        asyncio.create_task(stamp_job(ctx, m.chat_id, m.message_id))
+        return
+    elif a == "s":
+        STAMPJOB["stop"] = True
+        return
+    elif a == "u":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE stamped=1 AND COALESCE(orig_fid,'')<>''")[0][0]
+        hq("UPDATE h_files SET file_id=orig_fid, stamped=0 WHERE stamped=1 AND COALESCE(orig_fid,'')<>''", (), False)
+        backup_soon()
+        await q.message.reply_text(f"🧹 أُعيدت النسخ الأصلية لـ {n} ملزمة. (الملازم الجديدة تُختم ما دام الختم مفعّلاً، عطّله من هنا.)")
+    t, kb = stamp_menu()
+    try:
+        await q.message.edit_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
+
+async def stamp_input(update, ctx, act):
+    msg = update.message
+    if act.startswith("ksi:"):
+        slot = act.split(":")[1]
+        if slot == "l" and (msg.text or "").strip() == "-":
+            store.set("stamp_img_l", "")
+            await msg.reply_text("✅ ستستعمل الصفحة الأخيرة نفس صورة الأولى.")
+            t, kb = stamp_menu(); await msg.reply_text(t, reply_markup=kb)
+            return True
+        fid = None
+        if msg.photo:
+            fid = msg.photo[-1].file_id
+        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+            fid = msg.document.file_id
+        if not fid:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل صورة (PNG أو JPG) وليس نصاً.")
+            return True
+        try:
+            data = await fetch_file(ctx, fid)
+            png = await asyncio.to_thread(prep_stamp_image, data)
+        except Exception:
+            log.exception("stamp image")
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("تعذّرت قراءة الصورة، أرسل صورة PNG أو JPG أخرى.")
+            return True
+        import base64 as b64
+        store.set("stamp_img_" + slot, b64.b64encode(png).decode())
+        if slot == "f" and not store.get("stamp_on", ""):
+            store.set("stamp_on", "1")
+        await msg.reply_text("✅ تم حفظ الصورة.")
+        t, kb = stamp_menu(); await msg.reply_text(t, reply_markup=kb)
+        return True
+    if act == "ksx":
+        d = msg.document
+        cfg = stamp_cfg()
+        if not d or not cfg:
+            ctx.user_data["admin_wait"] = act
+            await msg.reply_text("أرسل ملف PDF.")
+            return True
+        if (d.file_size or 0) > MAX_DL:
+            await msg.reply_text("الملف أكبر من 20MB.")
+            return True
+        try:
+            data = await fetch_file(ctx, d.file_id)
+            out, n = await asyncio.to_thread(stamp_pdf, data, cfg)
+            await msg.reply_document(InputFile(io.BytesIO(out), filename="stamped_" + (d.file_name or "test.pdf")), caption=f"🧪 نتيجة التجربة ({n} صفحة مختومة)")
+        except Exception as e:
+            log.warning("stamp test: %r", e)
+            await msg.reply_text("❌ تعذّر ختم هذا الملف.")
+        return True
+    return False
+
 async def ing_finalize(status, rec, ctx):
     """Save the record if complete, otherwise ask for the missing field (reply to this message)."""
     for need, label in (("stage", "المرحلة (مثال: السادس الإعدادي العلمي)"), ("subject", "المادة (مثال: الفيزياء)")):
@@ -1646,9 +1962,10 @@ async def ing_finalize(status, rec, ctx):
         cleanup_empty(jid)
         await status.edit_text(f"⏭ تم تخطيها، موجودة مسبقاً: {dup[1]}")
         return
-    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+    rec["note"] = rec.get("note", "") + await apply_stamp(ctx, rec)
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
-        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title)), False)
+        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title), int(rec.get("stamped", 0)), rec.get("orig_fid", "")), False)
     backup_soon()
     hid = hq("SELECT id FROM h_files ORDER BY id DESC LIMIT 1")[0][0]
     PENDING.pop(status.message_id, None)
@@ -1709,6 +2026,10 @@ BULK = {}   # chat id -> state of the current/last bulk run (memory only)
 def bulk_text(st, final=False):
     t = (f"✅ اكتملت المعالجة ({st['done']}/{st['total']})" if final else f"⏳ {st['done']}/{st['total']}")
     t += f" · ✅ {st['ok']} · ⏭ {st['dup']} مكرر"
+    if st["stamped"]:
+        t += f" · 🖼 {st['stamped']} مختومة"
+    if st["nostamp"]:
+        t += f" · ⚠️ {st['nostamp']} بدون ختم"
     if st["review"]:
         t += f" · ❓ {len(st['review'])} تحتاج مراجعة"
     if st["fail"]:
@@ -1739,7 +2060,7 @@ async def bulk_edit(ctx, chat, st, final=False):
         elif "not modified" not in str(e).lower():
             log.warning("bulk edit: %r", e)
 
-async def bulk_save(rec):
+async def bulk_save(rec, ctx):
     sid = get_stage(rec["stage"])
     jid = get_subject(sid, rec["subject"])
     title = compose_title(rec["title"] or stem(rec["name"]), rec["teacher"])
@@ -1756,9 +2077,10 @@ async def bulk_save(rec):
     if dup:
         cleanup_empty(jid)
         return "dup"
-    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+    await apply_stamp(ctx, rec)
+    hq("INSERT INTO h_files(subject_id,title,file_id,kind,added,teacher,file_uid,year,quality,fname,fsize,ftype,stamped,orig_fid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (jid, title, rec["fid"], "document", time.time(), rec["teacher"], rec["uid"], rec.get("year", ""), rec.get("quality", ""),
-        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title)), False)
+        rec.get("fname", ""), int(rec.get("fsize", 0) or 0), rec.get("type", "") or classify_type(title), int(rec.get("stamped", 0)), rec.get("orig_fid", "")), False)
     backup_soon()
     return "ok"
 
@@ -1783,8 +2105,13 @@ async def bulk_one(item, st, ctx):
     if not rec["stage"] or not rec["subject"]:
         st["review"].append(rec)
         return
-    r = await bulk_save(rec)
+    r = await bulk_save(rec, ctx)
     st["ok" if r == "ok" else "dup"] += 1
+    if r == "ok":
+        if rec.get("stamped"):
+            st["stamped"] += 1
+        elif rec.get("stamp_fail"):
+            st["nostamp"] += 1
 
 async def bulk_worker(chat, st, ctx):
     try:
@@ -1816,7 +2143,7 @@ async def bulk_add(update, ctx):
             "cap": (msg.caption or "").strip()[:1500]}
     st = BULK.get(chat)
     if not st or st["closed"]:
-        st = {"q": deque(), "total": 0, "done": 0, "ok": 0, "dup": 0, "fail": 0, "review": [], "msg": None,
+        st = {"q": deque(), "total": 0, "done": 0, "ok": 0, "dup": 0, "fail": 0, "stamped": 0, "nostamp": 0, "review": [], "msg": None,
               "last": 0.0, "next": 0.0, "closed": False, "init": asyncio.Lock(), "running": False}
         BULK[chat] = st
     st["total"] += 1
@@ -2018,6 +2345,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(handout_cb, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(ing_cb, pattern=r"^i:"))
+    app.add_handler(CallbackQueryHandler(stamp_cb, pattern=r"^k:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, drop_pin_notice))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
