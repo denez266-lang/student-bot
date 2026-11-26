@@ -122,39 +122,66 @@ store = None
 
 # ---------------- backup (pinned doc in admin chat) ----------------
 
-_backup_due = 0.0
+_backup_dirty = False
+_last_backup = 0.0
+BACKUP_EVERY = 48 * 3600
 APP = None
 
 def backup_soon():
-    global _backup_due
-    _backup_due = time.time() + 90
+    # يعلّم أن هناك تغييرات؛ النسخ الفعلي يتم كل 48 ساعة فقط
+    global _backup_dirty
+    _backup_dirty = True
 
 async def backup_loop():
     while True:
-        await asyncio.sleep(30)
-        if _backup_due and time.time() >= _backup_due:
-            await do_backup()
+        await asyncio.sleep(600)
+        try:
+            if _backup_dirty and time.time() - _last_backup >= BACKUP_EVERY:
+                await do_backup()
+        except Exception:
+            log.exception("backup tick")
 
 async def do_backup():
-    global _backup_due
-    _backup_due = 0.0
+    global _backup_dirty, _last_backup
     if not APP or not ADMIN_BACKUP_CHAT or not store:
         return
     try:
+        _backup_dirty = False
         store.db.commit()
+        old_id = None
+        try:
+            ch = await APP.bot.get_chat(ADMIN_BACKUP_CHAT)
+            if ch.pinned_message and ch.pinned_message.document:
+                old_id = ch.pinned_message.message_id
+        except Exception:
+            pass
         with open(DB_PATH, "rb") as f:
             msg = await APP.bot.send_document(
                 ADMIN_BACKUP_CHAT, InputFile(f, filename="student.db"),
-                caption="💾 نسخة احتياطية من بيانات البوت - لا تحذف هذه الرسالة المثبتة.")
+                caption="💾 نسخة احتياطية من بيانات البوت", disable_notification=True)
+        _last_backup = time.time()
         try:
-            await APP.bot.unpin_all_chat_messages(ADMIN_BACKUP_CHAT)
             await APP.bot.pin_chat_message(ADMIN_BACKUP_CHAT, msg.message_id, disable_notification=True)
         except Exception:
             log.exception("pin failed")
+        if old_id and old_id != msg.message_id:
+            try:
+                await APP.bot.delete_message(ADMIN_BACKUP_CHAT, old_id)
+            except Exception:
+                pass
     except Exception:
+        _backup_dirty = True
         log.exception("backup failed")
 
+async def drop_pin_notice(update, ctx):
+    # يحذف رسالة "تم تثبيت رسالة" الخدمية
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        pass
+
 async def restore_backup(app):
+    global _last_backup
     if not ADMIN_BACKUP_CHAT:
         return False
     try:
@@ -166,6 +193,10 @@ async def restore_backup(app):
             await f.download_to_memory(out=out)
             with open(DB_PATH, "wb") as fh:
                 fh.write(out.getvalue())
+            try:
+                _last_backup = pin.date.timestamp()
+            except Exception:
+                _last_backup = time.time()
             log.info("backup restored, %d bytes", len(out.getvalue()))
             return True
     except Exception:
@@ -881,7 +912,7 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = back_admin("users")
     elif act == "backup":
         await do_backup()
-        t, kb = "💾 تم إرسال نسخة احتياطية وتثبيتها في محادثتك. تُحمَّل تلقائياً عند إعادة تشغيل الخدمة.", back_admin()
+        t, kb = "💾 تم تحديث النسخة الاحتياطية (رسالة واحدة مثبتة بصمت). النسخ التلقائي كل 48 ساعة، وتُحمَّل عند إعادة تشغيل الخدمة.", back_admin()
     else:
         t, kb = screen("main")
     try:
@@ -1824,6 +1855,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(handout_cb, pattern=r"^h:"))
     app.add_handler(CallbackQueryHandler(ing_cb, pattern=r"^i:"))
     app.add_handler(CallbackQueryHandler(quiz_cb, pattern=r"^q"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, drop_pin_notice))
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
     return app
