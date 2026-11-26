@@ -1753,6 +1753,9 @@ async def apply_stamp(ctx, rec):
         return ""
     rec["stamped"] = 0
     size = int(rec.get("fsize", 0) or 0)
+    if size > MAX_DL and (rec.get("fname") or "") in W.get("pre", {}):
+        rec["stamped"] = 1
+        return "🖼 ختم الصفحة الأولى والأخيرة (ملف كبير، عبر الحساب الثاني).\n"
     if size > MAX_DL:
         rec["stamp_fail"] = "كبير"
         return "⚠️ أُضيفت بدون ختم (الملف أكبر من 20MB).\n"
@@ -2324,10 +2327,64 @@ async def watch_on_new(ev):
     except Exception:
         log.exception("watch handler")
 
+BIG_STAMP_MAX = 60 * 1024 * 1024   # RAM guard on Render free (512MB)
+W["pre"] = {}   # fname -> ts : files the watcher already stamped and uploaded (bot must not re-stamp)
+
+async def watch_big(cid, mid):
+    """File > 20MB: download via MTProto, stamp, upload to the bot chat as the watcher account.
+    Returns True if handled (uploaded stamped), False to fall back to a plain forward."""
+    cfg = stamp_cfg()
+    if not cfg or not cfg["on"]:
+        return False
+    c = W["client"]
+    m = await c.get_messages(cid, ids=mid)
+    d = getattr(m, "document", None)
+    if not m or not d or d.size <= MAX_DL or d.size > BIG_STAMP_MAX:
+        return False
+    fname = "handout.pdf"
+    for a in d.attributes or []:
+        if getattr(a, "file_name", None):
+            fname = a.file_name
+    try:
+        async with STAMP_LOCK:
+            data = await asyncio.wait_for(c.download_media(m, file=bytes), 600)
+            out, n = await asyncio.wait_for(asyncio.to_thread(stamp_pdf, data, cfg), 240)
+            del data
+            bio = io.BytesIO(out)
+            bio.name = fname
+            W["pre"][fname] = time.time()
+            await c.send_file(W["bot_ent"], bio, caption=(m.message or ""), force_document=True,
+                              attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
+                              mime_type="application/pdf")
+            del out, bio
+        log.info("big stamped %s", fname)
+        return True
+    except Exception:
+        log.exception("big stamp failed")
+        W["pre"].pop(fname, None)
+        return False
+
 async def watch_forward(cid, ids):
     """Forward posts to the bot chat; returns False when forwards are blocked for this channel."""
     from telethon import errors
     c = W["client"]
+    try:
+        cfg = stamp_cfg()
+        if cfg and cfg["on"]:
+            msgs = await c.get_messages(cid, ids=list(ids))
+            rest = []
+            for m in msgs:
+                d = getattr(m, "document", None)
+                if m and d and MAX_DL < d.size <= BIG_STAMP_MAX:
+                    if not await watch_big(cid, m.id):
+                        rest.append(m.id)
+                else:
+                    rest.append(m.id if m else None)
+            ids = [i for i in rest if i]
+            if not ids:
+                return True
+    except Exception:
+        log.exception("big split")
     for attempt in range(3):
         try:
             await c.forward_messages(W["bot_ent"], ids, from_peer=cid)
