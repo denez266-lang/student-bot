@@ -2120,6 +2120,7 @@ def old_menu():
         [hb(("✅ " if store.get("old_ai", "1") == "1" else "⬜ ") + "فحص صفحات الصور بالذكاء (@ / إعلان)", "k:o:ai")],
         [hb("🧪 تجربة على ملف", "k:o:t"), hb("▶️ تطبيق على الكل", "k:o:g")],
         [hb("↩️ تراجع عن الاستبدال", "k:o:u")],
+        [hb("🔬 تشخيص علامة مائية (ملف)", "k:o:w")],
         [hb("🔙 رجوع", "k:m")]])
     return t, kb
 
@@ -2456,6 +2457,10 @@ async def old_cb(q, ctx, parts):
         m = await q.message.reply_text("⏳ جاري فحص الملازم...", reply_markup=M([[hb("⛔ إيقاف", "k:o:s")]]))
         asyncio.create_task(old_scan(ctx, m.chat_id, m.message_id, "d"))
         return
+    elif x == "w":
+        ctx.user_data["admin_wait"] = "kso:w"
+        await q.message.reply_text("🔬 أرسل ملف PDF واحد فيه العلامة المائية القديمة، وأرجع لك تقرير عن كيف العلامة مركّبة (نص، صورة، طبقة).")
+        return
     elif x == "t":
         ctx.user_data["admin_wait"] = "kso:t"
         await q.message.reply_text("🧪 أرسل ملف PDF فيه ختم قديم لأعالجه لك وأرجعه (لا يُحفظ في المكتبة).")
@@ -2516,9 +2521,60 @@ async def old_cb(q, ctx, parts):
     except Exception:
         await q.message.reply_text(t, reply_markup=kb)
 
+def wm_diag(data):
+    from pypdf import PdfReader
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    keys = ("malz", "iraqmlzm", "ملازم", "شبكة", "telegram", "t.me")
+    lines = [f"📄 الصفحات: {n}"]
+    for idx in sorted({0, min(1, n - 1), n - 1}):
+        pg = r.pages[idx]
+        try:
+            txt = pg.extract_text() or ""
+        except Exception:
+            txt = ""
+        hits = [k for k in keys if k.lower() in txt.lower()]
+        try:
+            imgs = [f"{im.image.width}x{im.image.height}" for im in list(pg.images)][:4]
+        except Exception:
+            imgs = ["?"]
+        try:
+            nan = len(pg.get("/Annots", []) or [])
+        except Exception:
+            nan = 0
+        try:
+            cont = pg.get_contents().get_data() if pg.get_contents() else b""
+        except Exception:
+            cont = b""
+        try:
+            xo = list((pg["/Resources"].get("/XObject") or {}).keys())[:6]
+        except Exception:
+            xo = []
+        mb = pg.mediabox
+        lines.append(f"\nصفحة {idx + 1}: {float(mb.width):.0f}x{float(mb.height):.0f} · نص {len(txt.strip())} حرف · كلمات العلامة بالنص: {hits or 'لا'} · صور: {imgs or 'لا'} · تعليقات: {nan} · كائنات: {xo or 'لا'} · محتوى {len(cont)}B")
+        if txt.strip():
+            lines.append("نص: " + txt.strip().replace("\n", " | ")[:160])
+    return "\n".join(lines)
+
 async def old_input(update, ctx, act):
     msg = update.message
     chat = msg.chat_id
+    if act == "kso:w":
+        d = msg.document
+        if not d or (d.file_size or 0) > MAX_DL:
+            await msg.reply_text("أرسل ملف PDF (حتى 20MB).")
+            return True
+        try:
+            data = await fetch_file(ctx, d.file_id)
+            rep = await asyncio.to_thread(wm_diag, data)
+        except Exception as e:
+            log.exception("wm diag")
+            await msg.reply_text("تعذّر الفحص (%s: %s)" % (type(e).__name__, str(e)[:100]))
+            return True
+        await msg.reply_text("🔬 تشخيص العلامة المائية\n" + rep)
+        return True
     if act == "kso:a":
         d = msg.document
         cap = (msg.caption or "").strip()
