@@ -6,3 +6,4 @@ python-bidi
 pypdf
 telethon
 cryptography
+segno
