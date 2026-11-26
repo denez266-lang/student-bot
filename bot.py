@@ -2551,20 +2551,42 @@ def login_form(step, st=None):
             svg = bio.getvalue().decode()
         except Exception:
             svg = "<p>تعذّر رسم QR</p>"
-        return ("<meta http-equiv=refresh content=3><h2>🔳 دخول عبر QR</h2><p><small>من الحساب الثاني في تيليگرام: الإعدادات ← الأجهزة ← ربط جهاز سطح مكتب، ثم امسح الرمز. (الصفحة تتحدّث تلقائياً)</small></p>"
+        return ("<meta http-equiv=refresh content=2><h2>🔳 دخول عبر QR</h2><p><small>من الحساب الثاني في تيليگرام: الإعدادات ← الأجهزة ← ربط جهاز سطح مكتب، ثم امسح الرمز. (الصفحة تتحدّث تلقائياً)</small></p>"
                 "<div style='background:#fff;text-align:center;direction:ltr'>" + svg + "</div>"
+                "<p><small>رابط هذه الشاشة لفتحها على جهاز ثاني: <span style='direction:ltr;display:block;word-break:break-all'>" + html_esc(st.get("qurl", "")) + "</span></small></p>"
                 "<p><a href='" + html_esc(st["qr"].url) + "'>أو اضغط هنا إن كنت تفتح الصفحة من نفس الهاتف</a></p>")
     if step == "pw":
         return ("<h2>🔐 كلمة سر التحقق بخطوتين</h2><form method=post><input type=hidden name=a value=pw>"
                 "<input name=pw type=password required autocomplete=off><button>تأكيد</button></form>")
     return "<h2>✅ تم ربط الحساب</h2><p>يمكنك إغلاق هذه الصفحة والعودة إلى البوت.</p>"
 
+async def qr_begin(st):
+    st["qr"] = await st["client"].qr_login()
+    st["step"] = "qr"
+    if not st.get("qtok"):
+        st["qtok"] = _secrets.token_urlsafe(24)
+        LOGINS[st["qtok"]] = st
+        st["exp"] = max(st["exp"], time.time() + 900)
+        base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        st["qurl"] = f"{base}/tglqr/{st['qtok']}"
+        try:
+            await watch_notify("🔳 رابط QR (افتحه على جهاز ثاني مثل الكمبيوتر، ثم امسحه من تيليگرام الحساب الثاني: الإعدادات ← الأجهزة ← ربط جهاز). يعمل 15 دقيقة، لا تشاركه:\n" + st["qurl"], None)
+        except Exception:
+            log.exception("qr notify")
+
+def login_drop(st):
+    for k in [k for k, v in LOGINS.items() if v is st]:
+        LOGINS.pop(k, None)
+
 class TgLoginH(tornado.web.RequestHandler):
+    qr_only = False
     def prepare(self):
         self.set_header("Cache-Control", "no-store")
         self.set_header("Referrer-Policy", "no-referrer")
         self.set_header("X-Robots-Tag", "noindex")
         self.st = LOGINS.get(self.path_args[0] if self.path_args else "")
+        if self.qr_only and self.st and self.st.get("qtok") != self.path_args[0]:
+            self.st = None
         if not self.st or self.st["exp"] < time.time():
             LOGINS.pop(self.path_args[0] if self.path_args else "", None)
             self.set_status(404)
@@ -2572,31 +2594,40 @@ class TgLoginH(tornado.web.RequestHandler):
 
     async def get(self, token):
         st = self.st
+        if st["step"] == "qr" and not self.qr_only and st.get("qtok"):
+            self.finish(login_page(login_form("qr", st)))
+            return
         if st["step"] == "qr":
+            qr = st["qr"]
+            lock = st.setdefault("lock", asyncio.Lock())
+            res = "wait"
             try:
-                qr = st["qr"]
-                try:
-                    await qr.wait(timeout=2.5)
-                except asyncio.TimeoutError:
-                    if qr.expires and qr.expires.timestamp() < time.time() + 3:
-                        await qr.recreate()
-                    self.finish(login_page(login_form("qr", st)))
+                async with lock:
+                    try:
+                        await qr.wait(timeout=1.2)
+                        res = "ok"
+                    except asyncio.TimeoutError:
+                        if qr.expires and qr.expires.timestamp() < time.time() + 10:
+                            await qr.recreate()
+                    except Exception as e:
+                        if type(e).__name__ == "SessionPasswordNeededError":
+                            res = "pw"
+                        else:
+                            raise
+                if res == "pw":
+                    st["step"] = "pw"
+                    self.finish(login_page(login_form("pw", st)))
                     return
-                except Exception as e:
-                    if type(e).__name__ == "SessionPasswordNeededError":
-                        st["step"] = "pw"
-                        self.finish(login_page(login_form("pw", st)))
-                        return
-                    raise
-                if await st["client"].is_user_authorized():
+                if res == "ok" and await st["client"].is_user_authorized():
                     await login_done(st)
-                    LOGINS.pop(token, None)
+                    login_drop(st)
                     self.finish(login_page(login_form("done")))
                     return
             except Exception as e:
                 log.warning("qr step failed: %r", e)
                 st["step"] = "start"
-                self.finish(login_page(login_form("start"), "فشل الدخول عبر QR: " + type(e).__name__))
+                msg = "فشل الدخول عبر QR: " + type(e).__name__
+                self.finish(login_page("<h2>تعذّر الدخول</h2><p>ارجع لصفحة الإدخال وابدأ من جديد.</p>" if self.qr_only else login_form("start"), msg))
                 return
         self.finish(login_page(login_form(st["step"], st)))
 
@@ -2619,8 +2650,7 @@ class TgLoginH(tornado.web.RequestHandler):
                 await c.connect()
                 st.update(client=c, api_id=api_id, api_hash=api_hash, phone=phone)
                 if self.get_body_argument("m", "code") == "qr":
-                    st["qr"] = await c.qr_login()
-                    st["step"] = "qr"
+                    await qr_begin(st)
                     self.finish(login_page(login_form("qr", st)))
                     return
                 if not phone:
@@ -2641,8 +2671,7 @@ class TgLoginH(tornado.web.RequestHandler):
                 self.finish(login_page(login_form("code", st)))
                 return
             elif a == "qr" and st["step"] == "code":
-                st["qr"] = await st["client"].qr_login()
-                st["step"] = "qr"
+                await qr_begin(st)
                 self.finish(login_page(login_form("qr", st)))
                 return
             elif a == "code" and st["step"] == "code":
@@ -2660,7 +2689,7 @@ class TgLoginH(tornado.web.RequestHandler):
             if st["step"] != "code" or await st["client"].is_user_authorized():
                 if await st["client"].is_user_authorized():
                     await login_done(st)
-                    LOGINS.pop(token, None)
+                    login_drop(st)
                     self.finish(login_page(login_form("done")))
                     return
             self.finish(login_page(login_form(st["step"], st)))
@@ -2673,6 +2702,12 @@ class TgLoginH(tornado.web.RequestHandler):
                    "PhoneCodeHashEmptyError": "ابدأ من جديد", "SendCodeUnavailableError": "لا توجد طريقة إرسال أخرى متاحة، جرّب QR",
                    "PhonePasswordFloodError": "محاولات كثيرة، انتظر ساعات أو جرّب QR"}.get(type(e).__name__, "تعذّرت العملية، تحقق من البيانات")
             self.finish(login_page(login_form(st["step"]), msg))
+
+class TgQrH(TgLoginH):
+    qr_only = True
+    async def post(self, token):
+        self.set_status(405)
+        self.finish()
 
 async def login_done(st):
     c = st["client"]
@@ -3171,7 +3206,7 @@ async def serve(url):
     await app.bot.set_webhook(url=f"{url.rstrip('/')}/{TOKEN}", allowed_updates=Update.ALL_TYPES)
     web = tornado.web.Application([
         (rf"/{re.escape(TOKEN)}", WebhookH),
-        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH), (r"/tglogin/([A-Za-z0-9_\-]+)", TgLoginH),
+        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH), (r"/tglogin/([A-Za-z0-9_\-]+)", TgLoginH), (r"/tglqr/([A-Za-z0-9_\-]+)", TgQrH),
         (r"/api/(\w+)", ApiH),
     ], tgapp=app)
     web.listen(int(os.environ.get("PORT", "10000")), address="0.0.0.0")
