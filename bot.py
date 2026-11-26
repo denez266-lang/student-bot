@@ -152,7 +152,7 @@ async def restore_backup(app):
         if pin and pin.document and pin.document.file_name == "student.db":
             f = await app.bot.get_file(pin.document.file_id)
             out = io.BytesIO()
-            await f.download_as_memory(out=out)
+            await f.download_to_memory(out=out)
             with open(DB_PATH, "wb") as fh:
                 fh.write(out.getvalue())
             log.info("backup restored, %d bytes", len(out.getvalue()))
@@ -473,7 +473,7 @@ def build_pdf(title, body_text):
 async def fetch_file(ctx, file_id):
     f = await ctx.bot.get_file(file_id)
     out = io.BytesIO()
-    await f.download_as_memory(out=out)
+    await f.download_to_memory(out=out)
     return out.getvalue()
 
 async def content_parts(update, ctx):
