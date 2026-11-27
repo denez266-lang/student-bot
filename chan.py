@@ -237,7 +237,19 @@ async def infer_stage(text, page1, subj, title):
     return G['canon_stage'](str(d.get("stage") or "")), conf
 
 
-async def fix_stages(vision=False):
+async def _gtry(fn, errs):
+    """Gemini is often busy: retry with pauses; count a final failure."""
+    for k in range(3):
+        try:
+            return await fn()
+        except Exception as e:
+            if k == 2:
+                errs.append(repr(e)[:60])
+                raise
+            await asyncio.sleep(30)
+
+
+async def fix_stages(vision=False):  # returns the number of Gemini failures
     """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
     moved, renamed, unresolved = [], 0, 0
     try:   # 1) canonical stage names; merge stages that are the same stage
@@ -263,17 +275,20 @@ async def fix_stages(vision=False):
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
     if vision:
         rows = sorted(rows, key=lambda r: 0 if not G["canon_stage"](r[6]) else 1)
-    unres_ids, review, inferred = [], [], []
+    unres_ids, review, inferred, errs = [], [], [], []
     for hid, fname, title, fid, fsize, subj, stage, jid in rows:
+        if len(errs) >= 30:
+            break
         try:
             new = G["stage_from_text"](fname)
             if not new and fid and 0 < fsize <= G["MAX_DL"] and fname.lower().endswith(".pdf"):
                 data = await asyncio.wait_for(G["fetch_file"](NS_CTX(), fid), 40)
                 text, _ = await asyncio.wait_for(asyncio.to_thread(G["pdf_head"], data), 25)
                 new = G["stage_from_text"](text)
+                p1 = await asyncio.to_thread(page1_pdf, data) if vision else None
                 if vision and (not new or (new.endswith("العلمي") and ("الخامس" in new or "السادس" in new))):
                     try:
-                        vs, _vj = await vision_stage(await asyncio.to_thread(page1_pdf, data))
+                        vs, _vj = await _gtry(lambda: vision_stage(p1), errs)
                         if vs and (not new or vs.startswith(new)):
                             new = vs
                     except Exception as e:
@@ -281,7 +296,7 @@ async def fix_stages(vision=False):
                     await asyncio.sleep(2)
                     if not new:   # not written anywhere: infer from content, only high confidence is applied
                         try:
-                            ist, conf = await infer_stage(text, await asyncio.to_thread(page1_pdf, data), subj, title)
+                            ist, conf = await _gtry(lambda: infer_stage(text, p1, subj, title), errs)
                             cur0 = G["canon_stage"](stage)
                             if ist and conf >= 85:
                                 new = ist
@@ -318,8 +333,10 @@ async def fix_stages(vision=False):
         except Exception:
             log().exception("stage_review save")
     G["backup_soon"]()
+    log().info("stage pass gemini errors: %d", len(errs))
     log().info("stage inference: %d applied (conf>=85) sample %s | %d low-confidence to review", len(inferred), inferred[:5], len(review))
     log().info("stage fix: %d entries moved, %d stages renamed/merged, %d pdfs read, %d still without a valid stage: %s | moved: %s", len(moved), renamed, checked, unresolved, unres_ids[:20], moved[:40])
+    return len(errs)
 
 
 class NS_CTX:
@@ -591,7 +608,12 @@ def start(g):
             await fix_stages()
             G["store"].set("stage_v", "1")
         if G["store"].get("stage_v2", "") != "1":
-            await fix_stages(vision=True)
-            G["store"].set("stage_v2", "1")
+            for _try in range(3):
+                ne = await fix_stages(vision=True)
+                if ne < 15:
+                    G["store"].set("stage_v2", "1")
+                    break
+                log().warning("stage pass had %d Gemini failures, retrying in 20 min", ne)
+                await asyncio.sleep(1200)
     asyncio.create_task(_fix())
     asyncio.create_task(loop())
