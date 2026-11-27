@@ -209,7 +209,7 @@ async def vision_stage(page1):
               "والآخر المادة (مثل مادة الحاسوب). إن كُتب بجانب المرحلة فرع (الأحيائي أو التطبيقي) فاكتبه مع المرحلة (مثل: الخامس العلمي الأحيائي). اقرأهما كما هما مكتوبان فقط. لا تخمّن ولا تأخذ المرحلة من اسم وحدة أو فصل؛ إن لم يظهرا بوضوح اترك الحقل فارغاً. "
               'الصيغة: {"stage":"","subject":""}')
     parts = [{"text": prompt}, {"inline_data": {"mime_type": "application/pdf", "data": __import__('base64').b64encode(page1).decode()}}]
-    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=True), 45)
+    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=False), 150)
     m = re.search(r"\{.*\}", out, re.S)
     d = __import__('json').loads(m.group(0)) if m else {}
     subj = str(d.get("subject") or "").strip()
@@ -227,7 +227,7 @@ async def infer_stage(text, page1, subj, title):
         parts.append({"text": "نص أول صفحات الملف:\n" + text[:3000]})
     if page1:
         parts.append({"inline_data": {"mime_type": "application/pdf", "data": __import__('base64').b64encode(page1).decode()}})
-    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=True), 45)
+    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=False), 150)
     m = re.search(r"\{.*\}", out, re.S)
     d = __import__('json').loads(m.group(0)) if m else {}
     try:
@@ -312,7 +312,7 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
                             new = vs
                     except Exception as e:
                         log().warning("vision %s: %r", hid, e)
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(6)
                     if not new:   # not written anywhere: infer from content, only high confidence is applied
                         try:
                             ist, conf = await _gtry(lambda: infer_stage(text, p1, subj, title), errs)
@@ -326,7 +326,7 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
                                 review.append((hid, title[:40], stage, "", conf))
                         except Exception as e:
                             log().warning("infer %s: %r", hid, e)
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(6)
                 del data
                 checked += 1
                 await asyncio.sleep(0.5)
