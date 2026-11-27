@@ -1602,6 +1602,9 @@ async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
             vs, vj = await _fast().vision_stage(page1)
             if vs:
                 res["stage"] = vs
+            else:   # not written anywhere: infer from the content; low confidence -> no stage (review list)
+                ist, conf = await _fast().infer_stage(text, page1, res["subject"], res["title"])
+                res["stage"] = ist if ist and conf >= 85 else ""
             if vj and not res["subject"]:
                 res["subject"] = vj
         except Exception as e:
