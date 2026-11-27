@@ -567,6 +567,8 @@ async def groq_call(parts, system, temperature=0.5, max_tokens=4000):
             return None
         if any(("inline_data" in p) or str(p.get("text", "")).startswith("محتوى ملف PDF") for p in parts):
             return None
+        if sum(len(str(p.get("text", ""))) for p in parts) > 24000:
+            return None
         now = time.time()
         live = [k for k in ks if _GR["rest"].get(k, 0) < now]
         if not live:
@@ -712,6 +714,186 @@ async def solve_more(q, ctx):
     await q.message.reply_text("هل تريد شيئاً آخر؟", reply_markup=G["M"]([[G["B"]("📖 شرح أكثر", callback_data="m:xs")], [G["B"]("🏠 القائمة", callback_data="m:menu")]]))
 
 
+NB_SYS = ("أنت مساعد دراسة يعمل مثل NotebookLM: تجيب فقط من المصادر التي يقدّمها الطالب ولا تضف معلومات من خارجها. "
+          "اكتب بالعربية بلغة بسيطة وواضحة. اذكر رقم المصدر بين قوسين مثل [مصدر 1] عند الاقتباس. "
+          "إذا لم تجد الجواب في المصادر فقل بوضوح: هذا غير موجود في المصادر المرفوعة. "
+          "الرسالة تظهر كنص عادي في تيليجرام: لا تستخدم LaTeX ولا markdown (لا ** ولا ##)، واكتب الرموز بيونيكود مقروء.")
+NB_ASKS = {
+    "sum": "لخّص المصادر في نقاط مرتبة بعناوين قصيرة، ثم اختم بأهم 5 أفكار يجب حفظها.",
+    "q": "أنشئ 8 أسئلة متنوعة (اختيار من متعدد، صح أو خطأ، وسؤال قصير) من المصادر فقط، وضع الجواب الصحيح بعد كل سؤال.",
+    "map": "ارسم خريطة ذهنية نصية للمصادر: الموضوع الرئيسي في السطر الأول، ثم الفروع بشرطة (-) وفروع الفروع بمسافتين وشرطة، بدون إطالة.",
+}
+_NB = {}
+NB_MAX = 150000
+
+
+def nb_add(uid, name, text):
+    text = (text or "").strip()
+    if len(text) < 30:
+        raise RuntimeError("لم أجد نصاً كافياً في هذا المصدر.")
+    if uid not in _NB and len(_NB) > 300:
+        _NB.pop(next(iter(_NB)))
+    s = _NB.setdefault(uid, [])
+    if len(s) >= 6:
+        raise RuntimeError("الحد 6 مصادر. امسح المصادر ثم أضف من جديد 🗑")
+    text = text[:60000]
+    if sum(len(x[1]) for x in s) + len(text) > NB_MAX:
+        raise RuntimeError("حجم المصادر كبير. امسح بعضها وأضف الأهم 🗑")
+    s.append((str(name)[:60] or "مصدر", text))
+    return len(s), len(text)
+
+
+async def nb_extract(data, mime, fname):
+    parts, err = G["blob_parts"](data, mime, fname)
+    if err:
+        raise RuntimeError(err)
+    img = [p for p in parts if "inline_data" in p]
+    if img and (mime or "").startswith("image/"):
+        t = await asyncio.wait_for(G["gemini"](img + [{"text": "انسخ كل النص الموجود في الصورة بدقة كما هو، وإن كانت صورة درس أو مخطط فاشرح محتواها بإيجاز. بدون مقدمات."}],
+                                    system="أنت قارئ دقيق للنصوص من الصور.", temperature=0, max_tokens=4000, fast=True), 60)
+        return t
+    if any("inline_data" in p for p in parts):
+        raise RuntimeError("هذا النوع غير مدعوم كمصدر. أرسل PDF أو نصاً أو صورة.")
+    return "\n".join(str(p.get("text", "")).replace("محتوى ملف PDF التالي:\n", "") for p in parts)
+
+
+async def nb_run(uid, kind, text=""):
+    LANE.set("chat")
+    s = _NB.get(uid) or []
+    if not s:
+        raise RuntimeError("📓 أضف مصدراً أولاً: أرسل ملف PDF أو صورة أو الصق نصاً طويلاً.")
+    now = time.time()
+    hr = [t for t in _CH["hour"].get(uid, []) if now - t < 3600]
+    if len(hr) >= 40 and uid not in G.get("ADMIN_IDS", ()):
+        raise RuntimeError("وصلت للحد المسموح (40 طلباً في الساعة)، حاول لاحقاً 🌿")
+    if kind == "ask":
+        text = (text or "").strip()[:1500]
+        if not text:
+            raise RuntimeError("اكتب سؤالك 🙂")
+        ask = "سؤال الطالب:\n" + text + "\n\nأجب من المصادر فقط."
+    else:
+        ask = NB_ASKS[kind]
+    src = "\n\n".join("[مصدر %d: %s]\n%s" % (i + 1, n, t) for i, (n, t) in enumerate(s))
+    parts = [{"text": "المصادر:\n" + src + "\n\n" + ask}]
+    if _CH["sem"] is None:
+        _CH["sem"] = asyncio.Semaphore(3)
+    lk = _CH.setdefault("lk", {}).setdefault(uid, asyncio.Lock())
+    try:
+        async with lk:
+            async with _CH["sem"]:
+                out = await ds_call(parts, NB_SYS, 0.2, 4000, "deepseek-v4-pro" if ds_key() else "deepseek-flash")
+                if not out:
+                    out = await G["gemini"](parts, system=NB_SYS, temperature=0.2, max_tokens=4096)
+    except RuntimeError:
+        raise RuntimeError("😅 الذكاء الاصطناعي مشغول الآن، أعد المحاولة بعد دقيقة (مصادرك محفوظة).")
+    hr.append(now)
+    _CH["hour"][uid] = hr
+    return re.sub(r"[*#`]+", "", out).strip()
+
+
+def nb_kb():
+    B = G["B"]
+    return G["M"]([[B("📝 ملخص", callback_data="m:nbs"), B("❓ أسئلة", callback_data="m:nbq")],
+                   [B("🗺 خريطة ذهنية", callback_data="m:nbm"), B("🗑 مسح المصادر", callback_data="m:nbc")],
+                   [B("🛑 إنهاء", callback_data="m:menu")]])
+
+
+def nb_list(uid):
+    s = _NB.get(uid) or []
+    return "\n".join("%d) %s" % (i + 1, n) for i, (n, _) in enumerate(s)) or "لا توجد مصادر بعد."
+
+
+async def nb_cb(q, ctx):
+    uid = q.from_user.id
+    d = q.data
+    if d == "m:nb":
+        ctx.user_data.clear()
+        ctx.user_data["mode"] = "nb"
+        await q.message.reply_text("📓 دفتر المصادر (مثل NotebookLM)\nأرسل مصادرك: ملف PDF أو صورة أو الصق نصاً طويلاً (حتى 6 مصادر). "
+                                   "بعدها اسألني وأجيبك من مصادرك فقط، أو اضغط ملخص أو أسئلة أو خريطة ذهنية.\n\nمصادرك الآن:\n" + nb_list(uid), reply_markup=nb_kb())
+        return
+    ctx.user_data["mode"] = "nb"
+    if d == "m:nbc":
+        _NB.pop(uid, None)
+        await q.message.reply_text("🗑 تم مسح كل المصادر. أرسل مصادر جديدة.", reply_markup=nb_kb())
+        return
+    kind = {"m:nbs": "sum", "m:nbq": "q", "m:nbm": "map"}.get(d)
+    if not kind:
+        return
+    stop = asyncio.Event()
+    asyncio.create_task(_typing(q.message, stop))
+    try:
+        out = await nb_run(uid, kind)
+    except RuntimeError as e:
+        await q.message.reply_text(str(e), reply_markup=nb_kb())
+        return
+    finally:
+        stop.set()
+    G["store"].event(uid, "notebook")
+    await G["send_long"](q.message, out)
+    await q.message.reply_text("اسأل سؤالاً عن مصادرك أو اختر 👇", reply_markup=nb_kb())
+
+
+async def nb_msg(update, ctx):
+    msg = update.message
+    uid = msg.from_user.id
+    try:
+        if msg.document or msg.photo:
+            d = msg.document
+            if d and (d.file_size or 0) > G["MAX_DL"]:
+                raise RuntimeError("الملف كبير جداً (الحد 20 ميغابايت).")
+            await msg.chat.send_action("typing")
+            data = await G["fetch_file"](ctx, d.file_id if d else msg.photo[-1].file_id)
+            name = (d.file_name if d else "") or "صورة"
+            text = await nb_extract(data, (d.mime_type if d else "image/jpeg") or "", name)
+            n, ln = nb_add(uid, name, text)
+            await msg.reply_text("✅ أضفت المصدر %d: %s (%d حرف).\nأرسل سؤالك أو أضف مصدراً آخر، أو اختر من الأزرار." % (n, name, ln), reply_markup=nb_kb())
+            return
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.reply_text("أرسل ملف PDF أو صورة أو نصاً 🙂", reply_markup=nb_kb())
+            return
+        if len(text) >= 600:
+            n, ln = nb_add(uid, "نص ملصق %d" % (len(_NB.get(uid) or []) + 1), text)
+            await msg.reply_text("✅ أضفت النص كمصدر %d (%d حرف)." % (n, ln), reply_markup=nb_kb())
+            return
+        stop = asyncio.Event()
+        asyncio.create_task(_typing(msg, stop))
+        try:
+            out = await nb_run(uid, "ask", text)
+        finally:
+            stop.set()
+        G["store"].event(uid, "notebook")
+        await msg.reply_text(out[:3900], reply_markup=nb_kb())
+    except RuntimeError as e:
+        await msg.reply_text(str(e), reply_markup=nb_kb())
+    except Exception:
+        log().exception("nb failed")
+        await msg.reply_text("تعذرت قراءة المصدر، جرّب ملفاً آخر أو الصق النص.", reply_markup=nb_kb())
+
+
+async def nb_api(uid, body):
+    act = body.get("act", "state")
+    if act == "clear":
+        _NB.pop(uid, None)
+    elif act == "add":
+        f = body.get("file")
+        if f:
+            import base64 as b64
+            data = b64.b64decode(f.get("b64", ""))
+            if len(data) > 15 * 1024 * 1024:
+                raise RuntimeError("الملف كبير (الحد 15 ميغابايت)")
+            text = await nb_extract(data, f.get("mime", ""), f.get("name", ""))
+            nb_add(uid, f.get("name") or "ملف", text)
+        else:
+            nb_add(uid, "نص ملصق %d" % (len(_NB.get(uid) or []) + 1), str(body.get("text", ""))[:60000])
+    elif act in ("ask", "sum", "q", "map"):
+        out = await nb_run(uid, act, str(body.get("text", "")))
+        G["store"].event(uid, "notebook")
+        return {"text": out, "srcs": [n for n, _ in _NB.get(uid, [])]}
+    return {"srcs": [n for n, _ in _NB.get(uid, [])]}
+
+
 ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("gem", "✨ جيميني")]
 
 
@@ -835,6 +1017,8 @@ async def chat_eng(q, ctx):
 
 
 async def chat_cb(q, ctx):
+    if q.data.startswith("m:nb"):
+        return await nb_cb(q, ctx)
     ctx.user_data.clear()
     ctx.user_data["mode"] = "aichat"
     ctx.user_data["chat"] = []
@@ -842,6 +1026,8 @@ async def chat_cb(q, ctx):
 
 
 async def chat_msg(update, ctx):
+    if ctx.user_data.get("mode") == "nb":
+        return await nb_msg(update, ctx)
     msg = update.message
     text = (msg.text or "").strip()
     if not text:
@@ -864,6 +1050,8 @@ async def chat_msg(update, ctx):
 
 
 async def chat_api(uid, body):
+    if body.get("op") == "nb":
+        return await nb_api(uid, body)
     if body.get("op") == "xs":
         return {"text": await explain_more("", str(body.get("solution", ""))[:6000])}
     if body.get("op") == "eng":
