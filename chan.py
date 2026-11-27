@@ -270,6 +270,83 @@ async def _gtry(fn, errs, streak):
             await asyncio.sleep(30)
 
 
+CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراقيين. أجب دائماً بالعربية وباختصار (من سطرين إلى خمسة أسطر)، بلغة بسيطة وواضحة، "
+            "بدون عناوين ولا رموز تنسيق مثل ** أو #. للأسئلة الدراسية اشرح خطوة بخطوة وباختصار. إذا لم تفهم الرسالة اطلب التوضيح بجملة قصيرة.")
+_CH = {"sem": None, "last": {}, "hour": {}}
+
+
+async def chat_answer(uid, hist, text):
+    """General AI chat (bot + Mini App). hist = [(role, text)], role u/a. Few calls per user, max 3 at once, so the archive/stage pass keep their quota."""
+    text = (text or "").strip()[:1500]
+    if not text:
+        raise RuntimeError("اكتب رسالتك نصاً من فضلك 🙂")
+    now = time.time()
+    if now - _CH["last"].get(uid, 0) < 3:
+        raise RuntimeError("⏳ انتظر ثواني قليلة بين الرسائل.")
+    hr = [t for t in _CH["hour"].get(uid, []) if now - t < 3600]
+    if len(hr) >= 40:
+        raise RuntimeError("وصلت للحد المسموح (40 رسالة في الساعة) لحماية الخدمة، حاول لاحقاً 🌿")
+    _CH["last"][uid] = now
+    if _CH["sem"] is None:
+        _CH["sem"] = asyncio.Semaphore(3)
+    lines = [("الطالب: " if r == "u" else "المساعد: ") + t[:600] for r, t in hist[-8:]]
+    prompt = ("سجل المحادثة السابق:\n" + "\n".join(lines) + "\n\n" if lines else "") + "رسالة الطالب الجديدة:\n" + text + "\n\nأجب عن الرسالة الجديدة فقط."
+    try:
+        async with _CH["sem"]:
+            out = await G["gemini"]([{"text": prompt}], system=CHAT_SYS, temperature=0.7, max_tokens=2000, fast=True)
+    except RuntimeError as e:
+        m = str(e)
+        if "مزدحمة" in m or "تعذر الاتصال" in m:
+            raise RuntimeError("😅 الذكاء الاصطناعي مشغول الآن بسبب كثرة الاستخدام. انتظر دقيقة ثم أعد إرسال رسالتك، ومحادثتك محفوظة.")
+        raise
+    hr.append(now)
+    _CH["hour"][uid] = hr
+    return re.sub(r"[*#`]+", "", out).strip()[:3900]
+
+
+def _end_kb():
+    return G["M"]([[G["B"]("🛑 إنهاء الدردشة", callback_data="m:menu")]])
+
+
+async def chat_cb(q, ctx):
+    ctx.user_data.clear()
+    ctx.user_data["mode"] = "aichat"
+    ctx.user_data["chat"] = []
+    await q.message.reply_text("💬 الدردشة مع الذكاء الاصطناعي\nاكتب أي سؤال أو موضوع وسأجيبك باختصار، وأتذكر ما قلناه خلال هذه المحادثة.\nعند الانتهاء اضغط الزر أدناه 👇", reply_markup=_end_kb())
+
+
+async def chat_msg(update, ctx):
+    msg = update.message
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.reply_text("أرسل رسالتك نصاً من فضلك 🙂 (الصور والملفات لها أدواتها في القائمة).", reply_markup=_end_kb())
+        return
+    hist = ctx.user_data.setdefault("chat", [])
+    try:
+        await msg.chat.send_action("typing")
+    except Exception:
+        pass
+    try:
+        out = await chat_answer(msg.from_user.id, hist, text)
+    except RuntimeError as e:
+        await msg.reply_text(str(e), reply_markup=_end_kb())
+        return
+    hist += [("u", text[:1500]), ("a", out)]
+    del hist[:-16]
+    G["store"].event(msg.from_user.id, "chat")
+    await msg.reply_text(out, reply_markup=_end_kb())
+
+
+async def chat_api(uid, body):
+    h = []
+    for m in (body.get("history") or [])[-12:]:
+        if isinstance(m, dict) and m.get("r") in ("u", "a"):
+            h.append((m["r"], str(m.get("t", ""))))
+    out = await chat_answer(uid, h, str(body.get("text", "")))
+    G["store"].event(uid, "chat")
+    return out
+
+
 def merge_stage_names():
     """Canonical stage names; stages that are the same stage (spelling variants) are merged, subjects and files moved."""
     renamed = 0
