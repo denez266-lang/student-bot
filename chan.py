@@ -700,19 +700,19 @@ async def chat_answer(uid, hist, text):
     if not text:
         raise RuntimeError("اكتب رسالتك نصاً من فضلك 🙂")
     now = time.time()
-    if now - _CH["last"].get(uid, 0) < 3:
-        raise RuntimeError("⏳ انتظر ثواني قليلة بين الرسائل.")
+    adm = uid in G.get("ADMIN_IDS", ())
     hr = [t for t in _CH["hour"].get(uid, []) if now - t < 3600]
-    if len(hr) >= 40:
+    if len(hr) >= 40 and not adm:
         raise RuntimeError("وصلت للحد المسموح (40 رسالة في الساعة) لحماية الخدمة، حاول لاحقاً 🌿")
-    _CH["last"][uid] = now
     if _CH["sem"] is None:
         _CH["sem"] = asyncio.Semaphore(3)
     lines = [("الطالب: " if r == "u" else "المساعد: ") + t[:600] for r, t in hist[-8:]]
     prompt = ("سجل المحادثة السابق:\n" + "\n".join(lines) + "\n\n" if lines else "") + "رسالة الطالب الجديدة:\n" + text + "\n\nأجب عن الرسالة الجديدة فقط."
     try:
-        async with _CH["sem"]:
-            out = await chat_call(prompt, get_eng(uid))
+        lk = _CH.setdefault("lk", {}).setdefault(uid, asyncio.Lock())
+        async with lk:  # one message per user at a time, extra messages wait their turn
+            async with _CH["sem"]:
+                out = await chat_call(prompt, get_eng(uid))
     except RuntimeError as e:
         m = str(e)
         if "مزدحمة" in m or "تعذر الاتصال" in m:
