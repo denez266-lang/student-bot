@@ -359,37 +359,55 @@ class KeysH(tornado.web.RequestHandler):
         raw = self.get_body_argument("keys", "")
         cand = []
         for k in re.split(r"[\s,;]+", raw):
+            k = k.strip("\"'`<>()[]{}").split("=", 1)[-1].strip("\"'`")
             if k and k not in cand:
                 cand.append(k)
         have = all_keys()
         extra = _extra_keys()
-        added, bad, dup = 0, [], 0
-        async with httpx.AsyncClient(timeout=15) as c:
+        added, bad, dup, why = 0, [], 0, []
+        async with httpx.AsyncClient(timeout=20) as c:
             for k in cand[:20]:
                 if k in have:
                     dup += 1
                     continue
-                ok = False
-                if re.fullmatch(r"AIza[0-9A-Za-z_\-]{30,50}", k):
-                    try:
-                        r = await c.get("https://generativelanguage.googleapis.com/v1beta/models", params={"key": k, "pageSize": 1})
-                        ok = r.status_code == 200
-                    except Exception:
-                        ok = False
-                if ok:
+                tail = "…" + k[-4:]
+                if not re.fullmatch(r"[A-Za-z0-9_\-.~]{20,200}", k):
+                    bad.append(f"{tail}: صيغة المفتاح غير صحيحة (أحرف غريبة أو مقطوع)")
+                    why.append("format")
+                    continue
+                try:
+                    r = await c.get("https://generativelanguage.googleapis.com/v1beta/models", params={"pageSize": 1}, headers={"x-goog-api-key": k})
+                except Exception:
+                    bad.append(f"{tail}: تعذر الاتصال بخدمة Google، أعد المحاولة")
+                    why.append("network")
+                    continue
+                msg = ""
+                try:
+                    msg = str(r.json().get("error", {}).get("message", "")).lower()
+                except Exception:
+                    pass
+                if r.status_code in (200, 429):   # 429 = the key is real, only rate limited
                     extra.append(k)
                     added += 1
+                    why.append("ok" if r.status_code == 200 else "ok-429")
+                elif r.status_code == 400 and ("not valid" in msg or "invalid" in msg):
+                    bad.append(f"{tail}: مفتاح غير صالح (تأكد من نسخه كاملاً من aistudio.google.com/apikey)")
+                    why.append("invalid")
+                elif r.status_code == 403:
+                    bad.append(f"{tail}: المفتاح مرفوض (الواجهة Generative Language API غير مفعّلة لمشروعه أو المفتاح مقيّد)")
+                    why.append("403")
                 else:
-                    bad.append("…" + k[-4:])
+                    bad.append(f"{tail}: ردّ غير متوقع من Google (رمز {r.status_code})")
+                    why.append(str(r.status_code))
         if added:
             G["store"].set("gkeys", G["_fernet"]().encrypt(json.dumps(extra).encode()).decode())
             try:
                 G["backup_soon"]()
             except Exception:
                 pass
-        log().info("gkeys page: added %d, rejected %d, duplicate %d", added, len(bad), dup)
+        log().info("gkeys page: added %d, rejected %d, duplicate %d, reasons %s", added, len(bad), dup, ",".join(why))
         msg = f"<p><b>✅ أُضيف {added} مفتاح.</b></p>" + (f"<p>مكرر/موجود: {dup}</p>" if dup else "") + \
-              (f"<div class=e>غير صالح أو لم يُقبل: {html_join(bad)}</div>" if bad else "")
+              (f"<div class=e>لم يُقبل:<br>{'<br>'.join(html_join([b]) for b in bad)}</div>" if bad else "")
         self.finish(self._form(msg))
 
 
