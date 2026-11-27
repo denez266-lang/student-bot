@@ -163,12 +163,16 @@ async def loop():
                     if ok:
                         st.set("chan_test", "done")
                     if ok and not st.get("chan_mode", ""):
-                        st.set("chan_mode", "new")
+                        st.set("chan_mode", "all")
                         st.set("chan_since", str(time.time()))
+            u = unstamped()
+            if len(u) != CH.get("nu"):
+                CH["nu"] = len(u)
+                log().warning("CHAN not posted (unstamped): %d %s", len(u), " | ".join(x[3] or x[1] for x in u[:15]))
             mode = st.get("chan_mode", "")
             if mode in ("new", "all") and await resolve():
                 since = float(st.get("chan_since", "0") or 0)
-                sql = ("SELECT id, title, file_id, COALESCE(ch_msg,0) FROM h_files WHERE kind='document' AND COALESCE(file_id,'')<>'' AND "
+                sql = ("SELECT id, title, file_id, COALESCE(ch_msg,0) FROM h_files WHERE kind='document' AND COALESCE(file_id,'')<>'' AND COALESCE(stamped,0)=1 AND "
                        "((ch_msg IS NULL AND (? = 'all' OR added>=?)) OR (ch_msg IS NOT NULL AND COALESCE(ch_fid,'')<>file_id)) ORDER BY id LIMIT 3")
                 rows = hq(sql, (mode, since))
                 for hid, title, fid, old in rows:
@@ -182,6 +186,21 @@ async def loop():
         await asyncio.sleep(20)
 
 
+def unstamped():
+    return hq("SELECT id, title, COALESCE(fsize,0), COALESCE(fname,'') FROM h_files WHERE kind='document' AND COALESCE(stamped,0)=0 ORDER BY id")
+
+
+async def chanlist(update, ctx):
+    if not G["is_admin"](update):
+        return
+    u = unstamped()
+    n = hq("SELECT COUNT(*) FROM h_files WHERE ch_msg>0")[0][0]
+    t = f"📢 منشورة في القناة: {n}\n⚠️ لم تُختم ولم تُنشر: {len(u)}"
+    for i, ti, fs, fn in u[:40]:
+        t += f"\n#{i} {ti[:50]} ({fs >> 20} MB)"
+    await update.message.reply_text(t[:4000])
+
+
 def start(g):
     G.update(g)
     for col in ("ch_msg INTEGER", "ch_fid TEXT"):
@@ -189,4 +208,6 @@ def start(g):
             hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
         except Exception:
             pass
+    from telegram.ext import CommandHandler
+    G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
     asyncio.create_task(loop())
