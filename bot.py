@@ -2841,7 +2841,7 @@ def wm_probe(data):
     for i in sorted({0, min(1, n - 1), n - 1}):
         try:
             p = wm_best_image(r.pages[i])
-            if p is not None and wm_find(p.convert("RGB")):
+            if p is not None and wm_find(wm_norm(p.convert("RGB"))):
                 return True
         except Exception:
             continue
@@ -2873,7 +2873,7 @@ def wm_process(data, texts, previews=0):
             p = wm_best_image(pg)
             if p is None:
                 continue
-            p = p.convert("RGB")
+            p = wm_norm(p.convert("RGB"))
             regs = wm_find(p)
             if not regs:
                 continue
@@ -3711,42 +3711,181 @@ async def watch_on_new(ev):
     except Exception:
         log.exception("watch handler")
 
-BIG_STAMP_MAX = 60 * 1024 * 1024   # RAM guard on Render free (512MB)
-W["pre"] = {}   # fname -> ts : files the watcher already stamped and uploaded (bot must not re-stamp)
+def wm_norm(p):
+    """Bring a page raster to the ~595px width the detector was tuned on."""
+    from PIL import Image
+    if p.width > 760:
+        k = 595.0 / p.width
+        p = p.resize((595, max(1, int(p.height * k))), Image.BOX)
+    return p
+
+def _big_page_image(page):
+    """Largest non-masked image of a pikepdf page as a small RGB PIL image (JPEGs are decoded at reduced size)."""
+    import pikepdf
+    from PIL import Image
+    best, bs = None, 0
+    for name, xo in page.images.items():
+        if "/SMask" in xo:
+            continue
+        s = int(xo.Width) * int(xo.Height)
+        if s > bs:
+            best, bs = xo, s
+    if best is None:
+        return None
+    flt = best.get("/Filter")
+    dct = pikepdf.Name("/DCTDecode")
+    if flt is not None and (flt == dct or (isinstance(flt, pikepdf.Array) and len(flt) == 1 and flt[0] == dct)):
+        im = Image.open(io.BytesIO(best.read_raw_bytes()))
+        im.draft("RGB", (760, 100000))
+        return wm_norm(im.convert("RGB"))
+    return wm_norm(pikepdf.PdfImage(best).as_pil_image().convert("RGB"))
+
+def _big_content(page):
+    import pikepdf
+    c = page.obj.get("/Contents")
+    if c is None:
+        return b""
+    if isinstance(c, pikepdf.Array):
+        return b"".join(s.read_bytes() for s in c)
+    return c.read_bytes()
+
+def _trim_mem():
+    import gc, ctypes
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True):
+    """Disk-to-disk: nothing but one page raster is decoded at a time; image streams are copied by qpdf, never re-encoded.
+    Returns {"pages", "changed", "stamped"}."""
+    import pikepdf
+    from pikepdf import Pdf
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    pdf = Pdf.open(src)
+    n = len(pdf.pages)
+    if n == 0:
+        raise ValueError("empty pdf")
+    st = {"pages": n, "changed": 0, "stamped": 0}
+    def dims(pg):
+        mb = [float(v) for v in (pg.get("/CropBox") or pg.MediaBox)]
+        W, H = abs(mb[2] - mb[0]), abs(mb[3] - mb[1])
+        if int(pg.get("/Rotate", 0) or 0) % 180:
+            W, H = H, W
+        return W, H
+    fW, fH = dims(pdf.pages[0])
+    lW, lH = dims(pdf.pages[n - 1])
+    keep = []
+    WMSTAT.update(regions=0, odd=0)
+    if do_wm:
+        cache = {}
+        def lab(key, lw, lh):
+            k = (key, texts[key], round(lw), round(lh))
+            if k not in cache:
+                im = wm_label(texts[key], round(lw), round(lh), 4)
+                q = im.quantize(colors=64, method=Image.Quantize.FASTOCTREE)
+                b = io.BytesIO(); q.save(b, "PNG", optimize=True)
+                cache[k] = Image.open(io.BytesIO(b.getvalue())).convert("RGBA")
+            return cache[k]
+        for pi, page in enumerate(pdf.pages):
+            try:
+                p = _big_page_image(page)
+                if p is None:
+                    continue
+                regs = wm_find(p)
+                if not regs:
+                    continue
+                mb = [float(v) for v in page.MediaBox]
+                W, H = abs(mb[2] - mb[0]), abs(mb[3] - mb[1])
+                cms = re.findall(rb"([\d.\-]+) 0 0 ([\d.\-]+) ([\d.\-]+) ([\d.\-]+) cm\s*/\S+ Do", _big_content(page))
+                if cms:
+                    iw, ih, ix, iy = [float(v) for v in max(cms, key=lambda t: float(t[1]))]
+                else:
+                    iw, ih, ix, iy = W, H, 0.0, 0.0
+                sx, sy = iw / p.width, ih / p.height
+                buf = io.BytesIO()
+                c = canvas.Canvas(buf, pagesize=(W, H))
+                for reg in regs:
+                    WMSTAT["regions"] += 1
+                    if not ((reg[3] + reg[4]) / 2 < p.height * 0.08 or (reg[3] + reg[4]) / 2 > p.height * 0.9):
+                        WMSTAT["odd"] += 1
+                    key, cx, cy, lw, lh = wm_layout(reg, texts, p.height)
+                    c.drawImage(ImageReader(lab(key, lw, lh)), ix + (cx - lw / 2) * sx, iy + ih - (cy + lh / 2) * sy, lw * sx, lh * sy, mask="auto")
+                c.save()
+                o = Pdf.open(io.BytesIO(buf.getvalue()))
+                keep.append(o)
+                page.add_overlay(o.pages[0])
+                st["changed"] += 1
+            except Exception as e:
+                log.warning("big wm page %s failed: %r", pi + 1, e)
+            if pi % 25 == 24:
+                _trim_mem()
+    if do_stamp and cfg:
+        fp = Pdf.open(io.BytesIO(stamp_page_pdf(cfg["img_f"], fW, fH)))
+        keep.append(fp)
+        pdf.pages.insert(0, fp.pages[0])
+        st["stamped"] = 1
+        if n > 1:
+            bp = Pdf.open(io.BytesIO(stamp_page_pdf(cfg["img_l"], lW, lH)))
+            keep.append(bp)
+            pdf.pages.append(bp.pages[0])
+            st["stamped"] = 2
+    pdf.save(dst, linearize=False, object_stream_mode=pikepdf.ObjectStreamMode.preserve,
+             stream_decode_level=pikepdf.StreamDecodeLevel.none, recompress_flate=False)
+    pdf.close()
+    for o in keep:
+        o.close()
+    return st
+
+BIG_MAX = 450 * 1024 * 1024   # disk-to-disk path: RAM does not grow with file size, only disk space does
+W["pre"] = {}   # fname -> ts : files the watcher already processed and uploaded (bot must not re-stamp)
 
 async def watch_big(cid, mid):
-    """File > 20MB: download via MTProto, stamp, upload to the bot chat as the watcher account.
-    Returns True if handled (uploaded stamped), False to fall back to a plain forward."""
+    """File > 20MB: download via MTProto to DISK, stamp + replace watermark with pikepdf (page by page), upload from disk
+    as the watcher account. Returns True if handled, False to fall back to a plain forward."""
+    import shutil, tempfile
     cfg = stamp_cfg()
-    if not cfg or not cfg["on"]:
+    do_stamp = bool(cfg and cfg["on"])
+    do_wm = store.get("wm_auto", "1") == "1"
+    if not do_stamp and not do_wm:
         return False
     c = W["client"]
     m = await c.get_messages(cid, ids=mid)
     d = getattr(m, "document", None)
-    if not m or not d or d.size <= MAX_DL or d.size > BIG_STAMP_MAX:
+    if not m or not d or d.size <= MAX_DL or d.size > BIG_MAX:
         return False
     fname = "handout.pdf"
     for a in d.attributes or []:
         if getattr(a, "file_name", None):
             fname = a.file_name
+    tmpd = tempfile.mkdtemp(prefix="big_")
     try:
+        free = shutil.disk_usage(tmpd).free
+        if free < d.size * 2.6 + 60 * 1024 * 1024:
+            log.warning("big file skipped: disk free %d MB, file %d MB", free >> 20, d.size >> 20)
+            return False
+        src, dst = os.path.join(tmpd, "in.pdf"), os.path.join(tmpd, "out.pdf")
         async with STAMP_LOCK:
-            data = await asyncio.wait_for(c.download_media(m, file=bytes), 600)
-            out, n = await asyncio.wait_for(asyncio.to_thread(stamp_pdf, data, cfg), 240)
-            del data
-            bio = io.BytesIO(out)
-            bio.name = fname
+            await asyncio.wait_for(c.download_media(m, file=src), 1800)
+            st = await asyncio.wait_for(asyncio.to_thread(big_process, src, dst, cfg if do_stamp else None, wm_texts(), do_stamp, do_wm), 1500)
+            os.remove(src)
+            if not st["changed"] and not st["stamped"]:
+                return False
             W["pre"][fname] = time.time()
-            await c.send_file(W["bot_ent"], bio, caption=(m.message or ""), force_document=True,
+            await c.send_file(W["bot_ent"], dst, caption=(m.message or ""), force_document=True,
                               attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
                               mime_type="application/pdf")
-            del out, bio
-        log.info("big stamped %s", fname)
+        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"])
         return True
     except Exception:
-        log.exception("big stamp failed")
+        log.exception("big process failed")
         W["pre"].pop(fname, None)
         return False
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
 
 async def watch_forward(cid, ids):
     """Forward posts to the bot chat; returns False when forwards are blocked for this channel."""
@@ -3754,12 +3893,12 @@ async def watch_forward(cid, ids):
     c = W["client"]
     try:
         cfg = stamp_cfg()
-        if cfg and cfg["on"]:
+        if (cfg and cfg["on"]) or store.get("wm_auto", "1") == "1":
             msgs = await c.get_messages(cid, ids=list(ids))
             rest = []
             for m in msgs:
                 d = getattr(m, "document", None)
-                if m and d and MAX_DL < d.size <= BIG_STAMP_MAX:
+                if m and d and MAX_DL < d.size <= BIG_MAX:
                     if not await watch_big(cid, m.id):
                         rest.append(m.id)
                 else:
