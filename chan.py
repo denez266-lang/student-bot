@@ -345,6 +345,9 @@ class KeysH(tornado.web.RequestHandler):
                                "<textarea name=keys rows=6 autocomplete=off placeholder='AIza...' style='width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0FF;border-radius:14px;font-size:15px;direction:ltr;text-align:left'></textarea>"
                                "<small>مفتاح في كل سطر (مفاتيح مجانية من aistudio.google.com/apikey، يفضل من حسابات مختلفة).</small><br><br>"
                                "<button>➕ إضافة المفاتيح</button></form>"
+                               "<hr><h2>DeepSeek</h2><p><small>" + ("✅ مفتاح DeepSeek محفوظ." if ds_key() else "لا يوجد مفتاح DeepSeek.") + " يُستعمل للدردشة والمهام النصية، والباقي على Gemini.</small></p>"
+                               "<form method=post><input type=hidden name=a value=ds><input name=dskey type=password autocomplete=off placeholder='sk-...'><button>💾 حفظ مفتاح DeepSeek</button></form>"
+                               "<form method=post style='margin-top:10px'><input type=hidden name=a value=dsclear><button style='background:#d9534f'>🗑 حذف مفتاح DeepSeek</button></form>"
                                "<form method=post style='margin-top:14px'><input type=hidden name=a value=clear><button style='background:#d9534f'>🗑 حذف المفاتيح الإضافية</button></form>")
 
     def get(self, tok):
@@ -352,7 +355,47 @@ class KeysH(tornado.web.RequestHandler):
 
     async def post(self, tok):
         import httpx
-        if self.get_body_argument("a", "") == "clear":
+        a = self.get_body_argument("a", "")
+        if a == "dsclear":
+            G["store"].set("dskey", "")
+            _DS["until"] = 0
+            self.finish(self._form("<p><b>✅ حُذف مفتاح DeepSeek.</b></p>"))
+            return
+        if a == "ds":
+            import httpx
+            k = self.get_body_argument("dskey", "").strip().strip("\"'`")
+            tail = "…" + k[-4:]
+            if not re.fullmatch(r"[A-Za-z0-9_\-.~]{20,200}", k):
+                self.finish(self._form(f"<div class=e>{tail}: صيغة المفتاح غير صحيحة (انسخه كاملاً من platform.deepseek.com/api_keys)</div>"))
+                return
+            try:
+                async with httpx.AsyncClient(timeout=20) as c:
+                    r = await c.get("https://api.deepseek.com/user/balance", headers={"Authorization": "Bearer " + k})
+            except Exception:
+                self.finish(self._form("<div class=e>تعذر الاتصال بـ DeepSeek، أعد المحاولة.</div>"))
+                return
+            if r.status_code == 401:
+                self.finish(self._form(f"<div class=e>{tail}: مفتاح غير صحيح.</div>"))
+                return
+            if r.status_code != 200:
+                self.finish(self._form(f"<div class=e>{tail}: ردّ غير متوقع من DeepSeek (رمز {r.status_code}).</div>"))
+                return
+            avail = None
+            try:
+                avail = bool(r.json().get("is_available"))
+            except Exception:
+                pass
+            G["store"].set("dskey", G["_fernet"]().encrypt(k.encode()).decode())
+            _DS["until"] = 0
+            try:
+                G["backup_soon"]()
+            except Exception:
+                pass
+            log().info("deepseek key saved, balance available: %s", avail)
+            warn = "" if avail else "<div class=e>تنبيه: الرصيد غير كافٍ حالياً، اشحن الرصيد من platform.deepseek.com (Top up) وإلا سيعمل البوت على Gemini.</div>"
+            self.finish(self._form("<p><b>✅ حُفظ مفتاح DeepSeek (مشفّراً).</b></p>" + warn))
+            return
+        if a == "clear":
             G["store"].set("gkeys", "")
             self.finish(self._form("<p><b>✅ حُذفت المفاتيح الإضافية.</b></p>"))
             return
@@ -420,11 +463,80 @@ CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراق
 _CH = {"sem": None, "last": {}, "hour": {}}
 
 
+_DS = {"until": 0, "day": 0, "n": 0}
+
+
+def ds_key():
+    try:
+        v = G["store"].get("dskey", "")
+        return G["_fernet"]().decrypt(v.encode()).decode() if v else ""
+    except Exception:
+        return ""
+
+
+async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepseek-flash"):
+    """DeepSeek (OpenAI-compatible) for plain text work. Returns None (caller uses Gemini) when there is no key, the request has images/audio/PDF text,
+    it is archive/stage classification, or DeepSeek fails or is resting."""
+    try:
+        key = ds_key()
+        now = time.time()
+        if not key or now < _DS["until"] or not system or system == G["ING_SYS"]:
+            return None
+        if any(("inline_data" in p) or str(p.get("text", "")).startswith("محتوى ملف PDF") for p in parts):
+            return None
+        d = int(now // 86400)
+        if _DS["day"] != d:
+            _DS["day"], _DS["n"] = d, 0
+        if _DS["n"] >= 3000:   # daily safety cap so the balance cannot drain
+            return None
+        _DS["n"] += 1
+        import httpx
+        solve = system == G.get("SOLVE_SYS")
+        body = {"model": model, "stream": False, "temperature": temperature,
+                "max_tokens": 16000 if solve else min(int(max_tokens), 4000),
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}],
+                "thinking": {"type": "enabled" if solve else "disabled"}}
+        if solve:
+            body["reasoning_effort"] = "low"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90 if solve else 25)) as c:
+            r = await c.post("https://api.deepseek.com/chat/completions", headers={"Authorization": "Bearer " + key}, json=body)
+        if r.status_code == 200:
+            text = str(r.json()["choices"][0]["message"].get("content") or "").strip()
+            return text or None
+        _DS["until"] = now + (900 if r.status_code in (401, 402) else 30)
+        log().warning("deepseek %s, using Gemini", r.status_code)
+    except Exception as e:
+        _DS["until"] = time.time() + 30
+        log().warning("deepseek failed (%s), using Gemini", type(e).__name__)
+    return None
+
+
 CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.7-flash"]
 
 
-async def chat_call(prompt):
+ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("gem", "✨ جيميني")]
+
+
+def engines():
+    return [e for e in ENGS if e[0] == "gem" or ds_key()]
+
+
+def get_eng(uid):
+    av = [e[0] for e in engines()]
+    s = G["store"].get("eng:%s" % uid, "")
+    return s if s in av else av[0]
+
+
+def eng_label(e):
+    return dict(ENGS).get(e, "")
+
+
+async def chat_call(prompt, eng="gem"):
     """Fast chat call: fastest lite model first, 9 s per try, next key (not resting) on 429/timeout, then next model; 28 s budget."""
+    if eng in ("dsp", "ds"):
+        r0 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200, "deepseek-v4-pro" if eng == "dsp" else "deepseek-flash")
+        if r0:
+            return r0
     import httpx
     n = len(all_keys())
     plan = [m for m in CHAT_MODELS for _ in range(min(n, 3))][:6]
@@ -453,6 +565,10 @@ async def chat_call(prompt):
             if r.status_code == 429:
                 gk_bad(k)
             log().warning("chat gemini %s (%s)", r.status_code, m)
+    if eng == "gem":
+        r1 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200)
+        if r1:
+            return r1
     raise RuntimeError("الخدمة مزدحمة حالياً، حاول بعد دقيقة.")
 
 
@@ -487,7 +603,7 @@ async def chat_answer(uid, hist, text):
     prompt = ("سجل المحادثة السابق:\n" + "\n".join(lines) + "\n\n" if lines else "") + "رسالة الطالب الجديدة:\n" + text + "\n\nأجب عن الرسالة الجديدة فقط."
     try:
         async with _CH["sem"]:
-            out = await chat_call(prompt)
+            out = await chat_call(prompt, get_eng(uid))
     except RuntimeError as e:
         m = str(e)
         if "مزدحمة" in m or "تعذر الاتصال" in m:
@@ -498,15 +614,29 @@ async def chat_answer(uid, hist, text):
     return re.sub(r"[*#`]+", "", out).strip()[:3900]
 
 
-def _end_kb():
-    return G["M"]([[G["B"]("🛑 إنهاء الدردشة", callback_data="m:menu")]])
+def _end_kb(uid=0):
+    rows = []
+    if uid and len(engines()) > 1:
+        rows.append([G["B"]("المحرك: " + eng_label(get_eng(uid)), callback_data="m:eng")])
+    rows.append([G["B"]("🛑 إنهاء الدردشة", callback_data="m:menu")])
+    return G["M"](rows)
+
+
+async def chat_eng(q, ctx):
+    uid = q.from_user.id
+    ids = [e[0] for e in engines()]
+    cur = get_eng(uid)
+    nx = ids[(ids.index(cur) + 1) % len(ids)]
+    G["store"].set("eng:%s" % uid, nx)
+    ctx.user_data["mode"] = "aichat"
+    await q.message.reply_text("تم اختيار المحرك: " + eng_label(nx) + "\nأكمل محادثتك 👇", reply_markup=_end_kb(uid))
 
 
 async def chat_cb(q, ctx):
     ctx.user_data.clear()
     ctx.user_data["mode"] = "aichat"
     ctx.user_data["chat"] = []
-    await q.message.reply_text("💬 الدردشة مع الذكاء الاصطناعي\nاكتب أي سؤال أو موضوع وسأجيبك باختصار، وأتذكر ما قلناه خلال هذه المحادثة.\nعند الانتهاء اضغط الزر أدناه 👇", reply_markup=_end_kb())
+    await q.message.reply_text("💬 الدردشة مع الذكاء الاصطناعي\nاكتب أي سؤال أو موضوع وسأجيبك باختصار، وأتذكر ما قلناه خلال هذه المحادثة.\nعند الانتهاء اضغط الزر أدناه 👇\nالمحرك الحالي: " + eng_label(get_eng(q.from_user.id)), reply_markup=_end_kb(q.from_user.id))
 
 
 async def chat_msg(update, ctx):
@@ -528,10 +658,15 @@ async def chat_msg(update, ctx):
     hist += [("u", text[:1500]), ("a", out)]
     del hist[:-16]
     G["store"].event(msg.from_user.id, "chat")
-    await msg.reply_text(out, reply_markup=_end_kb())
+    await msg.reply_text(out, reply_markup=_end_kb(msg.from_user.id))
 
 
 async def chat_api(uid, body):
+    if body.get("op") == "eng":
+        ids = [e[0] for e in engines()]
+        if body.get("set") in ids:
+            G["store"].set("eng:%s" % uid, body["set"])
+        return {"eng": get_eng(uid), "list": [{"id": i, "t": t} for i, t in engines()]}
     h = []
     for m in (body.get("history") or [])[-12:]:
         if isinstance(m, dict) and m.get("r") in ("u", "a"):
