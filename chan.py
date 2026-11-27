@@ -270,10 +270,10 @@ async def _gtry(fn, errs, streak):
             await asyncio.sleep(30)
 
 
-async def fix_stages(vision=False):  # returns the number of Gemini failures
-    """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
-    moved, renamed, unresolved = [], 0, 0
-    try:   # 1) canonical stage names; merge stages that are the same stage
+def merge_stage_names():
+    """Canonical stage names; stages that are the same stage (spelling variants) are merged, subjects and files moved."""
+    renamed = 0
+    try:
         for sid, sname in G["hq"]("SELECT id, name FROM h_stages ORDER BY id"):
             cn = G["canon_stage"](sname)
             if not cn or G["nrm"](cn) == G["nrm"](sname):
@@ -285,12 +285,111 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
             elif target != sid:
                 for jid, jname in hq("SELECT id, name FROM h_subjects WHERE stage_id=?", (sid,)):
                     nj = G["get_subject"](target, jname)
-                    hq("UPDATE h_files SET subject_id=? WHERE subject_id=?", (nj, jid), False)
-                    hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+                    if nj != jid:
+                        hq("UPDATE h_files SET subject_id=? WHERE subject_id=?", (nj, jid), False)
+                        hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
                 hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
                 renamed += 1
+        if renamed:
+            log().info("stage names merged: %d", renamed)
     except Exception:
         log().exception("stage names")
+    return renamed
+
+
+_ST = ("الأول المتوسط", "الثاني المتوسط", "الثالث المتوسط", "الرابع الإعدادي", "الخامس الإعدادي", "السادس الإعدادي")
+_ORD = ("الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس")
+_TRK = {0: "", 1: " العلمي", 2: " الأدبي", 3: " العلمي الأحيائي", 4: " العلمي التطبيقي"}
+
+
+def _pos(name):
+    c = G["canon_stage"](name)
+    for n, o in enumerate(_ORD):
+        if c.startswith(o + " "):
+            return n, (3 if "الأحيائي" in c else 4 if "التطبيقي" in c else 1 if "العلمي" in c else 2 if "الأدبي" in c else 0)
+    return None
+
+
+def menu(parts):
+    """Nested library menu: stage -> track (علمي/ادبي/عام) -> sub-track (احيائي/تطبيقي) -> subjects. Returns (text, markup)."""
+    B, M = G["B"], G["M"]
+    rows = hq("SELECT s.id, s.name, (SELECT COUNT(*) FROM h_files f JOIN h_subjects j ON f.subject_id=j.id WHERE j.stage_id=s.id) FROM h_stages s ORDER BY s.id")
+    pos, other, byid = {}, [], {}
+    for sid, name, n in rows:
+        p = _pos(name)
+        byid[sid] = p
+        if p is None:
+            other.append((sid, name, n))
+        elif p not in pos:
+            pos[p] = [sid, n]
+        else:
+            pos[p][1] += n
+    cnt = lambda n, ts: sum(pos[(n, t)][1] for t in ts if (n, t) in pos)
+    btn = lambda label, cb: [B(label, callback_data=cb)]
+    back = lambda cb: [B("🔙 رجوع", callback_data=cb)]
+
+    def subjects(n, t, bk, sid=None, title=None):
+        if sid is None:
+            sid = pos[(n, t)][0] if (n, t) in pos else 0
+        subj = hq("SELECT j.id, j.name, (SELECT COUNT(*) FROM h_files f WHERE f.subject_id=j.id) FROM h_subjects j WHERE j.stage_id=? ORDER BY j.id", (sid,))
+        kb = [btn(f"📖 {G['trim'](r[1])} ({r[2]})", f"h:j:{r[0]}") for r in subj[:50]]
+        kb.append(back(bk))
+        title = title or f"🎓 {_ST[n]}{_TRK[t]}"
+        return (f"{title}\nاختر المادة:" if subj else f"{title}\nلا توجد ملازم في هذا القسم بعد."), M(kb)
+
+    act = parts[1]
+    if act == "t":   # a stage row (used by the subject 'back' button)
+        sid = int(parts[2])
+        p = byid.get(sid)
+        if p is None:
+            nm = next((r[1] for r in rows if r[0] == sid), "")
+            return subjects(0, 0, "h:S:9", sid, f"📂 {nm}")
+        n, t = p
+        return subjects(n, t, "h:s" if n < 3 else f"h:S:{n}" if t in (0, 1, 2) else f"h:S:{n}:1", sid)
+    if act == "S" and len(parts) > 2:
+        n = int(parts[2])
+        t = int(parts[3]) if len(parts) > 3 else None
+        if n == 9:
+            kb = [btn(f"📂 {G['trim'](nm)} ({k})", f"h:t:{sid}") for sid, nm, k in other[:50]] + [back("h:s")]
+            return "📂 ملازم غير مصنفة بعد\nاختر:", M(kb)
+        if n < 3:
+            return subjects(n, 0, "h:s")
+        if t is None:
+            kb = []
+            if cnt(n, (1, 3, 4)):
+                kb.append(btn(f"🔬 العلمي ({cnt(n, (1, 3, 4))})", f"h:S:{n}:1"))
+            if cnt(n, (2,)):
+                kb.append(btn(f"📖 الأدبي ({cnt(n, (2,))})", f"h:S:{n}:2"))
+            if cnt(n, (0,)):
+                kb.append(btn(f"📂 عام ({cnt(n, (0,))})", f"h:S:{n}:0"))
+            kb.append(back("h:s"))
+            return (f"🎓 {_ST[n]}\nاختر الفرع:" if len(kb) > 1 else f"🎓 {_ST[n]}\nلا توجد ملازم بعد."), M(kb)
+        if t == 1 and n > 3 and cnt(n, (3, 4)):
+            kb = []
+            if cnt(n, (3,)):
+                kb.append(btn(f"🧬 الأحيائي ({cnt(n, (3,))})", f"h:S:{n}:3"))
+            if cnt(n, (4,)):
+                kb.append(btn(f"⚙️ التطبيقي ({cnt(n, (4,))})", f"h:S:{n}:4"))
+            if cnt(n, (1,)):
+                kb.append(btn(f"📂 علمي عام ({cnt(n, (1,))})", f"h:S:{n}:6"))
+            kb.append(back(f"h:S:{n}"))
+            return f"🎓 {_ST[n]} العلمي\nاختر الفرع:", M(kb)
+        if t == 6:
+            return subjects(n, 1, f"h:S:{n}:1", title=f"🎓 {_ST[n]} العلمي (عام)")
+        return subjects(n, t, f"h:S:{n}" if t in (0, 1, 2) else f"h:S:{n}:1")
+    kb = [btn("🔍 بحث", "h:q")]
+    for n in range(6):
+        kb.append(btn(f"🎓 {_ST[n]} ({cnt(n, (0, 1, 2, 3, 4))})", f"h:S:{n}"))
+    if other:
+        kb.append(btn(f"📂 غير مصنفة ({sum(o[2] for o in other)})", "h:S:9"))
+    kb.append(G["HOME"])
+    return "📚 الملازم\nاختر المرحلة الدراسية:", M(kb)
+
+
+async def fix_stages(vision=False):  # returns the number of Gemini failures
+    """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
+    moved, renamed, unresolved = [], 0, 0
+    renamed = merge_stage_names()
     checked = 0
     rows = hq("SELECT f.id, COALESCE(f.fname,''), COALESCE(f.title,''), f.file_id, COALESCE(f.fsize,0), j.name, s.name, f.subject_id FROM h_files f "
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
@@ -584,6 +683,10 @@ async def chanlist(update, ctx):
 
 def start(g):
     G.update(g)
+    try:
+        merge_stage_names()
+    except Exception:
+        pass
     for col in ("ch_msg INTEGER", "ch_fid TEXT"):
         try:
             hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
