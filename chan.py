@@ -180,7 +180,7 @@ async def fix_teachers():
     for hid in fixed:
         try:
             r = hq("SELECT ch_msg FROM h_files WHERE id=?", (hid,))
-            if r and r[0][0] and r[0][0] > 0 and CH["id"]:
+            if False and r and r[0][0] and r[0][0] > 0 and CH["id"]:   # channel left alone for now (user)
                 await _retry(G["APP"].bot.edit_message_caption, CH["id"], r[0][0], caption=(G["hcaption"](hid) or "")[:1024])
                 await asyncio.sleep(2)
         except Exception as e:
@@ -321,10 +321,7 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
                 hq("UPDATE h_files SET subject_id=? WHERE id=?", (nj, hid), False)
                 G["cleanup_empty"](jid)
                 moved.append((hid, stage, new))
-                r = hq("SELECT ch_msg FROM h_files WHERE id=?", (hid,))
-                if r and r[0][0] and r[0][0] > 0 and CH["id"]:
-                    await _retry(G["APP"].bot.edit_message_caption, CH["id"], r[0][0], caption=(G["hcaption"](hid) or "")[:1024])
-                    await asyncio.sleep(2)
+                # channel captions/posts are NOT touched (user: library only)
         except Exception as e:
             log().warning("stage fix %s: %r", hid, e)
     if vision:
