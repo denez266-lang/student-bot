@@ -3748,9 +3748,17 @@ def sent_type_text(t):
 def login_form(step, st=None):
     st = st or {}
     if step == "start":
-        return ("<h2>🔑 ربط الحساب المراقب</h2><p><small>استعمل بيانات الحساب الثاني فقط. هذه الصفحة تعمل مرة واحدة ولا تُحفظ البيانات إلا مشفّرة.</small></p>"
-                "<form method=post><input type=hidden name=a value=start>api_id<input name=api_id inputmode=numeric required>"
-                "api_hash<input name=api_hash required autocomplete=off>رقم الهاتف مع المفتاح (+964...) <small>(للكود فقط، يُترك فارغاً مع QR)</small><input name=phone>"
+        try:
+            _c = tg_load()
+        except Exception:
+            _c = None
+        _have = bool(_c and _c.get("api_id") and _c.get("api_hash"))
+        _req = "" if _have else " required"
+        _note = ("<p><b>✅ api_id و api_hash محفوظان على السيرفر. اتركهما فارغين واضغط الزر الأخضر.</b></p>" if _have
+                 else "<p><small>api_id و api_hash غير محفوظين، أدخلهما (من my.telegram.org/apps).</small></p>")
+        return ("<h2>🔑 ربط الحساب المراقب</h2><p><small>استعمل بيانات الحساب الثاني فقط. هذه الصفحة تعمل مرة واحدة ولا تُحفظ البيانات إلا مشفّرة.</small></p>" + _note +
+                "<form method=post><input type=hidden name=a value=start>api_id<input name=api_id inputmode=numeric" + _req + ">"
+                "api_hash<input name=api_hash autocomplete=off" + _req + ">رقم الهاتف مع المفتاح (+964...) <small>(للكود فقط، يُترك فارغاً مع QR)</small><input name=phone>"
                 "<button name=m value=code>إرسال الكود</button><div style='height:10px'></div>"
                 "<button name=m value=qr style='background:#2BB673'>🔳 الدخول عبر QR (بدون كود)</button></form>")
     if step == "code":
@@ -3867,8 +3875,12 @@ class TgLoginH(tornado.web.RequestHandler):
             from telethon import TelegramClient, errors
             from telethon.sessions import StringSession
             if a == "start" and st["step"] == "start":
-                api_id = int(self.get_body_argument("api_id").strip())
-                api_hash = self.get_body_argument("api_hash").strip()
+                api_id_s = self.get_body_argument("api_id", "").strip()
+                api_hash = self.get_body_argument("api_hash", "").strip()
+                if not api_id_s or not api_hash:
+                    _sc = tg_load() or {}
+                    api_id_s, api_hash = str(_sc.get("api_id", "")), str(_sc.get("api_hash", ""))
+                api_id = int(api_id_s)
                 phone = self.get_body_argument("phone", "").strip().replace(" ", "")
                 c = TelegramClient(StringSession(), api_id, api_hash, device_model="TalibBot")
                 await c.connect()
