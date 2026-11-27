@@ -270,6 +270,133 @@ async def _gtry(fn, errs, streak):
             await asyncio.sleep(30)
 
 
+import contextvars, json, secrets, os
+import tornado.web
+LANE = contextvars.ContextVar("lane", default="main")
+_GK = {"bad": {}, "n": {}, "ptr": {"main": 0, "chat": 1, "stage": 2}}
+KT = {}   # one-time page token -> expiry
+
+
+def _extra_keys():
+    try:
+        v = G["store"].get("gkeys", "")
+        if v:
+            return [k for k in json.loads(G["_fernet"]().decrypt(v.encode()).decode()) if isinstance(k, str)]
+    except Exception:
+        log().warning("gkeys unreadable")
+    return []
+
+
+def all_keys():
+    ks = [G["GKEY"]]
+    return ks + [k for k in _extra_keys() if k not in ks]
+
+
+def gk():
+    """Next Gemini key: round-robin per lane (main/chat/stage start at different keys), skipping keys cooling after a 429."""
+    ks, now, lane = all_keys(), time.time(), LANE.get()
+    p = _GK["ptr"].get(lane, 0) % len(ks)
+    for i in range(len(ks)):
+        k = ks[(p + i) % len(ks)]
+        if _GK["bad"].get(k, 0) <= now:
+            _GK["ptr"][lane] = (p + i + 1) % len(ks)
+            return k
+    return min(ks, key=lambda x: _GK["bad"].get(x, 0))
+
+
+def gk_bad(k):
+    n = _GK["n"].get(k, 0) + 1
+    _GK["n"][k] = n
+    _GK["bad"][k] = time.time() + min(900, 30 * 2 ** (n - 1))
+
+
+def gk_ok(k):
+    _GK["n"][k] = 0
+    _GK["bad"].pop(k, None)
+
+
+async def gkeys_cmd(update, ctx):
+    if not G["is_admin"](update):
+        return
+    tok = secrets.token_urlsafe(24)
+    KT[tok] = time.time() + 900
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    ks, now = all_keys(), time.time()
+    cool = sum(1 for k in ks if _GK["bad"].get(k, 0) > now)
+    await update.message.reply_text(f"🔑 مفاتيح Gemini: {len(ks)} فعّال ({cool} في استراحة مؤقتة بعد ضغط الحصة).\n"
+                                    f"رابط إضافة مفاتيح جديدة (صالح 15 دقيقة، لا تشاركه):\n{base}/gkeys/{tok}\n"
+                                    "الصق المفاتيح في الصفحة وليس في المحادثة.", disable_web_page_preview=True)
+
+
+class KeysH(tornado.web.RequestHandler):
+    def prepare(self):
+        self.set_header("Cache-Control", "no-store")
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("X-Robots-Tag", "noindex")
+        if KT.get(self.path_args[0], 0) < time.time():
+            KT.pop(self.path_args[0], None)
+            self.set_status(404)
+            self.finish(G["login_page"]("<h2>انتهت صلاحية الرابط</h2><p>أرسل /gkeys للبوت ليعطيك رابطاً جديداً.</p>"))
+
+    def _form(self, msg=""):
+        n = len(all_keys())
+        return G["login_page"]("<h2>🔑 مفاتيح Gemini</h2>" + msg + f"<p><small>المفاتيح الفعّالة الآن: {n}. المفاتيح لا تُعرض بعد الحفظ وتُحفظ مشفّرة.</small></p>"
+                               "<form method=post><input type=hidden name=a value=add>"
+                               "<textarea name=keys rows=6 autocomplete=off placeholder='AIza...' style='width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0FF;border-radius:14px;font-size:15px;direction:ltr;text-align:left'></textarea>"
+                               "<small>مفتاح في كل سطر (مفاتيح مجانية من aistudio.google.com/apikey، يفضل من حسابات مختلفة).</small><br><br>"
+                               "<button>➕ إضافة المفاتيح</button></form>"
+                               "<form method=post style='margin-top:14px'><input type=hidden name=a value=clear><button style='background:#d9534f'>🗑 حذف المفاتيح الإضافية</button></form>")
+
+    def get(self, tok):
+        self.finish(self._form())
+
+    async def post(self, tok):
+        import httpx
+        if self.get_body_argument("a", "") == "clear":
+            G["store"].set("gkeys", "")
+            self.finish(self._form("<p><b>✅ حُذفت المفاتيح الإضافية.</b></p>"))
+            return
+        raw = self.get_body_argument("keys", "")
+        cand = []
+        for k in re.split(r"[\s,;]+", raw):
+            if k and k not in cand:
+                cand.append(k)
+        have = all_keys()
+        extra = _extra_keys()
+        added, bad, dup = 0, [], 0
+        async with httpx.AsyncClient(timeout=15) as c:
+            for k in cand[:20]:
+                if k in have:
+                    dup += 1
+                    continue
+                ok = False
+                if re.fullmatch(r"AIza[0-9A-Za-z_\-]{30,50}", k):
+                    try:
+                        r = await c.get("https://generativelanguage.googleapis.com/v1beta/models", params={"key": k, "pageSize": 1})
+                        ok = r.status_code == 200
+                    except Exception:
+                        ok = False
+                if ok:
+                    extra.append(k)
+                    added += 1
+                else:
+                    bad.append("…" + k[-4:])
+        if added:
+            G["store"].set("gkeys", G["_fernet"]().encrypt(json.dumps(extra).encode()).decode())
+            try:
+                G["backup_soon"]()
+            except Exception:
+                pass
+        log().info("gkeys page: added %d, rejected %d, duplicate %d", added, len(bad), dup)
+        msg = f"<p><b>✅ أُضيف {added} مفتاح.</b></p>" + (f"<p>مكرر/موجود: {dup}</p>" if dup else "") + \
+              (f"<div class=e>غير صالح أو لم يُقبل: {html_join(bad)}</div>" if bad else "")
+        self.finish(self._form(msg))
+
+
+def html_join(xs):
+    return ", ".join(str(x).replace("<", "").replace(">", "") for x in xs)
+
+
 CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراقيين. أجب دائماً بالعربية وباختصار (من سطرين إلى خمسة أسطر)، بلغة بسيطة وواضحة، "
             "بدون عناوين ولا رموز تنسيق مثل ** أو #. للأسئلة الدراسية اشرح خطوة بخطوة وباختصار. إذا لم تفهم الرسالة اطلب التوضيح بجملة قصيرة.")
 _CH = {"sem": None, "last": {}, "hour": {}}
@@ -277,6 +404,7 @@ _CH = {"sem": None, "last": {}, "hour": {}}
 
 async def chat_answer(uid, hist, text):
     """General AI chat (bot + Mini App). hist = [(role, text)], role u/a. Few calls per user, max 3 at once, so the archive/stage pass keep their quota."""
+    LANE.set("chat")
     text = (text or "").strip()[:1500]
     if not text:
         raise RuntimeError("اكتب رسالتك نصاً من فضلك 🙂")
@@ -466,6 +594,7 @@ def menu(parts):
 async def fix_stages(vision=False):  # returns the number of Gemini failures
     """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
     moved, renamed, unresolved = [], 0, 0
+    LANE.set("stage")
     renamed = merge_stage_names()
     checked = 0
     rows = hq("SELECT f.id, COALESCE(f.fname,''), COALESCE(f.title,''), f.file_id, COALESCE(f.fsize,0), j.name, s.name, f.subject_id FROM h_files f "
@@ -795,6 +924,7 @@ def start(g):
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
     G["APP"].add_handler(CommandHandler("stagereview", stagereview), group=-1)
+    G["APP"].add_handler(CommandHandler("gkeys", gkeys_cmd), group=-1)
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
     async def _fix():
         await asyncio.sleep(90)
