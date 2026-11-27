@@ -4849,7 +4849,8 @@ class ApiH(tornado.web.RequestHandler):
                 for jid, jname in store.q("SELECT id,name FROM h_subjects WHERE stage_id=? ORDER BY id", (sid,), fetch=True):
                     tch = lib_tree(jid)
                     subs.append({"id": jid, "name": jname, "n": sum(t["n"] for t in tch), "teachers": tch})
-                out.append({"id": sid, "name": sname, "subjects": subs})
+                p = _fast()._pos(sname) or (9, 0)
+                out.append({"id": sid, "name": sname, "n": p[0], "t": p[1], "subjects": subs})
             store.event(uid, "webapp")
             return self.write({"stages": out})
         if name == "search":
