@@ -187,7 +187,36 @@ async def fix_teachers():
             log().warning("caption fix %s: %r", hid, e)
 
 
-async def fix_stages():
+def page1_pdf(data):
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(__import__('io').BytesIO(data))
+    if r.is_encrypted:
+        try:
+            r.decrypt("")
+        except Exception:
+            return None
+    w = PdfWriter()
+    w.add_page(r.pages[0])
+    buf = __import__('io').BytesIO()
+    w.write(buf)
+    return buf.getvalue() if buf.tell() <= 7 * 1024 * 1024 else None
+
+async def vision_stage(page1):
+    """Gemini reads the header ovals/graphics on page 1 (stage + subject). Returns (canonical stage or "", subject)."""
+    if not page1:
+        return "", ""
+    prompt = ("في أعلى الصفحة الأولى من هذه الملزمة غالباً شكلان (بيضاويان أو شريطان): أحدهما مكتوب فيه المرحلة الدراسية (مثل الخامس العلمي) "
+              "والآخر المادة (مثل مادة الحاسوب). اقرأهما كما هما مكتوبان فقط. لا تخمّن ولا تأخذ المرحلة من اسم وحدة أو فصل؛ إن لم يظهرا بوضوح اترك الحقل فارغاً. "
+              'الصيغة: {"stage":"","subject":""}')
+    parts = [{"text": prompt}, {"inline_data": {"mime_type": "application/pdf", "data": __import__('base64').b64encode(page1).decode()}}]
+    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=True), 45)
+    m = re.search(r"\{.*\}", out, re.S)
+    d = __import__('json').loads(m.group(0)) if m else {}
+    subj = str(d.get("subject") or "").strip()
+    subj = re.sub(r"^(مادة|ماده)\s+", "", subj)
+    return G['canon_stage'](str(d.get("stage") or "")), subj
+
+async def fix_stages(vision=False):
     """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
     moved, renamed, unresolved = [], 0, 0
     try:   # 1) canonical stage names; merge stages that are the same stage
@@ -211,18 +240,28 @@ async def fix_stages():
     checked = 0
     rows = hq("SELECT f.id, COALESCE(f.fname,''), COALESCE(f.title,''), f.file_id, COALESCE(f.fsize,0), j.name, s.name, f.subject_id FROM h_files f "
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
+    if vision:
+        rows = sorted(rows, key=lambda r: 0 if not G["canon_stage"](r[6]) else 1)
+    unres_ids = []
     for hid, fname, title, fid, fsize, subj, stage, jid in rows:
         try:
             new = G["stage_from_text"](fname)
             if not new and fid and 0 < fsize <= G["MAX_DL"] and fname.lower().endswith(".pdf"):
                 data = await asyncio.wait_for(G["fetch_file"](NS_CTX(), fid), 40)
                 text, _ = await asyncio.wait_for(asyncio.to_thread(G["pdf_head"], data), 25)
-                del data
                 new = G["stage_from_text"](text)
+                if not new and vision:
+                    try:
+                        new, _vj = await vision_stage(await asyncio.to_thread(page1_pdf, data))
+                    except Exception as e:
+                        log().warning("vision %s: %r", hid, e)
+                    await asyncio.sleep(2)
+                del data
                 checked += 1
                 await asyncio.sleep(0.5)
             if not new and not G["canon_stage"](stage):
                 unresolved += 1
+                unres_ids.append((hid, title[:40], stage))
             if new and G["nrm"](new) != G["nrm"](G["canon_stage"](stage) or stage):
                 sid = G["get_stage"](new)
                 nj = G["get_subject"](sid, subj)
@@ -236,7 +275,7 @@ async def fix_stages():
         except Exception as e:
             log().warning("stage fix %s: %r", hid, e)
     G["backup_soon"]()
-    log().info("stage fix: %d entries moved, %d stages renamed/merged, %d pdfs read, %d still without a valid stage: %s", len(moved), renamed, checked, unresolved, moved[:40])
+    log().info("stage fix: %d entries moved, %d stages renamed/merged, %d pdfs read, %d still without a valid stage: %s | moved: %s", len(moved), renamed, checked, unresolved, unres_ids[:20], moved[:40])
 
 
 class NS_CTX:
@@ -492,5 +531,8 @@ def start(g):
         if G["store"].get("stage_v", "") != "1":
             await fix_stages()
             G["store"].set("stage_v", "1")
+        if G["store"].get("stage_v2", "") != "1":
+            await fix_stages(vision=True)
+            G["store"].set("stage_v2", "1")
     asyncio.create_task(_fix())
     asyncio.create_task(loop())
