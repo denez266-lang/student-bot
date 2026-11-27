@@ -165,16 +165,16 @@ async def loop():
                     if ok and not st.get("chan_mode", ""):
                         st.set("chan_mode", "all")
                         st.set("chan_since", str(time.time()))
-            u = unstamped()
+            u = unstamped() if st.on("stamp_on") else []
             if len(u) != CH.get("nu"):
                 CH["nu"] = len(u)
                 log().warning("CHAN not posted (unstamped): %d %s", len(u), " | ".join(x[3] or x[1] for x in u[:15]))
             mode = st.get("chan_mode", "")
             if mode in ("new", "all") and await resolve():
                 since = float(st.get("chan_since", "0") or 0)
-                sql = ("SELECT id, title, file_id, COALESCE(ch_msg,0) FROM h_files WHERE kind='document' AND COALESCE(file_id,'')<>'' AND COALESCE(stamped,0)=1 AND "
+                sql = ("SELECT id, title, file_id, COALESCE(ch_msg,0) FROM h_files WHERE kind='document' AND COALESCE(file_id,'')<>'' AND (COALESCE(stamped,0)=1 OR ?=0) AND "
                        "((ch_msg IS NULL AND (? = 'all' OR added>=?)) OR (ch_msg IS NOT NULL AND COALESCE(ch_fid,'')<>file_id)) ORDER BY id LIMIT 3")
-                rows = hq(sql, (mode, since))
+                rows = hq(sql, (1 if st.on("stamp_on") else 0, mode, since))
                 for hid, title, fid, old in rows:
                     await post_one(hid, title, fid, old)
                     await asyncio.sleep(4)
@@ -312,6 +312,15 @@ def start(g):
             log().info("label replacement switched OFF (wm_auto=0)")
     except Exception:
         log().exception("wm off")
+    try:   # user decision 27 Nov 4:13 PM: plain copy mode (no stamp, no promo removal, no label replacement); toggles stay in the admin panel
+        st = G["store"]
+        if st.get("plain_v", "") != "1":
+            for k in ("stamp_on", "old_auto", "wm_auto"):
+                st.set(k, "0")
+            st.set("plain_v", "1")
+            log().info("plain copy mode ON: stamp_on=0 old_auto=0 wm_auto=0")
+    except Exception:
+        log().exception("plain mode")
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
     asyncio.create_task(loop())
