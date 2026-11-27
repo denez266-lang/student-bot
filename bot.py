@@ -335,7 +335,7 @@ def menu_markup(adm=False):
     if base:
         rows = [[B("🌐 افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app"))]] + rows
     return M(tool_buttons("main") + [
-        [B("💬 الدردشة مع الذكاء الاصطناعي", callback_data="m:aichat")],
+        [B("💬 دردشة", callback_data="m:aichat"), B("📓 دفتر المصادر", callback_data="m:nb")],
         [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
     ] + rows)
@@ -460,7 +460,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "m:eng":
         await _fast().chat_eng(q, ctx)
         return
-    if data == "m:aichat":
+    if data == "m:aichat" or data.startswith("m:nb"):
         await _fast().chat_cb(q, ctx)
         return
     if data == "m:more":
@@ -751,7 +751,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate_ok(update, ctx):
         return
     mode = ctx.user_data.get("mode")
-    if mode == "aichat":
+    if mode in ("aichat", "nb"):
         await _fast().chat_msg(update, ctx)
         return
 
