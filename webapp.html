@@ -114,9 +114,10 @@ function render(){
     const main=TOOLS.filter(t=>t.group==="main");
     v.innerHTML=`<div class="top"><h1>يلا نذاكر${NAME?" يا "+esc(NAME):""}! 📖</h1>${STREAK>=2?`<div class="chip">🔥 ${STREAK} أيام متواصلة</div>`:""}</div>
       <div class="big"><button class="a" onclick="go('lib')"><div class="ico">📚</div>الملازم</button><button class="b" onclick="go('timer')"><div class="ico">⏱</div>المؤقت</button></div>
-      <button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('chat')"><span>💬 الدردشة مع الذكاء الاصطناعي</span><small>‹</small></button><h2>🎓 أدوات الدراسة</h2><div class="grid">${main.map(tile).join("")}</div>
+      <button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('chat')"><span>💬 الدردشة مع الذكاء الاصطناعي</span><small>‹</small></button><button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('nb')"><span>📓 دفتر المصادر (اسأل من ملازمك)</span><small>‹</small></button><h2>🎓 أدوات الدراسة</h2><div class="grid">${main.map(tile).join("")}</div>
       <h2>✨ المزيد</h2><button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px" onclick="go('tools')"><span>🤖 كل الأدوات (اشرحها ببساطة، بطاقات حفظ، ترجمة...)</span><small>‹</small></button>`;
   } else if(tab==="chat"){ renderChat(v) }
+  else if(tab==="nb"){ renderNb(v) }
   else if(tab==="lib"){ renderLib(v) }
   else if(tab==="timer"){ renderTimer(v) }
   else if(tab==="tools"){
@@ -242,6 +243,27 @@ function ct(n,ts){return rw(n,ts).reduce((a,o)=>a+o.s.subjects.reduce((b,j)=>b+j
 function pg(n,t){const r=rw(n,[t]);if(r.length)pick(r[0].i)}
 function gp(n){if(n<3&&rw(n,[0]).length)pg(n,0);else{sel.g=n;sel.tr=null;render()}}
 function bk(){const s=LIB[sel.stage];sel.stage=null;sel.g=s.n<3?null:s.n;sel.tr=(s.n>3&&s.n<9&&(s.t>=3||(s.t===1&&ct(s.n,[3,4])>0)))?1:null}
+let NBS=null,NBO="",NBF=null,NBB=false;
+async function nbCall(b){
+  NBB=true;NBO=b.act==="ask"||b.act==="sum"||b.act==="q"||b.act==="map"?"⏳ جاري التحضير...":NBO;render();
+  try{const j=await api("aichat",Object.assign({op:"nb"},b));NBS=j.srcs;NBO=j.text||(b.act==="clear"?"":"");if(b.act==="add")NBO="✅ تمت إضافة المصدر"}
+  catch(e){NBO="❌ "+e.message}
+  NBB=false;NBF=null;render();
+}
+function nbFile(i){const f=i.files[0];if(!f)return;if(f.size>10*1024*1024){toast("⚠️ الحد 10 ميغابايت");i.value="";return}
+  const r=new FileReader();r.onload=()=>nbCall({act:"add",file:{name:f.name,mime:f.type,b64:String(r.result).split(",")[1]}});r.readAsDataURL(f)}
+function nbPaste(){const t=$("nbt").value.trim();if(t.length<30){toast("الصق نصاً أطول");return}nbCall({act:"add",text:t})}
+function nbAsk(){const t=$("nbq").value.trim();if(!t)return;nbCall({act:"ask",text:t})}
+function renderNb(v){
+  if(NBS===null){NBS=[];nbCall({act:"state"})}
+  v.innerHTML=`<div class="pill" onclick="go('home')">‹ رجوع</div><div class="top"><h1>📓 دفتر المصادر</h1></div><div class="card hint">💡 أضف ملازمك (PDF أو صورة أو نص) ثم اسأل: أجيبك من مصادرك فقط.</div>
+  <div class="card"><b>مصادرك (${NBS.length}/6)</b><div style="white-space:pre-wrap;margin-top:4px">${NBS.length?esc(NBS.map((n,i)=>(i+1)+") "+n).join("\n")):"لا توجد مصادر بعد."}</div></div>
+  <label class="filebtn">📎 <span>إضافة ملف PDF أو صورة</span><input type="file" accept="image/*,application/pdf,text/plain" onchange="nbFile(this)"></label>
+  <textarea class="inp" id="nbt" placeholder="أو الصق نصاً طويلاً هنا..." style="min-height:60px"></textarea><button class="btn" onclick="nbPaste()">➕ إضافة النص</button>
+  <button class="btn purple" onclick="nbCall({act:'sum'})">📝 ملخص</button><button class="btn purple" onclick="nbCall({act:'q'})">❓ أسئلة</button><button class="btn purple" onclick="nbCall({act:'map'})">🗺 خريطة ذهنية</button>
+  <textarea class="inp" id="nbq" placeholder="✏️ اسأل عن مصادرك..." style="min-height:60px"></textarea><button class="btn" ${NBB?"disabled":""} onclick="nbAsk()">📨 اسأل</button>
+  ${NBO?`<div class="res" style="white-space:pre-wrap">${esc(NBO)}</div>`:""}<button class="btn ghost" onclick="nbCall({act:'clear'})">🗑 مسح المصادر</button>`;
+}
 let CHT=[],CHB=false,CHE="",CHG=null;
 async function chatEng(s){try{CHG=await api("aichat",s?{op:"eng",set:s}:{op:"eng"})}catch(e){} render()}
 function renderChat(v){
