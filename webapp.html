@@ -177,10 +177,21 @@ async function renderLib(v){
   if(!LIB.length){ v.innerHTML=title+'<div class="empty">📭 لا توجد ملازم بعد، سنضيفها قريباً.</div>'; return }
   if(sel.search){ renderSearch(v); return }
   if(sel.stage===null){
-    v.innerHTML=title+'<div class="row" onclick="sel.search=true;render()"><span>🔍 بحث في الملازم</span><small>مادة، أستاذ، عنوان ‹</small></div><h2>🎓 اختر المرحلة</h2>'+LIB.map((s,i)=>row("🎓",s.name,s.subjects.length,"مادة",`pick(${i})`)).join(""); return }
+    const sr='<div class="row" onclick="sel.search=true;render()"><span>🔍 بحث في الملازم</span><small>مادة، أستاذ، عنوان ‹</small></div>';
+    const g=sel.g, un=LIB.some(s=>s.n===9), none='<div class="empty">📭 لا توجد ملازم بعد.</div>';
+    if(g==null){
+      v.innerHTML=title+sr+'<h2>🎓 اختر المرحلة</h2>'+GN.map((x,n)=>row("🎓",x,ct(n,[0,1,2,3,4]),"ملف",`gp(${n})`)).join("")+(un?row("📂","غير مصنفة",ct(9,[0]),"ملف","sel.g=9;render()"):""); return }
+    if(g===9){
+      v.innerHTML=back("sel.g=null")+title+'<h2>📂 ملازم غير مصنفة بعد</h2>'+LIB.map((s,i)=>s.n===9?row("📂",s.name,s.subjects.reduce((a,j)=>a+j.n,0),"ملف",`pick(${i})`):"").join(""); return }
+    if(g>=3 && sel.tr===1 && ct(g,[3,4])>0){
+      v.innerHTML=back("sel.tr=null")+title+`<h2>🔬 ${GN[g]} العلمي</h2>`+(ct(g,[3])?row("🧬","الأحيائي",ct(g,[3]),"ملف",`pg(${g},3)`):"")+(ct(g,[4])?row("⚙️","التطبيقي",ct(g,[4]),"ملف",`pg(${g},4)`):"")+(ct(g,[1])?row("📂","علمي عام",ct(g,[1]),"ملف",`pg(${g},1)`):""); return }
+    if(g>=3){
+      const b=(ct(g,[1,3,4])?row("🔬","العلمي",ct(g,[1,3,4]),"ملف",ct(g,[3,4])?"sel.tr=1;render()":`pg(${g},1)`):"")+(ct(g,[2])?row("📖","الأدبي",ct(g,[2]),"ملف",`pg(${g},2)`):"")+(ct(g,[0])?row("📂","عام",ct(g,[0]),"ملف",`pg(${g},0)`):"");
+      v.innerHTML=back("sel.g=null")+title+`<h2>🎓 ${GN[g]}</h2>`+(b||none); return }
+    v.innerHTML=back("sel.g=null")+title+`<h2>🎓 ${GN[g]}</h2>`+none; return }
   const st=LIB[sel.stage];
   if(sel.subject===null){
-    v.innerHTML=back("sel.stage=null")+title+`<h2>📖 اختر المادة (${esc(st.name)})</h2>`+
+    v.innerHTML=back("bk()")+title+`<h2>📖 اختر المادة (${esc(st.name)})</h2>`+
       (st.subjects.length?st.subjects.map((j,i)=>row("📖",j.name,j.n,"ملف",`pickSub(${i})`)).join(""):'<div class="empty">📭 لا توجد مواد بعد.</div>'); return }
   const sj=st.subjects[sel.subject];
   if(sel.teacher===null){
@@ -218,6 +229,12 @@ async function srRun(){
     box.innerHTML=r.files.length?`<h2>📄 النتائج (${r.total})</h2>`+r.files.map(f=>`<div class="row"><span>📄 ${esc(f.title)}<br><small>🎓 ${esc(f.stage)} · 📖 ${esc(f.subject)} · 🗂 ${esc(f.type)}</small></span><button class="btn green" style="padding:10px 14px;font-size:14px" onclick="dl(${f.id},this)">⬇ تحميل</button></div>`).join(""):'<div class="empty">😕 لا توجد نتائج. جرّب كلمات أقل.</div>';
   }catch(e){box.innerHTML='<div class="empty">❌ '+esc(e.message)+'</div>'}
 }
+const GN=["الأول المتوسط","الثاني المتوسط","الثالث المتوسط","الرابع الإعدادي","الخامس الإعدادي","السادس الإعدادي"];
+function rw(n,ts){return LIB.map((s,i)=>({s,i})).filter(o=>o.s.n===n&&ts.includes(o.s.t))}
+function ct(n,ts){return rw(n,ts).reduce((a,o)=>a+o.s.subjects.reduce((b,j)=>b+j.n,0),0)}
+function pg(n,t){const r=rw(n,[t]);if(r.length)pick(r[0].i)}
+function gp(n){if(n<3&&rw(n,[0]).length)pg(n,0);else{sel.g=n;sel.tr=null;render()}}
+function bk(){const s=LIB[sel.stage];sel.stage=null;sel.g=s.n<3?null:s.n;sel.tr=(s.n>3&&s.n<9&&(s.t>=3||(s.t===1&&ct(s.n,[3,4])>0)))?1:null}
 function pick(i){sel={stage:i,subject:null,teacher:null,type:null,search:false};render()}
 function pickSub(i){sel.subject=i;sel.teacher=null;sel.type=null;render()}
 function pickT(i){sel.teacher=i;sel.type=null;render()}
