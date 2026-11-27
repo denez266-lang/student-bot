@@ -206,7 +206,7 @@ async def vision_stage(page1):
     if not page1:
         return "", ""
     prompt = ("في أعلى الصفحة الأولى من هذه الملزمة غالباً شكلان (بيضاويان أو شريطان): أحدهما مكتوب فيه المرحلة الدراسية (مثل الخامس العلمي) "
-              "والآخر المادة (مثل مادة الحاسوب). اقرأهما كما هما مكتوبان فقط. لا تخمّن ولا تأخذ المرحلة من اسم وحدة أو فصل؛ إن لم يظهرا بوضوح اترك الحقل فارغاً. "
+              "والآخر المادة (مثل مادة الحاسوب). إن كُتب بجانب المرحلة فرع (الأحيائي أو التطبيقي) فاكتبه مع المرحلة (مثل: الخامس العلمي الأحيائي). اقرأهما كما هما مكتوبان فقط. لا تخمّن ولا تأخذ المرحلة من اسم وحدة أو فصل؛ إن لم يظهرا بوضوح اترك الحقل فارغاً. "
               'الصيغة: {"stage":"","subject":""}')
     parts = [{"text": prompt}, {"inline_data": {"mime_type": "application/pdf", "data": __import__('base64').b64encode(page1).decode()}}]
     out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=True), 45)
@@ -250,9 +250,11 @@ async def fix_stages(vision=False):
                 data = await asyncio.wait_for(G["fetch_file"](NS_CTX(), fid), 40)
                 text, _ = await asyncio.wait_for(asyncio.to_thread(G["pdf_head"], data), 25)
                 new = G["stage_from_text"](text)
-                if not new and vision:
+                if vision and (not new or (new.endswith("العلمي") and ("الخامس" in new or "السادس" in new))):
                     try:
-                        new, _vj = await vision_stage(await asyncio.to_thread(page1_pdf, data))
+                        vs, _vj = await vision_stage(await asyncio.to_thread(page1_pdf, data))
+                        if vs and (not new or vs.startswith(new)):
+                            new = vs
                     except Exception as e:
                         log().warning("vision %s: %r", hid, e)
                     await asyncio.sleep(2)
@@ -262,7 +264,8 @@ async def fix_stages(vision=False):
             if not new and not G["canon_stage"](stage):
                 unresolved += 1
                 unres_ids.append((hid, title[:40], stage))
-            if new and G["nrm"](new) != G["nrm"](G["canon_stage"](stage) or stage):
+            cur = G["canon_stage"](stage) or stage
+            if new and G["nrm"](new) != G["nrm"](cur) and not G["nrm"](cur).startswith(G["nrm"](new)):
                 sid = G["get_stage"](new)
                 nj = G["get_subject"](sid, subj)
                 hq("UPDATE h_files SET subject_id=? WHERE id=?", (nj, hid), False)
