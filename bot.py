@@ -1660,7 +1660,8 @@ def stamp_cfg():
     pf = s.get("stamp_pos_f", "") or "tc"
     return {"on": s.on("stamp_on"), "img_f": b64.b64decode(f), "img_l": b64.b64decode(l), "has_l": bool(s.get("stamp_img_l", "")),
             "pos_f": pf, "pos_l": s.get("stamp_pos_l", "") or pf,
-            "size": s.get("stamp_size", "") or "s", "op": int(s.get("stamp_op", "") or 100) / 100.0}
+            "size": s.get("stamp_size", "") or "s", "op": int(s.get("stamp_op", "") or 100) / 100.0,
+            "mode": s.get("stamp_mode", "") or "page"}
 
 def stamp_rect(pos, size, iw, ih, W, H):
     frac = {"s": 0.30, "m": 0.50, "l": 0.75}[size]
@@ -1679,13 +1680,62 @@ def prep_stamp_image(data):
     from PIL import Image
     im = Image.open(io.BytesIO(data))
     im = im.convert("RGBA")
-    im.thumbnail((900, 900))
+    im.thumbnail((1700, 1700))
     out = io.BytesIO()
     im.save(out, "PNG", optimize=True)
     return out.getvalue()
 
+def stamp_page_pdf(img_bytes, W, H):
+    """One PDF page of size W x H (points) showing the stamp image fitted whole (contain), centered on white."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    bg = Image.new("RGB", im.size, (255, 255, 255))
+    bg.paste(im, (0, 0), im.getchannel("A"))
+    jb = io.BytesIO()
+    bg.save(jb, "JPEG", quality=92)
+    sc = min(W / im.width, H / im.height)
+    bw, bh = im.width * sc, im.height * sc
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(W, H))
+    c.drawImage(ImageReader(io.BytesIO(jb.getvalue())), (W - bw) / 2, (H - bh) / 2, bw, bh)
+    c.save()
+    return buf.getvalue()
+
+def stamp_insert(data, cfg):
+    """Add the stamp image as a NEW first page and a NEW last page (page size follows the document's first/last page)."""
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    if n == 0:
+        raise ValueError("empty pdf")
+    def dims(pg):
+        mb = pg.cropbox
+        W, H = float(mb.width), float(mb.height)
+        if (pg.get("/Rotate", 0) or 0) % 180:
+            W, H = H, W
+        return W, H
+    fW, fH = dims(r.pages[0])
+    lW, lH = dims(r.pages[n - 1])
+    front = PdfReader(io.BytesIO(stamp_page_pdf(cfg["img_f"], fW, fH))).pages[0]
+    back = PdfReader(io.BytesIO(stamp_page_pdf(cfg["img_l"], lW, lH))).pages[0] if n > 1 else None
+    w = PdfWriter()
+    w.add_page(front)
+    for pg in r.pages:
+        w.add_page(pg)
+    if back is not None:
+        w.add_page(back)
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue(), 1 + (1 if back is not None else 0)
+
 def stamp_pdf(data, cfg):
     """Return (stamped_bytes, pages_stamped). First and last page; one page once."""
+    if cfg.get("mode", "page") == "page":
+        return stamp_insert(data, cfg)
     from pypdf import PdfReader, PdfWriter, Transformation
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
@@ -1741,6 +1791,15 @@ def stamp_preview_png(cfg):
             d.rectangle([40, yy, W - 40 - (i % 5) * 25, yy + 7], fill=(205, 205, 205, 255))
         d.rectangle([40, 36, 220, 52], fill=(120, 120, 120, 255))
         im = Image.open(io.BytesIO(cfg["img_" + slot])).convert("RGBA")
+        if cfg.get("mode", "page") == "page":
+            pg = Image.new("RGBA", (W, H), "white")
+            d = ImageDraw.Draw(pg)
+            d.rectangle([0, 0, W - 1, H - 1], outline=(180, 180, 180, 255))
+            sc = min(W / im.width, H / im.height)
+            st = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))))
+            pg.alpha_composite(st, ((W - st.width) // 2, (H - st.height) // 2))
+            pages.append(pg)
+            continue
         x, y, bw, bh = stamp_rect(cfg["pos_" + slot], cfg["size"], im.width, im.height, W, H)
         st = im.resize((max(1, int(bw)), max(1, int(bh))))
         a = st.getchannel("A").point(lambda v: int(v * cfg["op"]))
@@ -1824,10 +1883,11 @@ def stamp_menu():
     n_st = hq("SELECT COUNT(*) FROM h_files WHERE stamped=1")[0][0]
     n_all = hq("SELECT COUNT(*) FROM h_files WHERE kind='document'")[0][0]
     t = (f"🖼 ختم الملازم: {'🟢 مفعّل' if cfg['on'] else '🔴 معطّل'}\n"
-         f"يُختم أول صفحة وآخر صفحة من كل ملزمة PDF جديدة (صفحة واحدة تُختم مرة).\n"
+         f"{'الطريقة: تُضاف صورة الختم كصفحة أولى جديدة وصفحة أخيرة جديدة بحجم صفحات الملزمة، بدون تغطية أي محتوى.' if cfg['mode'] == 'page' else 'الطريقة: يوضع الختم فوق أول صفحة وآخر صفحة.'}\n"
          f"📊 المختومة: {n_st} من {n_all}")
     kb = M([
         [hb("🔴 إيقاف" if cfg["on"] else "🟢 تفعيل", "k:t")],
+        [hb("📄 الطريقة: " + ("صفحة مضافة" if cfg["mode"] == "page" else "فوق الصفحة"), "k:y")],
         [hb("🖼 صورة الأولى", "k:i:f"), hb("🖼 صورة الأخيرة" + ("" if cfg["has_l"] else " (نفسها)"), "k:i:l")],
         [hb("📍 الأولى: " + POS_LABEL[cfg["pos_f"]], "k:p:f"), hb("📍 الأخيرة: " + POS_LABEL[cfg["pos_l"]], "k:p:l")],
         [hb("📏 الحجم: " + SIZE_LABEL[cfg["size"]], "k:z"), hb(f"🌫 الشفافية: {int(cfg['op'] * 100)}%", "k:o")],
@@ -1901,6 +1961,8 @@ async def stamp_cb(update, ctx):
         k = "stamp_pos_" + parts[2]
         cur = cfg["pos_" + parts[2]]
         s.set(k, POS_ORDER[(POS_ORDER.index(cur) + 1) % len(POS_ORDER)])
+    elif a == "y" and cfg:
+        s.set("stamp_mode", "over" if cfg["mode"] == "page" else "page")
     elif a == "z" and cfg:
         s.set("stamp_size", SIZE_ORDER[(SIZE_ORDER.index(cfg["size"]) + 1) % 3])
     elif a == "o" and cfg:
