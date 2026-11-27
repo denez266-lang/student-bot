@@ -186,6 +186,103 @@ async def loop():
         await asyncio.sleep(20)
 
 
+CONC = 5
+
+
+async def fast_dl(c, d, path, part=512 * 1024):
+    """Pipelined download: CONC part requests in flight on one connection. Falls back to Telethon's own download on any error."""
+    import os
+    from telethon.tl.functions.upload import GetFileRequest
+    from telethon.tl.types import InputDocumentFileLocation
+    size = d.size
+    own = False
+    sender = c._sender
+    try:
+        loc = InputDocumentFileLocation(id=d.id, access_hash=d.access_hash, file_reference=d.file_reference, thumb_size="")
+        if d.dc_id and d.dc_id != c.session.dc_id:
+            sender = await c._borrow_exported_sender(d.dc_id)
+            own = True
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        sem = asyncio.Semaphore(CONC)
+
+        async def one(o):
+            async with sem:
+                r = await c._call(sender, GetFileRequest(loc, o, part))
+                b = getattr(r, "bytes", None)
+                if b is None or len(b) != min(part, size - o):
+                    raise RuntimeError("short part")
+                os.pwrite(fd, b, o)
+
+        tasks = [asyncio.ensure_future(one(o)) for o in range(0, size, part)]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            raise
+        finally:
+            os.close(fd)
+        if os.path.getsize(path) != size:
+            raise RuntimeError("size mismatch")
+        return path
+    except Exception as e:
+        log().warning("fast_dl failed, using plain download: %r", e)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return await c.download_file(d, file=path, part_size_kb=512, file_size=size)
+    finally:
+        if own:
+            try:
+                await c._return_exported_sender(sender)
+            except Exception:
+                pass
+
+
+async def fast_up(c, path, name, part=512 * 1024):
+    """Pipelined upload of a big file (SaveBigFilePart with CONC parts in flight)."""
+    import os
+    from telethon.tl.functions.upload import SaveBigFilePartRequest
+    from telethon.tl.types import InputFileBig
+    size = os.path.getsize(path)
+    if size <= 10 * 1024 * 1024:
+        return await c.upload_file(path, part_size_kb=512, file_name=name)
+    try:
+        count = (size + part - 1) // part
+        fid = int.from_bytes(os.urandom(8), "big", signed=True)
+        sem = asyncio.Semaphore(CONC)
+        tasks = []
+
+        async def one(i, b):
+            try:
+                if not await c(SaveBigFilePartRequest(fid, i, count, b)):
+                    raise RuntimeError("part rejected")
+            finally:
+                sem.release()
+
+        try:
+            with open(path, "rb") as f:
+                for i in range(count):
+                    await sem.acquire()
+                    b = f.read(part)
+                    tasks.append(asyncio.ensure_future(one(i, b)))
+                    if i % 16 == 0:
+                        tasks = [t for t in tasks if not t.done() or t.exception()]
+                        for t in tasks:
+                            if t.done() and t.exception():
+                                raise t.exception()
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            raise
+        return InputFileBig(fid, count, name)
+    except Exception as e:
+        log().warning("fast_up failed, using plain upload: %r", e)
+        return await c.upload_file(path, part_size_kb=512, file_name=name)
+
+
 def unstamped():
     return hq("SELECT id, title, COALESCE(fsize,0), COALESCE(fname,'') FROM h_files WHERE kind='document' AND COALESCE(stamped,0)=0 ORDER BY id")
 
