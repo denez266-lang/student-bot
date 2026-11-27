@@ -305,6 +305,13 @@ def start(g):
             hq("ALTER TABLE h_files ADD COLUMN " + col, (), False)
         except Exception:
             pass
+    try:   # user decision 27 Nov: label replacement OFF everywhere (stamp pages, promo removal and channel posting stay)
+        if G["store"].get("wm_off_v", "") != "1":
+            G["store"].set("wm_auto", "0")
+            G["store"].set("wm_off_v", "1")
+            log().info("label replacement switched OFF (wm_auto=0)")
+    except Exception:
+        log().exception("wm off")
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
     asyncio.create_task(loop())
