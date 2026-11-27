@@ -964,13 +964,8 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = q.data.split(":")
     act = parts[1]
-    if act == "s":
-        rows = hq("SELECT s.id, s.name, (SELECT COUNT(*) FROM h_files f JOIN h_subjects j ON f.subject_id=j.id WHERE j.stage_id=s.id) FROM h_stages s ORDER BY s.id")
-        rows = stage_sorted(rows)
-        kb = [[B("🔍 بحث", callback_data="h:q")]]
-        kb += [[B(f"🎓 {trim(r[1])} ({r[2]})", callback_data=f"h:t:{r[0]}")] for r in rows[:50]]
-        kb.append(HOME)
-        await hshow(q, "📚 الملازم\nاختر المرحلة الدراسية:" if rows else "📚 الملازم\nلا توجد ملازم بعد، سنضيفها قريباً.", M(kb))
+    if act in ("s", "S", "t"):
+        await hshow(q, *_fast().menu(parts))
     elif act == "q":
         ctx.user_data.pop("mode", None)
         await hshow(q, "🔍 كيف تريد البحث عن الملزمة؟",
@@ -982,13 +977,6 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     M([[B("🔙 رجوع", callback_data="h:q")]]))
     elif act == "g":
         await guided_view(q, int(parts[2]), parts[3], parts[4], parts[5])
-    elif act == "t":
-        sid = int(parts[2])
-        st = hq("SELECT name FROM h_stages WHERE id=?", (sid,))
-        rows = hq("SELECT j.id, j.name, (SELECT COUNT(*) FROM h_files f WHERE f.subject_id=j.id) FROM h_subjects j WHERE j.stage_id=? ORDER BY j.id", (sid,))
-        kb = [[B(f"📖 {trim(r[1])} ({r[2]})", callback_data=f"h:j:{r[0]}")] for r in rows[:50]]
-        kb.append([B("🔙 رجوع", callback_data="h:s")])
-        await hshow(q, f"🎓 {st[0][0] if st else ''}\nاختر المادة:" if rows else "لا توجد مواد في هذه المرحلة بعد.", M(kb))
     elif act in ("j", "r", "y"):
         jid = int(parts[2])
         j = hq("SELECT name, stage_id FROM h_subjects WHERE id=?", (jid,))
