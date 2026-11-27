@@ -147,9 +147,15 @@ async function runTool(){
   const b=$("go");b.disabled=true;b.textContent="⏳ جاري المعالجة...";
   try{
     const j=await api("run",{mode:t.id,text:txt,file:FILE});
-    $("out").innerHTML='<div class="res">📝 '+"الإجابة:\n\n"+esc(j.text)+'</div>'+(j.pdf_sent?'<p class="center hint">📄 أُرسل ملف PDF في محادثة البوت</p>':'')+'<div class="center sp"><button class="btn ghost" onclick="copyRes()">📋 نسخ</button></div>';
+    $("out").innerHTML='<div class="res">📝 '+"الإجابة:\n\n"+esc(j.text)+'</div>'+(t.id==="solve"?'<div class="center sp"><button class="btn purple" id="xs" onclick="moreSolve()">📖 شرح أكثر</button></div><div id="out2"></div>':"")+(j.pdf_sent?'<p class="center hint">📄 أُرسل ملف PDF في محادثة البوت</p>':'')+'<div class="center sp"><button class="btn ghost" onclick="copyRes()">📋 نسخ</button></div>';
   }catch(e){$("out").innerHTML='<div class="res">❌ '+esc(e.message)+'</div>'}
   b.disabled=false;b.textContent="✨ نفّذ";
+}
+async function moreSolve(){
+  const b=$("xs"),s=document.querySelector(".res").textContent;b.disabled=true;b.textContent="⏳ جاري الشرح...";
+  try{const j=await api("aichat",{op:"xs",solution:s});$("out2").innerHTML='<div class="res">📖 '+esc(j.text)+'</div>'}
+  catch(e){$("out2").innerHTML='<div class="res">❌ '+esc(e.message)+'</div>'}
+  b.disabled=false;b.textContent="📖 شرح أكثر";
 }
 function copyRes(){const t=document.querySelector(".res").textContent;navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast("✅ تم النسخ"))}
 async function startQuiz(){
