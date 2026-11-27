@@ -1551,8 +1551,9 @@ async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
     parts = [{"text": prompt}]
     size = doc.file_size or 0
     text, small, scanned = "", None, False
-    if size and size <= MAX_DL and not no_file:
-        data = await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
+    pr = W.get("probe", {}).get(doc.file_name or "") if size > MAX_DL else None
+    if size and (size <= MAX_DL or pr) and not no_file:
+        data = pr or await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
         try:
             text, small = await asyncio.wait_for(asyncio.to_thread(pdf_head, data), 20)
         except Exception:
@@ -3026,17 +3027,35 @@ async def wm_apply(ctx, chat, mid):
         backup_soon()
         await show(True)
 
+def wm_fix_disk(data):
+    """Watermark replacement for an in-memory PDF via the disk-based path (lower peak RAM). Returns bytes or None."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp(prefix="wmi_")
+    try:
+        s_, o_ = os.path.join(d, "i.pdf"), os.path.join(d, "o.pdf")
+        with open(s_, "wb") as f:
+            f.write(data)
+        st = big_process(s_, o_, None, wm_texts(), False, True)
+        if not st["changed"]:
+            return None
+        with open(o_, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        _trim_mem()
+
 async def wm_auto_ingest(ctx, rec):
     try:
         if store.get("wm_auto", "1") != "1" or int(rec.get("fsize", 0) or 0) > MAX_DL:
             return
         async with STAMP_LOCK:
             data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
-            res = await asyncio.wait_for(wm_fix_one(data, None), 300)
+            out = await asyncio.wait_for(asyncio.to_thread(wm_fix_disk, data), 300)
             del data
-            if not res:
+            if not out:
                 return
-            rec["fid"] = await store_doc(ctx.bot, res[0], rec.get("fname") or "handout.pdf")
+            rec["fid"] = await store_doc(ctx.bot, out, rec.get("fname") or "handout.pdf")
+            del out
             rec["wm_new"] = 1
     except Exception as e:
         log.warning("wm auto ingest failed: %r", e)
@@ -3823,6 +3842,17 @@ def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True):
                 log.warning("big wm page %s failed: %r", pi + 1, e)
             if pi % 25 == 24:
                 _trim_mem()
+    st["probe"] = None
+    try:   # first 3 pages as a small PDF so the bot can read subject/stage of a file it cannot download
+        pp = Pdf.new()
+        pp.pages.extend(pdf.pages[:3])
+        pb = io.BytesIO()
+        pp.save(pb)
+        pp.close()
+        if pb.tell() <= 7 * 1024 * 1024:
+            st["probe"] = pb.getvalue()
+    except Exception as e:
+        log.warning("probe failed: %r", e)
     if do_stamp and cfg:
         fp = Pdf.open(io.BytesIO(stamp_page_pdf(cfg["img_f"], fW, fH)))
         keep.append(fp)
@@ -3875,10 +3905,20 @@ async def watch_big(cid, mid):
             if not st["changed"] and not st["stamped"]:
                 return False
             W["pre"][fname] = time.time()
+            if st.get("probe"):
+                pr = W.setdefault("probe", {})
+                pr[fname] = st["probe"]
+                while len(pr) > 40:
+                    pr.pop(next(iter(pr)))
             await c.send_file(W["bot_ent"], dst, caption=(m.message or ""), force_document=True,
                               attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
                               mime_type="application/pdf")
-        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"])
+        _trim_mem()
+        try:
+            hwm = [l for l in open("/proc/self/status") if l.startswith(("VmHWM", "VmRSS"))]
+        except Exception:
+            hwm = []
+        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d | %s", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"], " ".join(x.split(":")[0] + x.split(":")[1].strip().replace(" ", "") for x in hwm))
         return True
     except Exception:
         log.exception("big process failed")
