@@ -3894,31 +3894,37 @@ async def watch_big(cid, mid):
     tmpd = tempfile.mkdtemp(prefix="big_")
     try:
         free = shutil.disk_usage(tmpd).free
-        if free < d.size * 2.6 + 60 * 1024 * 1024:
+        if free < d.size * 5.2 + 120 * 1024 * 1024:   # two files can be in flight
             log.warning("big file skipped: disk free %d MB, file %d MB", free >> 20, d.size >> 20)
             return False
         src, dst = os.path.join(tmpd, "in.pdf"), os.path.join(tmpd, "out.pdf")
-        async with STAMP_LOCK:
-            await asyncio.wait_for(c.download_media(m, file=src), 1800)
+        t0 = time.time()
+        await asyncio.wait_for(c.download_file(d, file=src, part_size_kb=512, file_size=d.size), 1800)   # 512KB parts: 4x fewer round trips
+        t1 = time.time()
+        async with STAMP_LOCK:   # only the CPU/RAM step is serialized, so one file can transfer while another is processed
+            t1 = time.time()
             st = await asyncio.wait_for(asyncio.to_thread(big_process, src, dst, cfg if do_stamp else None, wm_texts(), do_stamp, do_wm), 1500)
-            os.remove(src)
-            if not st["changed"] and not st["stamped"]:
-                return False
-            W["pre"][fname] = time.time()
-            if st.get("probe"):
-                pr = W.setdefault("probe", {})
-                pr[fname] = st["probe"]
-                while len(pr) > 40:
-                    pr.pop(next(iter(pr)))
-            await c.send_file(W["bot_ent"], dst, caption=(m.message or ""), force_document=True,
-                              attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
-                              mime_type="application/pdf")
+            t2 = time.time()
+        os.remove(src)
+        if not st["changed"] and not st["stamped"]:
+            return False
+        W["pre"][fname] = time.time()
+        if st.get("probe"):
+            pr = W.setdefault("probe", {})
+            pr[fname] = st["probe"]
+            while len(pr) > 40:
+                pr.pop(next(iter(pr)))
+        up = await c.upload_file(dst, part_size_kb=512, file_name=fname)
+        await c.send_file(W["bot_ent"], up, caption=(m.message or ""), force_document=True,
+                          attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
+                          mime_type="application/pdf")
+        t3 = time.time()
         _trim_mem()
         try:
             hwm = [l for l in open("/proc/self/status") if l.startswith(("VmHWM", "VmRSS"))]
         except Exception:
             hwm = []
-        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d | %s", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"], " ".join(x.split(":")[0] + x.split(":")[1].strip().replace(" ", "") for x in hwm))
+        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d | dl %ds proc %ds up %ds | %s", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"], t1 - t0, t2 - t1, t3 - t2, " ".join(x.split(":")[0] + x.split(":")[1].strip().replace(" ", "") for x in hwm))
         return True
     except Exception:
         log.exception("big process failed")
@@ -3935,14 +3941,20 @@ async def watch_forward(cid, ids):
         cfg = stamp_cfg()
         if (cfg and cfg["on"]) or store.get("wm_auto", "1") == "1":
             msgs = await c.get_messages(cid, ids=list(ids))
-            rest = []
+            rest, bigs = [], []
             for m in msgs:
                 d = getattr(m, "document", None)
                 if m and d and MAX_DL < d.size <= BIG_MAX:
-                    if not await watch_big(cid, m.id):
-                        rest.append(m.id)
+                    bigs.append(m.id)
                 else:
                     rest.append(m.id if m else None)
+            sem = asyncio.Semaphore(2)   # two files in flight: one transfers while the other is processed
+            async def _one(mid):
+                async with sem:
+                    return mid, await watch_big(cid, mid)
+            for mid, ok in await asyncio.gather(*[_one(i) for i in bigs]):
+                if not ok:
+                    rest.append(mid)
             ids = [i for i in rest if i]
             if not ids:
                 return True
@@ -4024,7 +4036,7 @@ async def bf_run(cid, resume=False):
             bf["sent"] = int(bf.get("sent", 0)) + len(batch)
             bf_put(bf)
             batch = []
-            await asyncio.sleep(25)
+            await asyncio.sleep(10)
             while bot_queue_len() > 25:
                 if bf_get().get("state") != "run":
                     break
@@ -4038,7 +4050,7 @@ async def bf_run(cid, resume=False):
             if not is_pdf_msg(m):
                 continue
             batch.append(m.id)
-            if len(batch) >= 15:
+            if len(batch) >= 6:
                 if not await flush():
                     return
         if bf_get().get("state") == "run":
