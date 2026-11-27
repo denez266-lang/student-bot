@@ -420,6 +420,54 @@ CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراق
 _CH = {"sem": None, "last": {}, "hour": {}}
 
 
+CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.7-flash"]
+
+
+async def chat_call(prompt):
+    """Fast chat call: fastest lite model first, 9 s per try, next key (not resting) on 429/timeout, then next model; 28 s budget."""
+    import httpx
+    n = len(all_keys())
+    plan = [m for m in CHAT_MODELS for _ in range(min(n, 3))][:6]
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "system_instruction": {"parts": [{"text": CHAT_SYS}]},
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1200}}
+    t0 = time.time()
+    async with httpx.AsyncClient(timeout=9) as c:
+        for m in plan:
+            if time.time() - t0 > 28:
+                break
+            k = gk()
+            try:
+                r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent", params={"key": k}, json=body)
+            except Exception:
+                log().warning("chat gemini timeout/network (%s)", m)
+                continue
+            if r.status_code == 200:
+                try:
+                    text = "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"] if not p.get("thought")).strip()
+                except Exception:
+                    text = ""
+                gk_ok(k)
+                if text:
+                    return text
+                continue
+            if r.status_code == 429:
+                gk_bad(k)
+            log().warning("chat gemini %s (%s)", r.status_code, m)
+    raise RuntimeError("الخدمة مزدحمة حالياً، حاول بعد دقيقة.")
+
+
+async def _typing(msg, stop):
+    while not stop.is_set():
+        try:
+            await msg.chat.send_action("typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), 4)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def chat_answer(uid, hist, text):
     """General AI chat (bot + Mini App). hist = [(role, text)], role u/a. Few calls per user, max 3 at once, so the archive/stage pass keep their quota."""
     LANE.set("chat")
@@ -439,7 +487,7 @@ async def chat_answer(uid, hist, text):
     prompt = ("سجل المحادثة السابق:\n" + "\n".join(lines) + "\n\n" if lines else "") + "رسالة الطالب الجديدة:\n" + text + "\n\nأجب عن الرسالة الجديدة فقط."
     try:
         async with _CH["sem"]:
-            out = await G["gemini"]([{"text": prompt}], system=CHAT_SYS, temperature=0.7, max_tokens=2000, fast=True)
+            out = await chat_call(prompt)
     except RuntimeError as e:
         m = str(e)
         if "مزدحمة" in m or "تعذر الاتصال" in m:
@@ -468,15 +516,15 @@ async def chat_msg(update, ctx):
         await msg.reply_text("أرسل رسالتك نصاً من فضلك 🙂 (الصور والملفات لها أدواتها في القائمة).", reply_markup=_end_kb())
         return
     hist = ctx.user_data.setdefault("chat", [])
-    try:
-        await msg.chat.send_action("typing")
-    except Exception:
-        pass
+    stop = asyncio.Event()
+    asyncio.create_task(_typing(msg, stop))
     try:
         out = await chat_answer(msg.from_user.id, hist, text)
     except RuntimeError as e:
         await msg.reply_text(str(e), reply_markup=_end_kb())
         return
+    finally:
+        stop.set()
     hist += [("u", text[:1500]), ("a", out)]
     del hist[:-16]
     G["store"].event(msg.from_user.id, "chat")
