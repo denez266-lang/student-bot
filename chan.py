@@ -177,184 +177,6 @@ async def fix_teachers():
     if fixed:
         G["backup_soon"]()
     log().info("teacher cleanup: %d entries cleared %s", len(fixed), fixed[:30])
-"""Handout channel: processed handouts are mirrored to a channel and served with copyMessage."""
-import asyncio, time, re
-from telegram.error import RetryAfter
-
-G = {}
-CH = {"id": 0}
-
-
-def hq(*a):
-    return G["hq"](*a)
-
-
-def log():
-    return G["log"]
-
-
-async def _retry(fn, *a, **k):
-    for i in range(3):
-        try:
-            return await fn(*a, **k)
-        except RetryAfter as e:
-            await asyncio.sleep(float(e.retry_after) + 1)
-    return await fn(*a, **k)
-
-
-async def resolve():
-    if CH["id"]:
-        return CH["id"]
-    st = G["store"]
-    v = st.get("chan_id", "")
-    if v.lstrip("-").isdigit():
-        CH["id"] = int(v)
-        return CH["id"]
-    ch = await G["APP"].bot.get_chat("@" + (st.get("chan_user", "") or "TalibIAi"))
-    CH["id"] = ch.id
-    st.set("chan_id", str(ch.id))
-    return CH["id"]
-
-
-async def send(bot, uid, hid):
-    """Copy the channel post to the student. False means: use the old file_id path."""
-    try:
-        r = hq("SELECT ch_msg, ch_fid, file_id FROM h_files WHERE id=?", (hid,))
-        if not r or not r[0][0] or r[0][0] < 1 or r[0][1] != r[0][2] or not CH["id"]:
-            return False
-        try:
-            await _retry(bot.copy_message, uid, CH["id"], r[0][0], protect_content=False)
-        except Exception as e:
-            s = str(e).lower()
-            if "not found" in s or "message to copy" in s or "can't be copied" in s:   # post deleted: forget it, the loop reposts it
-                hq("UPDATE h_files SET ch_msg=NULL, ch_fid=NULL WHERE id=?", (hid,), False)
-                log().warning("chan post gone for handout %s: %s", hid, e)
-                await G["watch_notify"](f"⚠️ منشور ملزمة #{hid} محذوف من القناة، سيُعاد نشره تلقائياً.")
-            else:
-                log().warning("chan copy failed for %s: %r", hid, e)
-            return False
-        return True
-    except Exception:
-        log().exception("chan send")
-        return False
-
-
-async def post_one(hid, title, fid, old):
-    bot = G["APP"].bot
-    cap = (G["hcaption"](hid) or f"📄 {title}")[:1024]
-    try:
-        m = await _retry(bot.send_document, CH["id"], fid, caption=cap, disable_notification=True)
-        hq("UPDATE h_files SET ch_msg=?, ch_fid=? WHERE id=?", (m.message_id, fid, hid), False)
-        if old and old > 0:
-            try:
-                await bot.delete_message(CH["id"], old)
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        log().warning("chan post failed %s: %r", hid, e)
-        hq("UPDATE h_files SET ch_msg=-1, ch_fid=? WHERE id=?", (fid, hid), False)   # do not retry until the file changes
-        return False
-
-
-async def test():
-    """One-time self-test of posting and copying, results go to the log and the admin chat."""
-    g, bot, W = G, G["APP"].bot, G["W"]
-    adm = g["ADMIN_BACKUP_CHAT"]
-    out, cleanup, ent = [], [], None
-    try:
-        cid = await resolve()
-        me = await bot.get_me()
-        mem = await bot.get_chat_member(cid, me.id)
-        out.append(f"bot role in channel: {mem.status}")
-        m = await bot.send_message(cid, "اختبار نشر البوت")
-        cleanup.append(("b", m.message_id))
-        out.append("bot posted text: OK")
-        c = W.get("client")
-        ent = None
-        if c:
-            try:
-                ent = await c.get_entity("@" + (g["store"].get("chan_user", "") or "TalibIAi"))
-                wm = await c.send_message(ent, "اختبار نشر الحساب المراقب")
-                cleanup.append(("w", wm.id))
-                out.append("watcher posted text: OK")
-            except Exception as e:
-                out.append(f"watcher post FAILED: {e!r}")
-        else:
-            out.append("watcher not connected")
-        r = hq("SELECT file_id, fsize, title FROM h_files WHERE kind='document' AND COALESCE(fsize,0)>0 ORDER BY fsize DESC LIMIT 1")
-        if r:
-            t0 = time.time()
-            bm = await bot.send_document(cid, r[0][0], caption="اختبار ملف كبير", disable_notification=True)
-            t1 = time.time()
-            cleanup.append(("b", bm.message_id))
-            cp = await bot.copy_message(adm, cid, bm.message_id, protect_content=False)
-            t2 = time.time()
-            cleanup.append(("a", cp.message_id))
-            out.append(f"big file {r[0][1] >> 20} MB: bot post by file_id {t1 - t0:.1f}s, bot copyMessage to admin chat {t2 - t1:.1f}s: OK")
-        if c and ent:
-            best = None
-            async for mm in c.iter_messages(W["bot_ent"], limit=300):
-                d = getattr(mm, "document", None)
-                if d and (not best or d.size > best.document.size):
-                    best = mm
-            if best:
-                t0 = time.time()
-                wp = await c.send_file(ent, best.document, caption="اختبار ملف الحساب المراقب")
-                t1 = time.time()
-                cleanup.append(("w", wp.id))
-                cp = await bot.copy_message(adm, cid, wp.id, protect_content=False)
-                t2 = time.time()
-                cleanup.append(("a", cp.message_id))
-                out.append(f"watcher post of {best.document.size >> 20} MB doc {t1 - t0:.1f}s, bot copy to admin chat {t2 - t1:.1f}s: OK")
-        ok = True
-    except Exception as e:
-        ok = False
-        out.append(f"TEST FAILED: {e!r}")
-    for k, i in cleanup:
-        try:
-            if k == "b":
-                await bot.delete_message(CH["id"], i)
-            elif k == "a":
-                await bot.delete_message(adm, i)
-            elif k == "w" and W.get("client"):
-                await W["client"].delete_messages(ent, [i])
-        except Exception:
-            pass
-    log().info("CHANTEST %s | %s", "PASS" if ok else "FAIL", " | ".join(out))
-    try:
-        await g["watch_notify"]("🧪 اختبار القناة: " + ("نجح" if ok else "فشل") + "\n" + "\n".join(out))
-    except Exception:
-        pass
-    return ok
-
-BAD_T = ("وزاري", "مسائل", "اسئل", "ملخص", "ملزم", "فصل", "دفتر", "واجب", "اختبار", "امتحان", "كلاميات", "للاستاذ", "pdf", "مراجع", "قطع", "نماذج", "اسقاط", "املاء", "قواعد", "انشاء",
-         "فيزياء", "كيمياء", "رياضيات", "احياء", "انكليزي", "انجليزي", "عربي", "اسلامي", "حاسوب", "جغرافي", "تاريخ", "علوم", "ادبي", "علمي", "اعدادي", "متوسط", "جزء", "المنهج", "كتاب")
-
-
-def teacher_ok(t):
-    """A real teacher name has no digits and no handout/subject/stage words (those mean the file name was taken for a name)."""
-    t = (t or "").strip()
-    if not t:
-        return False
-    if re.search(r"\d", t) or len(t.split()) > 4:
-        return False
-    n = G.get("nrm", lambda x: x)(t)
-    return not any(n.find(G.get("nrm", lambda x: x)(w)) >= 0 for w in BAD_T)
-
-
-async def fix_teachers():
-    """One pass: drop teacher values that are really file-name fragments (never invent a name) and fix the channel captions."""
-    fixed = []
-    for hid, title, teacher in hq("SELECT id, title, COALESCE(teacher,'') FROM h_files WHERE COALESCE(teacher,'')<>''"):
-        if not teacher_ok(teacher):
-            suf = f" - أ. {teacher}"
-            nt = title[: -len(suf)].strip() if title.endswith(suf) else title
-            hq("UPDATE h_files SET teacher='', title=? WHERE id=?", (nt, hid), False)
-            fixed.append(hid)
-    if fixed:
-        G["backup_soon"]()
-    log().info("teacher cleanup: %d entries cleared %s", len(fixed), fixed[:30])
     for hid in fixed:
         try:
             r = hq("SELECT ch_msg FROM h_files WHERE id=?", (hid,))
@@ -366,9 +188,26 @@ async def fix_teachers():
 
 
 async def fix_stages():
-    """One pass: re-sort entries whose stage is wrong, using the stage written in the file name or the PDF's first pages (only when exactly one stage is stated)."""
-    st = G["store"]
-    moved = []
+    """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
+    moved, renamed, unresolved = [], 0, 0
+    try:   # 1) canonical stage names; merge stages that are the same stage
+        for sid, sname in G["hq"]("SELECT id, name FROM h_stages ORDER BY id"):
+            cn = G["canon_stage"](sname)
+            if not cn or G["nrm"](cn) == G["nrm"](sname):
+                continue
+            target = G["get_stage"](cn, create=False)
+            if target is None:
+                hq("UPDATE h_stages SET name=? WHERE id=?", (cn, sid), False)
+                renamed += 1
+            elif target != sid:
+                for jid, jname in hq("SELECT id, name FROM h_subjects WHERE stage_id=?", (sid,)):
+                    nj = G["get_subject"](target, jname)
+                    hq("UPDATE h_files SET subject_id=? WHERE subject_id=?", (nj, jid), False)
+                    hq("DELETE FROM h_subjects WHERE id=?", (jid,), False)
+                hq("DELETE FROM h_stages WHERE id=?", (sid,), False)
+                renamed += 1
+    except Exception:
+        log().exception("stage names")
     checked = 0
     rows = hq("SELECT f.id, COALESCE(f.fname,''), COALESCE(f.title,''), f.file_id, COALESCE(f.fsize,0), j.name, s.name, f.subject_id FROM h_files f "
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
@@ -382,7 +221,9 @@ async def fix_stages():
                 new = G["stage_from_text"](text)
                 checked += 1
                 await asyncio.sleep(0.5)
-            if new and G["nrm"](new) != G["nrm"](stage):
+            if not new and not G["canon_stage"](stage):
+                unresolved += 1
+            if new and G["nrm"](new) != G["nrm"](G["canon_stage"](stage) or stage):
                 sid = G["get_stage"](new)
                 nj = G["get_subject"](sid, subj)
                 hq("UPDATE h_files SET subject_id=? WHERE id=?", (nj, hid), False)
@@ -394,9 +235,8 @@ async def fix_stages():
                     await asyncio.sleep(2)
         except Exception as e:
             log().warning("stage fix %s: %r", hid, e)
-    if moved:
-        G["backup_soon"]()
-    log().info("stage fix: %d entries moved, %d pdfs read: %s", len(moved), checked, moved[:40])
+    G["backup_soon"]()
+    log().info("stage fix: %d entries moved, %d stages renamed/merged, %d pdfs read, %d still without a valid stage: %s", len(moved), renamed, checked, unresolved, moved[:40])
 
 
 class NS_CTX:
@@ -413,7 +253,7 @@ def gkey(r):
     """Teacher first (all of one teacher's handouts together, any subject), then stage, subject, title. No teacher goes last."""
     n = G.get("nrm", lambda x: x)
     t = n(r[4])
-    return (0 if t else 1, t, r[6], r[5], r[1])
+    return (G["stage_rank"](r[6]), 0 if t else 1, t, r[5], r[1])
 
 
 async def regroup(update):
