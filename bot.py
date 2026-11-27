@@ -2621,7 +2621,8 @@ def wm_mask(im, full=False):
 # ---------------- Framed-label watermark replacement ----------------
 WM_KEYS = ("tl", "tr", "bl", "br")
 WM_NAMES = {"tl": "أعلى اليسار", "tr": "أعلى اليمين", "bl": "أسفل اليسار", "br": "أسفل اليمين"}
-WM_DEF = {"tl": "🎓 @TalibIQBot", "tr": "Talib AI | طالب AI 🎓", "bl": "📚 | @TalibIQBot", "br": "نسخة خاصة من 🎓 Talib AI | طالب AI"}
+WM_TG = "\ue000"   # the {tg} token: our own drawn paper-plane icon
+WM_DEF = {"tl": "{tg} @TalibIQBot", "tr": "{tg} Talib AI | @TalibIQBot", "bl": "{tg} @TalibIQBot", "br": "نسخة خاصة من {tg} Talib AI | @TalibIQBot"}
 WM_PH = "◆★●■▲▼♦♣♠♥"   # neutral placeholder symbols that stand in for emoji while the bidi order is computed
 WMJOB = {"run": False, "stop": False}
 WMST = {"tested": False}
@@ -2631,8 +2632,32 @@ _WMEMO = {}
 def wm_texts():
     return {k: (store.get("wm_t_" + k, "") or WM_DEF[k]) for k in WM_KEYS}
 
+def _wm_tg_icon():
+    from PIL import Image, ImageDraw
+    N = 640
+    im = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (N, N))
+    gd = ImageDraw.Draw(grad)
+    for y in range(N):
+        k = y / (N - 1)
+        gd.line([(0, y), (N, y)], fill=(int(42 - 13 * k), int(171 - 49 * k), int(238 - 15 * k), 255))
+    m = Image.new("L", (N, N), 0)
+    ImageDraw.Draw(m).ellipse([6, 6, N - 7, N - 7], fill=255)
+    im.paste(grad, (0, 0), m)
+    d = ImageDraw.Draw(im)
+    f = N / 100.0
+    P = lambda pts: [(x * f, y * f) for x, y in pts]
+    d.polygon(P([(76, 27), (21, 48.5), (38, 54.5), (45, 73.5), (53, 64.5), (66.5, 74)]), fill=(255, 255, 255, 255))
+    d.polygon(P([(76, 27), (40, 56), (46, 74), (49, 63)]), fill=(201, 218, 232, 255))
+    d.polygon(P([(76, 27), (38, 54.5), (50, 60)]), fill=(255, 255, 255, 255))
+    return im.resize((160, 160), Image.LANCZOS)
+
 def _wm_emoji_img(e):
     from PIL import Image
+    if e == WM_TG:
+        if e not in _WMEMO:
+            _WMEMO[e] = _wm_tg_icon()
+        return _WMEMO[e]
     if e not in _WMEMO:
         _WMEMO[e] = Image.open(io.BytesIO(base64.b64decode(WM_EMOJI[e]))).convert("RGBA")
     return _WMEMO[e]
@@ -2643,10 +2668,10 @@ def wm_label(text, w, h, S=4):
     import arabic_reshaper
     from bidi.algorithm import get_display
     W, H = int(round(w * S)), int(round(h * S))
-    t = "".join(c for c in (text or "") if c not in "\ufe0f\u200d")
+    t = "".join(c for c in (text or "").replace("{tg}", WM_TG).replace("{TG}", WM_TG) if c not in "\ufe0f\u200d")
     emos, s = [], ""
     for c in t:
-        if c in WM_EMOJI and len(emos) < len(WM_PH):
+        if (c in WM_EMOJI or c == WM_TG) and len(emos) < len(WM_PH):
             s += WM_PH[len(emos)]
             emos.append(c)
         elif ord(c) > 0x2000 and c not in WM_PH and not ("\u2010" <= c <= "\u206f"):
@@ -3029,7 +3054,7 @@ async def wm_cb(q, ctx, x, parts):
         k = parts[3] if len(parts) > 3 else ""
         if k in WM_KEYS:
             ctx.user_data["admin_wait"] = "kso:wx:" + k
-            await q.message.reply_text(f"✏️ اكتب النص الجديد لإطار «{WM_NAMES[k]}» (الحالي: {wm_texts()[k]}).\nيمكنك استخدام إيموجي مثل 🎓 📚 📌 📖 ✨ ⭐ 🔥 📝 🧪 💡. أرسل - لإرجاع النص الافتراضي. النص الطويل يُصغَّر تلقائياً ليناسب الإطار.")
+            await q.message.reply_text(f"✏️ اكتب النص الجديد لإطار «{WM_NAMES[k]}» (الحالي: {wm_texts()[k]}).\nيمكنك استخدام {{tg}} لشعار تيليجرام، وإيموجي مثل 🎓 📚 📌 📖 ✨ ⭐ 🔥 📝 🧪 💡. أرسل - لإرجاع النص الافتراضي. النص الطويل يُصغَّر تلقائياً ليناسب الإطار.")
         return True
     if x == "wt":
         ctx.user_data["admin_wait"] = "kso:wf"
