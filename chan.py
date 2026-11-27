@@ -237,6 +237,25 @@ async def infer_stage(text, page1, subj, title):
     return G['canon_stage'](str(d.get("stage") or "")), conf
 
 
+async def resume_archive():
+    """Resume the archive from the saved cursor after the stage pass paused it."""
+    try:
+        st_ = G["store"]
+        if st_.get("bf_paused_stage", "") != "1":
+            return
+        bf = G["bf_get"]()
+        if bf.get("state") == "pause" and bf.get("cid"):
+            bf["state"] = "run"
+            G["bf_put"](bf)
+            W = G["W"]
+            if not W.get("task") or W["task"].done():
+                W["task"] = asyncio.create_task(G["bf_run"](bf["cid"], resume=True))
+            log().info("archive resumed from cursor %s", bf.get("cursor"))
+        st_.set("bf_paused_stage", "0")
+    except Exception:
+        log().exception("resume archive")
+
+
 async def _gtry(fn, errs):
     """Gemini is often busy: retry with pauses; count a final failure."""
     for k in range(3):
@@ -604,13 +623,28 @@ def start(g):
         if G["store"].get("stage_v", "") != "1":
             await fix_stages()
             G["store"].set("stage_v", "1")
-        if G["store"].get("stage_v2", "") != "1":
-            for _try in range(3):
-                ne = await fix_stages(vision=True)
-                if ne < 15:
-                    G["store"].set("stage_v2", "1")
-                    break
-                log().warning("stage pass had %d Gemini failures, retrying in 20 min", ne)
-                await asyncio.sleep(1200)
+        st_ = G["store"]
+        if st_.get("stage_v2", "") != "1":
+            try:   # user: pause the archive while the stage pass runs (Gemini is shared), resume afterwards
+                bf = G["bf_get"]()
+                if bf.get("state") == "run":
+                    bf["state"] = "pause"
+                    G["bf_put"](bf)
+                    st_.set("bf_paused_stage", "1")
+                    log().info("archive paused for the stage pass (cursor %s)", bf.get("cursor"))
+            except Exception:
+                log().exception("pause archive")
+            try:
+                for _try in range(3):
+                    ne = await fix_stages(vision=True)
+                    if ne < 15:
+                        st_.set("stage_v2", "1")
+                        break
+                    log().warning("stage pass had %d Gemini failures, retrying in 20 min", ne)
+                    await asyncio.sleep(1200)
+            finally:
+                await resume_archive()
+        elif st_.get("bf_paused_stage", "") == "1":
+            await resume_archive()
     asyncio.create_task(_fix())
     asyncio.create_task(loop())
