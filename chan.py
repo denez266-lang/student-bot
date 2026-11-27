@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Handout channel: processed handouts are mirrored to a channel and served with copyMessage."""
-import asyncio, time
+import asyncio, time, re
 from telegram.error import RetryAfter
 
 G = {}
@@ -149,6 +149,42 @@ async def test():
     except Exception:
         pass
     return ok
+
+BAD_T = ("وزاري", "مسائل", "اسئل", "ملخص", "ملزم", "فصل", "دفتر", "واجب", "اختبار", "امتحان", "كلاميات", "للاستاذ", "pdf", "مراجع", "قطع", "نماذج", "اسقاط", "املاء", "قواعد", "انشاء",
+         "فيزياء", "كيمياء", "رياضيات", "احياء", "انكليزي", "انجليزي", "عربي", "اسلامي", "حاسوب", "جغرافي", "تاريخ", "علوم", "ادبي", "علمي", "اعدادي", "متوسط", "جزء", "المنهج", "كتاب")
+
+
+def teacher_ok(t):
+    """A real teacher name has no digits and no handout/subject/stage words (those mean the file name was taken for a name)."""
+    t = (t or "").strip()
+    if not t:
+        return False
+    if re.search(r"\d", t) or len(t.split()) > 4:
+        return False
+    n = G.get("nrm", lambda x: x)(t)
+    return not any(n.find(G.get("nrm", lambda x: x)(w)) >= 0 for w in BAD_T)
+
+
+async def fix_teachers():
+    """One pass: drop teacher values that are really file-name fragments (never invent a name) and fix the channel captions."""
+    fixed = []
+    for hid, title, teacher in hq("SELECT id, title, COALESCE(teacher,'') FROM h_files WHERE COALESCE(teacher,'')<>''"):
+        if not teacher_ok(teacher):
+            suf = f" - أ. {teacher}"
+            nt = title[: -len(suf)].strip() if title.endswith(suf) else title
+            hq("UPDATE h_files SET teacher='', title=? WHERE id=?", (nt, hid), False)
+            fixed.append(hid)
+    if fixed:
+        G["backup_soon"]()
+    log().info("teacher cleanup: %d entries cleared %s", len(fixed), fixed[:30])
+    for hid in fixed:
+        try:
+            r = hq("SELECT ch_msg FROM h_files WHERE id=?", (hid,))
+            if r and r[0][0] and r[0][0] > 0 and CH["id"]:
+                await _retry(G["APP"].bot.edit_message_caption, CH["id"], r[0][0], caption=(G["hcaption"](hid) or "")[:1024])
+                await asyncio.sleep(2)
+        except Exception as e:
+            log().warning("caption fix %s: %r", hid, e)
 
 
 PEND_SQL = ("SELECT f.id, f.title, f.file_id, COALESCE(f.ch_msg,0), COALESCE(f.teacher,''), COALESCE(j.name,''), COALESCE(s.name,''), f.added "
@@ -379,7 +415,22 @@ def start(g):
             log().info("plain copy mode ON: stamp_on=0 old_auto=0 wm_auto=0")
     except Exception:
         log().exception("plain mode")
+    try:   # user: keep Gemini classification (the "AI only when needed" archive shortcut was reading teachers from file names)
+        if G["store"].get("gem_v", "") != "1":
+            G["store"].set("gem_lite", "0")
+            G["store"].set("gem_v", "1")
+            log().info("gemini classification for every archive file (gem_lite=0)")
+    except Exception:
+        log().exception("gem")
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
+    async def _fix():
+        await asyncio.sleep(90)
+        try:
+            await resolve()
+        except Exception:
+            pass
+        await fix_teachers()
+    asyncio.create_task(_fix())
     asyncio.create_task(loop())
