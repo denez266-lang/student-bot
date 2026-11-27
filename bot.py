@@ -1025,7 +1025,7 @@ async def handout_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             if kind == "photo":
                 await q.message.reply_photo(fid, caption=hcaption(hid) or f"📄 {title}")
-            else:
+            elif not await chan_send(q.message.get_bot(), q.message.chat_id, hid):
                 await q.message.reply_document(fid, caption=hcaption(hid) or f"📄 {title}")
         except Exception:
             log.exception("send handout failed")
@@ -1127,7 +1127,7 @@ async def hadmin_cb(q, ctx, act):
         if r:
             if r[0][2] == "photo":
                 await q.message.reply_photo(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
-            else:
+            elif not await chan_send(q.message.get_bot(), q.message.chat_id, int(parts[1])):
                 await q.message.reply_document(r[0][1], caption=hcaption(int(parts[1])) or r[0][0])
     elif a == "hrt":
         ctx.user_data["admin_wait"] = f"hrnt:{parts[1]}"
@@ -1412,6 +1412,13 @@ def stage_for(stage):
         st = re.sub(r"\s*(الإعدادي|الاعدادي)", "", st)
     st = re.sub(r"^ال", "لل", st) if st.startswith("ال") else "ل" + st
     return st
+
+async def chan_send(bot, uid, hid):
+    try:
+        import chan
+        return await chan.send(bot, uid, hid)
+    except Exception:
+        return False
 
 def hcaption(hid):
     r = hq("SELECT f.title, f.teacher, f.year, f.quality, j.name, s.name FROM h_files f "
@@ -4665,6 +4672,11 @@ async def post_init(app):
     wm_db_init()
     asyncio.create_task(backup_loop())
     asyncio.create_task(keepalive())
+    try:
+        import chan
+        chan.start(globals())
+    except Exception:
+        log.exception("chan start")
     async def _ws():
         await asyncio.sleep(20)
         await watch_start()
@@ -4779,7 +4791,7 @@ class ApiH(tornado.web.RequestHandler):
             try:
                 if kind == "photo":
                     await tgapp.bot.send_photo(uid, fid, caption=hcaption(int(body.get("id", 0))) or f"📄 {title}")
-                else:
+                elif not await chan_send(tgapp.bot, uid, int(body.get("id", 0))):
                     await tgapp.bot.send_document(uid, fid, caption=hcaption(int(body.get("id", 0))) or f"📄 {title}")
             except Exception:
                 log.exception("webapp send failed")
