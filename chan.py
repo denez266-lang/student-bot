@@ -534,8 +534,8 @@ async def ds_one(parts, system, temperature=0.5, max_tokens=4000, model="deepsee
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}],
                 "thinking": {"type": "enabled" if solve else "disabled"}}
         if solve:
-            body["reasoning_effort"] = "low"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90 if solve else 25)) as c:
+            body["reasoning_effort"] = "high" if model == "deepseek-v4-pro" else "low"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(110 if solve else 25)) as c:
             r = await c.post("https://api.deepseek.com/chat/completions", headers={"Authorization": "Bearer " + key}, json=body)
         if r.status_code == 200:
             text = str(r.json()["choices"][0]["message"].get("content") or "").strip()
@@ -617,6 +617,99 @@ async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepse
 
 
 CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.7-flash"]
+
+
+_SV = {}
+_SOLVED = contextvars.ContextVar("SOLVED", default=None)
+
+
+def clean_math(t):
+    """Plain readable math: strip LaTeX leftovers and markdown."""
+    t = str(t or "")
+    for _ in range(3):
+        t = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", t)
+        t = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r"√(\1)", t)
+    for a, z in (("\\times", "×"), ("\\cdot", "·"), ("\\div", "÷"), ("\\pm", "±"), ("\\leq", "≤"), ("\\geq", "≥"), ("\\neq", "≠"),
+                 ("\\approx", "≈"), ("\\pi", "π"), ("\\theta", "θ"), ("\\Delta", "Δ"), ("\\rightarrow", "→"), ("\\to", "→"), ("\\left", ""), ("\\right", ""),
+                 ("\\(", ""), ("\\)", ""), ("\\[", ""), ("\\]", ""), ("\\,", " "), ("\\text", "")):
+        t = t.replace(a, z)
+    t = re.sub(r"\^2\b", "²", t)
+    t = re.sub(r"\^3\b", "³", t)
+    t = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", t)
+    t = re.sub(r"[$`]+|\*\*|^#{1,6}\s*", "", t, flags=re.M)
+    return t.strip()
+
+
+async def solve(parts):
+    """Photomath-style: Gemini reads the photo, the strongest text engine solves (thinking), Gemini is the fallback."""
+    g, ask, sys_ = G["gemini"], G["MODE_ASKS"].get("solve", ""), G["SOLVE_SYS"]
+    problem, rest = "", []
+    imgs = [p for p in parts if "inline_data" in p]
+    txt = [p for p in parts if "inline_data" not in p]
+    if imgs:
+        try:
+            problem = (await asyncio.wait_for(g(imgs + [{"text": "انسخ نص المسألة أو المسائل الموجودة في الصورة كما هي حرفياً، مع المعادلات والأرقام بدقة بنص عادي (بدون LaTeX). لا تحلّها. إذا كانت الصورة غير واضحة أو لا تحتوي مسألة فاكتب فقط: غير واضحة"}],
+                      system="أنت قارئ دقيق للمسائل المدرسية من الصور.", temperature=0, max_tokens=1500, fast=True), 50)).strip()
+        except Exception as e:
+            log().warning("solve ocr failed (%s), direct", type(e).__name__)
+            problem = ""
+        if problem and problem.replace(".", "").strip() == "غير واضحة":
+            return "📷 لم أستطع قراءة المسألة بوضوح. صوّرها مرة أخرى من قرب وبإضاءة جيدة، أو اكتبها نصاً."
+    if imgs and not problem:
+        out = await g(parts + [{"text": ask}], system=sys_, temperature=0.2, max_tokens=16384)
+        out = clean_math(out)
+        _SOLVED.set(("", out))
+        return out
+    full = ([{"text": "نص المسألة (مقروء من الصورة):\n" + problem}] if problem else []) + txt + [{"text": ask}]
+    out = await ds_call(full, sys_, 0.2, 16000, "deepseek-v4-pro" if ds_key() else "deepseek-flash")
+    if not out:
+        out = await g(full, system=sys_, temperature=0.2, max_tokens=16384)
+    out = clean_math(out)
+    _SOLVED.set((problem or "\n".join(str(p.get("text", "")) for p in txt)[:1500], out))
+    return out
+
+
+def solve_kb(mode, uid, kb):
+    v = _SOLVED.get()
+    if mode != "solve" or not v:
+        return kb
+    _SV[uid] = v
+    _SOLVED.set(None)
+    return G["M"]([[G["B"]("📖 شرح أكثر", callback_data="m:xs")]] + [list(r) for r in kb.inline_keyboard])
+
+
+async def explain_more(problem, solution):
+    p = ("المسألة:\n" + problem[:1500] + "\n\n" if problem else "") + "الحل السابق:\n" + solution[:6000] + (
+        "\n\nاشرح هذا الحل بتفصيل أكثر وبأسلوب مبسّط جداً لطالب لم يفهمه: وضّح سبب كل خطوة والقانون المستخدم، وأعطِ مثالاً صغيراً مشابهاً عند الحاجة، "
+        "وانبّه إلى أخطاء الطلاب الشائعة. اكتب بالعربية وبنص عادي (بدون LaTeX وبدون markdown) وبرموز يونيكود مقروءة، واختم بسطر: ✅ الخلاصة: ...")
+    parts = [{"text": p}]
+    out = await ds_call(parts, G["SOLVE_SYS"], 0.4, 8000, "deepseek-v4-pro" if ds_key() else "deepseek-flash")
+    if not out:
+        out = await G["gemini"](parts, system=G["SOLVE_SYS"], temperature=0.4, max_tokens=8192)
+    return clean_math(out)
+
+
+async def solve_more(q, ctx):
+    uid = q.from_user.id
+    v = _SV.get(uid)
+    if not v:
+        await q.message.reply_text("أرسل المسألة أولاً من زر حل مسألة رياضيات 🙂")
+        return
+    stop = asyncio.Event()
+    asyncio.create_task(_typing(q.message, stop))
+    try:
+        out = await explain_more(*v)
+    except Exception:
+        await q.message.reply_text("الخدمة مشغولة الآن، حاول بعد دقيقة.")
+        return
+    finally:
+        stop.set()
+    _SV[uid] = (v[0], v[1] + "\n\n" + out)
+    try:
+        await G["send_long"](q.message, out)
+    except Exception:
+        await q.message.reply_text(out[:3900])
+    await q.message.reply_text("هل تريد شيئاً آخر؟", reply_markup=G["M"]([[G["B"]("📖 شرح أكثر", callback_data="m:xs")], [G["B"]("🏠 القائمة", callback_data="m:menu")]]))
 
 
 ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("gem", "✨ جيميني")]
@@ -771,6 +864,8 @@ async def chat_msg(update, ctx):
 
 
 async def chat_api(uid, body):
+    if body.get("op") == "xs":
+        return {"text": await explain_more("", str(body.get("solution", ""))[:6000])}
     if body.get("op") == "eng":
         ids = [e[0] for e in engines()]
         if body.get("set") in ids:
