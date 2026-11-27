@@ -1420,6 +1420,13 @@ async def chan_send(bot, uid, hid):
     except Exception:
         return False
 
+def _tok(t):
+    try:
+        import chan
+        return chan.teacher_ok(t)
+    except Exception:
+        return True
+
 def _fast():
     import chan
     return chan
@@ -1628,7 +1635,7 @@ def guess_from_name(name, caption):
             continue
         if any(kw in pn for kw, _ in SUBJ_KW) or any(nrm(o) in pn for o in ORD) or "ملزم" in pn or "متوسط" in pn or "اعدادي" in pn:
             continue
-        if len(part.split()) <= 4:
+        if len(part.split()) <= 4 and _tok(part):
             g["teacher"] = part.strip()
             break
     year = re.search(r"(20\d\d)", stem(name))
@@ -3495,6 +3502,7 @@ async def bulk_edit(ctx, chat, st, final=False):
             log.warning("bulk edit: %r", e)
 
 async def bulk_save(rec, ctx):
+    rec["teacher"] = rec.get("teacher") if _tok(rec.get("teacher")) else ""
     fn_, fs_ = rec.get("fname") or "", int(rec.get("fsize", 0) or 0)
     if fn_ and fs_ > MAX_DL and fn_ in W.get("pre", {}):   # a big file reprocessed by the watcher: replace the old unprocessed entry, never duplicate
         if hq("SELECT 1 FROM h_files WHERE fname=? AND COALESCE(stamped,0)=1 AND COALESCE(fsize,0)>?", (fn_, MAX_DL)):
