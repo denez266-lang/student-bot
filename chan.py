@@ -241,10 +241,9 @@ async def resume_archive():
     """Resume the archive from the saved cursor after the stage pass paused it."""
     try:
         st_ = G["store"]
-        if st_.get("bf_paused_stage", "") != "1":
-            return
         bf = G["bf_get"]()
-        if bf.get("state") == "pause" and bf.get("cid"):
+        log().info("archive state: %s cursor %s sent %s", bf.get("state"), bf.get("cursor"), bf.get("sent"))
+        if bf.get("state") in ("pause", "error") and bf.get("cid"):   # user: start/resume the archive by itself, no button
             bf["state"] = "run"
             G["bf_put"](bf)
             W = G["W"]
@@ -631,6 +630,7 @@ def start(g):
         if st_.get("stage_v2", "") != "1":
             try:   # user: pause the archive while the stage pass runs (Gemini is shared), resume afterwards
                 bf = G["bf_get"]()
+                log().info("archive state at stage pass start: %s cursor %s sent %s", bf.get("state"), bf.get("cursor"), bf.get("sent"))
                 if bf.get("state") == "run":
                     bf["state"] = "pause"
                     G["bf_put"](bf)
@@ -648,7 +648,7 @@ def start(g):
                     await asyncio.sleep(1200)
             finally:
                 await resume_archive()
-        elif st_.get("bf_paused_stage", "") == "1":
+        else:
             await resume_archive()
     asyncio.create_task(_fix())
     asyncio.create_task(loop())
