@@ -216,6 +216,27 @@ async def vision_stage(page1):
     subj = re.sub(r"^(مادة|ماده)\s+", "", subj)
     return G['canon_stage'](str(d.get("stage") or "")), subj
 
+async def infer_stage(text, page1, subj, title):
+    """Gemini judges the stage from the content/level when it is not written. Returns (canonical stage or "", confidence 0-100)."""
+    prompt = ("حدّد المرحلة الدراسية العراقية لهذه الملزمة من محتواها ومستواها ومواضيعها حسب المنهج العراقي، علماً أن المرحلة غير مكتوبة صراحةً. "
+              "المراحل الصالحة فقط: الأول المتوسط، الثاني المتوسط، الثالث المتوسط، الرابع الإعدادي، الخامس الإعدادي، السادس الإعدادي (مع العلمي أو الأدبي إن أمكن). "
+              f"المادة: {subj or '-'}. العنوان: {title or '-'}.\n"
+              'أجب JSON فقط: {"stage":"","confidence":0,"reason":""}. confidence رقم من 0 إلى 100، ولا تعطِ رقماً عالياً (85 فأكثر) إلا إذا كانت المواضيع تخص مرحلة واحدة بوضوح.')
+    parts = [{"text": prompt}]
+    if text:
+        parts.append({"text": "نص أول صفحات الملف:\n" + text[:3000]})
+    if page1:
+        parts.append({"inline_data": {"mime_type": "application/pdf", "data": __import__('base64').b64encode(page1).decode()}})
+    out = await asyncio.wait_for(G['gemini'](parts, system=G['ING_SYS'], temperature=0.0, max_tokens=300, fast=True), 45)
+    m = re.search(r"\{.*\}", out, re.S)
+    d = __import__('json').loads(m.group(0)) if m else {}
+    try:
+        conf = int(float(d.get("confidence") or 0))
+    except Exception:
+        conf = 0
+    return G['canon_stage'](str(d.get("stage") or "")), conf
+
+
 async def fix_stages(vision=False):
     """One pass: canonical stage names (merge duplicates), then re-sort entries by the stage written in the file name or first PDF pages."""
     moved, renamed, unresolved = [], 0, 0
@@ -242,7 +263,7 @@ async def fix_stages(vision=False):
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
     if vision:
         rows = sorted(rows, key=lambda r: 0 if not G["canon_stage"](r[6]) else 1)
-    unres_ids = []
+    unres_ids, review, inferred = [], [], []
     for hid, fname, title, fid, fsize, subj, stage, jid in rows:
         try:
             new = G["stage_from_text"](fname)
@@ -258,6 +279,20 @@ async def fix_stages(vision=False):
                     except Exception as e:
                         log().warning("vision %s: %r", hid, e)
                     await asyncio.sleep(2)
+                    if not new:   # not written anywhere: infer from content, only high confidence is applied
+                        try:
+                            ist, conf = await infer_stage(text, await asyncio.to_thread(page1_pdf, data), subj, title)
+                            cur0 = G["canon_stage"](stage)
+                            if ist and conf >= 85:
+                                new = ist
+                                inferred.append((hid, title[:30], stage, ist, conf))
+                            elif ist and G["nrm"](ist) != G["nrm"](cur0) and not G["nrm"](cur0).startswith(G["nrm"](ist)):
+                                review.append((hid, title[:40], stage, ist, conf))
+                            elif not ist and not cur0:
+                                review.append((hid, title[:40], stage, "", conf))
+                        except Exception as e:
+                            log().warning("infer %s: %r", hid, e)
+                        await asyncio.sleep(2)
                 del data
                 checked += 1
                 await asyncio.sleep(0.5)
@@ -277,7 +312,13 @@ async def fix_stages(vision=False):
                     await asyncio.sleep(2)
         except Exception as e:
             log().warning("stage fix %s: %r", hid, e)
+    if vision:
+        try:
+            G["store"].set("stage_review", __import__('json').dumps(review, ensure_ascii=False))
+        except Exception:
+            log().exception("stage_review save")
     G["backup_soon"]()
+    log().info("stage inference: %d applied (conf>=85) sample %s | %d low-confidence to review", len(inferred), inferred[:5], len(review))
     log().info("stage fix: %d entries moved, %d stages renamed/merged, %d pdfs read, %d still without a valid stage: %s | moved: %s", len(moved), renamed, checked, unresolved, unres_ids[:20], moved[:40])
 
 
@@ -480,6 +521,20 @@ def unstamped():
     return hq("SELECT id, title, COALESCE(fsize,0), COALESCE(fname,'') FROM h_files WHERE kind='document' AND COALESCE(stamped,0)=0 ORDER BY id")
 
 
+async def stagereview(update, ctx):
+    if not G["is_admin"](update):
+        return
+    try:
+        rows = __import__('json').loads(G["store"].get("stage_review", "") or "[]")
+    except Exception:
+        rows = []
+    if not rows:
+        await update.message.reply_text("لا توجد ملازم بانتظار المراجعة.")
+        return
+    lines = [f"{r[0]} | {r[1]} | الحالي: {r[2]} | مقترح: {r[3] or '-'} ({r[4]}%)" for r in rows[:40]]
+    await update.message.reply_text(f"ملازم مرحلتها غير مؤكدة ({len(rows)}):\n" + "\n".join(lines))
+
+
 async def chanlist(update, ctx):
     if not G["is_admin"](update):
         return
@@ -523,6 +578,7 @@ def start(g):
         log().exception("gem")
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
+    G["APP"].add_handler(CommandHandler("stagereview", stagereview), group=-1)
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
     async def _fix():
         await asyncio.sleep(90)
