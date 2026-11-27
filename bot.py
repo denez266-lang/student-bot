@@ -328,6 +328,7 @@ def menu_markup(adm=False):
     if base:
         rows = [[B("🌐 افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app"))]] + rows
     return M(tool_buttons("main") + [
+        [B("💬 الدردشة مع الذكاء الاصطناعي", callback_data="m:aichat")],
         [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
     ] + rows)
@@ -445,6 +446,9 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "m:menu":
         ctx.user_data.clear()
         await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+        return
+    if data == "m:aichat":
+        await _fast().chat_cb(q, ctx)
         return
     if data == "m:more":
         ctx.user_data.clear()
@@ -734,6 +738,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await gate_ok(update, ctx):
         return
     mode = ctx.user_data.get("mode")
+    if mode == "aichat":
+        await _fast().chat_msg(update, ctx)
+        return
 
     if mode == "hsearch":
         text = (msg.text or "").strip()
@@ -4878,6 +4885,11 @@ class ApiH(tornado.web.RequestHandler):
             store.q("UPDATE h_files SET downloads=downloads+1 WHERE id=?", (int(body.get("id")),))
             store.event(uid, "handout")
             return self.write({"ok": True})
+        if name == "aichat":
+            try:
+                return self.write({"text": await _fast().chat_api(uid, body)})
+            except RuntimeError as e:
+                return self.fail(429, str(e))
         if name == "timer":
             mins = 45 if int(body.get("mins", 25)) >= 45 else 25
             store.event(uid, "timer")
