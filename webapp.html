@@ -236,9 +236,11 @@ function ct(n,ts){return rw(n,ts).reduce((a,o)=>a+o.s.subjects.reduce((b,j)=>b+j
 function pg(n,t){const r=rw(n,[t]);if(r.length)pick(r[0].i)}
 function gp(n){if(n<3&&rw(n,[0]).length)pg(n,0);else{sel.g=n;sel.tr=null;render()}}
 function bk(){const s=LIB[sel.stage];sel.stage=null;sel.g=s.n<3?null:s.n;sel.tr=(s.n>3&&s.n<9&&(s.t>=3||(s.t===1&&ct(s.n,[3,4])>0)))?1:null}
-let CHT=[],CHB=false,CHE="";
+let CHT=[],CHB=false,CHE="",CHG=null;
+async function chatEng(s){try{CHG=await api("aichat",s?{op:"eng",set:s}:{op:"eng"})}catch(e){} render()}
 function renderChat(v){
-  v.innerHTML=`<div class="top"><h1>💬 الدردشة مع الذكاء الاصطناعي</h1></div><div class="card hint">💡 اسألني أي شيء وسأجيبك باختصار. أتذكر ما قلناه في هذه المحادثة.</div><div id="cmsgs">${CHT.map(m=>`<div class="card"${m.r==="u"?' style="background:var(--sec)"':''}><b>${m.r==="u"?"🧑 أنت":"🤖 المساعد"}</b><div style="white-space:pre-wrap;margin-top:4px">${esc(m.t)}</div></div>`).join("")}${CHB?'<div class="empty">⏳ يكتب...</div>':""}${CHE?`<div class="card" style="color:#e55">${esc(CHE)}</div>`:""}</div><textarea class="inp" id="cin" placeholder="✏️ اكتب رسالتك..." style="min-height:60px"></textarea><button class="btn purple" onclick="chatSend()">📨 إرسال</button><button class="btn" onclick="chatEnd()">🛑 إنهاء الدردشة</button>`;
+  if(CHG===null){CHG=false;chatEng()}
+  v.innerHTML=`<div class="top"><h1>💬 الدردشة مع الذكاء الاصطناعي</h1></div><div class="card hint">💡 اسألني أي شيء وسأجيبك باختصار. أتذكر ما قلناه في هذه المحادثة.</div>${CHG&&CHG.list.length>1?`<div class="card">المحرك: ${CHG.list.map(x=>`<button class="btn${x.id===CHG.eng?" purple":""}" style="display:inline-block;width:auto;margin:3px;padding:6px 10px" onclick="chatEng('${x.id}')">${esc(x.t)}</button>`).join("")}</div>`:""}<div id="cmsgs">${CHT.map(m=>`<div class="card"${m.r==="u"?' style="background:var(--sec)"':''}><b>${m.r==="u"?"🧑 أنت":"🤖 المساعد"}</b><div style="white-space:pre-wrap;margin-top:4px">${esc(m.t)}</div></div>`).join("")}${CHB?'<div class="empty">⏳ يكتب...</div>':""}${CHE?`<div class="card" style="color:#e55">${esc(CHE)}</div>`:""}</div><textarea class="inp" id="cin" placeholder="✏️ اكتب رسالتك..." style="min-height:60px"></textarea><button class="btn purple" onclick="chatSend()">📨 إرسال</button><button class="btn" onclick="chatEnd()">🛑 إنهاء الدردشة</button>`;
 }
 async function chatSend(){
   const el=$("cin"); const t=(el&&el.value||"").trim(); if(!t||CHB)return;
@@ -246,7 +248,7 @@ async function chatSend(){
   try{ const j=await api("aichat",{text:t,history:h}); CHT.push({r:"a",t:j.text}); CHB=false; render() }
   catch(e){ CHT.pop(); CHB=false; CHE=e.message; render(); const x=$("cin"); if(x)x.value=t }
 }
-function chatEnd(){CHT=[];CHB=false;CHE="";go("home")}
+function chatEnd(){CHG=null;CHT=[];CHB=false;CHE="";go("home")}
 function pick(i){sel={stage:i,subject:null,teacher:null,type:null,search:false};render()}
 function pickSub(i){sel.subject=i;sel.teacher=null;sel.type=null;render()}
 function pickT(i){sel.teacher=i;sel.type=null;render()}
