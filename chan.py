@@ -151,6 +151,52 @@ async def test():
     return ok
 
 
+PEND_SQL = ("SELECT f.id, f.title, f.file_id, COALESCE(f.ch_msg,0), COALESCE(f.teacher,''), COALESCE(j.name,''), COALESCE(s.name,''), f.added "
+            "FROM h_files f LEFT JOIN h_subjects j ON f.subject_id=j.id LEFT JOIN h_stages s ON j.stage_id=s.id "
+            "WHERE f.kind='document' AND COALESCE(f.file_id,'')<>''")
+
+
+def gkey(r):
+    """Teacher first (all of one teacher's handouts together, any subject), then stage, subject, title. No teacher goes last."""
+    n = G.get("nrm", lambda x: x)
+    t = n(r[4])
+    return (0 if t else 1, t, r[6], r[5], r[1])
+
+
+async def regroup(update):
+    """Admin: repost every handout already in the channel in teacher order (new post first, then the old one is deleted)."""
+    CH["busy"] = True
+    n = 0
+    try:
+        rows = hq(PEND_SQL + " AND f.ch_msg>0")
+        for r in sorted(rows, key=gkey):
+            if await post_one(r[0], r[1], r[2], r[3]):
+                n += 1
+            await asyncio.sleep(4)
+        G["backup_soon"]()
+        await update.message.reply_text(f"✅ انتهت إعادة ترتيب القناة حسب المدرس: {n} ملزمة.")
+    except Exception as e:
+        log().exception("regroup")
+        await update.message.reply_text(f"⚠️ توقفت إعادة الترتيب: {e!r}")
+    finally:
+        CH["busy"] = False
+
+
+async def chanregroup(update, ctx):
+    if not G["is_admin"](update):
+        return
+    if (ctx.args or [""])[0] != "yes":
+        n = hq("SELECT COUNT(*) FROM h_files WHERE ch_msg>0")[0][0]
+        await update.message.reply_text(f"سأعيد نشر {n} ملزمة بالقناة مرتبة حسب المدرس وأحذف المنشورات القديمة (حوالي {n * 4 // 60 + 1} دقيقة). للتأكيد: /chanregroup yes")
+        return
+    if CH.get("busy"):
+        await update.message.reply_text("إعادة الترتيب شغالة الآن.")
+        return
+    await update.message.reply_text("بدأت إعادة الترتيب. أخبرك عند الانتهاء.")
+    asyncio.create_task(regroup(update))
+
+
+
 async def loop():
     st = G["store"]
     await asyncio.sleep(40)
@@ -170,17 +216,29 @@ async def loop():
                 CH["nu"] = len(u)
                 log().warning("CHAN not posted (unstamped): %d %s", len(u), " | ".join(x[3] or x[1] for x in u[:15]))
             mode = st.get("chan_mode", "")
-            if mode in ("new", "all") and await resolve():
+            if mode in ("new", "all") and not CH.get("busy") and await resolve():
                 since = float(st.get("chan_since", "0") or 0)
-                sql = ("SELECT id, title, file_id, COALESCE(ch_msg,0) FROM h_files WHERE kind='document' AND COALESCE(file_id,'')<>'' AND (COALESCE(stamped,0)=1 OR ?=0) AND "
-                       "((ch_msg IS NULL AND (? = 'all' OR added>=?)) OR (ch_msg IS NOT NULL AND COALESCE(ch_fid,'')<>file_id)) ORDER BY id LIMIT 3")
-                rows = hq(sql, (1 if st.on("stamp_on") else 0, mode, since))
-                for hid, title, fid, old in rows:
-                    await post_one(hid, title, fid, old)
+                gate = 1 if st.on("stamp_on") else 0
+                # entries whose file changed (redo/undo): repost at once
+                for hid, title, fid, old in hq("SELECT id, title, file_id, ch_msg FROM h_files WHERE kind='document' AND ch_msg IS NOT NULL AND COALESCE(ch_fid,'')<>file_id AND COALESCE(file_id,'')<>'' LIMIT 3"):
+                    await post_one(hid, title, fid, old if old and old > 0 else 0)
                     await asyncio.sleep(4)
-                if rows:
-                    G["backup_soon"]()
-                    continue
+                pend = hq(PEND_SQL + " AND f.ch_msg IS NULL AND (? = 'all' OR f.added>=?) AND (COALESCE(f.stamped,0)=1 OR ?=0)", (mode, since, gate))
+                if pend:
+                    try:
+                        running = G["bf_get"]().get("state") == "run"
+                    except Exception:
+                        running = False
+                    oldest = min(r[7] or time.time() for r in pend)
+                    # group by teacher: wait for more files while the archive runs, then post teacher by teacher
+                    if st.get("chan_group", "1") != "1" or not running or len(pend) >= 150 or time.time() - oldest >= 5400:
+                        for r in sorted(pend, key=gkey):
+                            if CH.get("busy"):
+                                break
+                            await post_one(r[0], r[1], r[2], 0)
+                            await asyncio.sleep(4)
+                        G["backup_soon"]()
+                        continue
         except Exception:
             log().exception("chan loop")
         await asyncio.sleep(20)
@@ -323,4 +381,5 @@ def start(g):
         log().exception("plain mode")
     from telegram.ext import CommandHandler
     G["APP"].add_handler(CommandHandler("chanlist", chanlist), group=-1)
+    G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
     asyncio.create_task(loop())
