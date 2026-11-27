@@ -1354,6 +1354,8 @@ async def guided_view(q, step, S, T, C):
         return
     spec = {0: ("sk", "subject", "📖", "اختر المادة"), 1: ("gk", "stage", "🎓", "اختر المرحلة"), 2: ("tk", "teacher", "👨‍🏫", "اختر الأستاذ")}[step]
     opts = uniq_options(files, spec[0], spec[1])
+    if spec[1] == "stage":
+        opts = sorted(opts, key=lambda o: stage_rank(o[1]))
     def nxt(val):
         ch = [S, T, C]
         ch[step] = val
@@ -1570,7 +1572,7 @@ async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
                    "تجاهل الروابط والإعلانات وأسماء القنوات. اكتب المرحلة بصيغتها الكاملة مثل السادس الإعدادي العلمي حتى لو كُتبت مختصرة (مثل: سادس علمي).")
     parts = [{"text": prompt}]
     size = doc.file_size or 0
-    text, small, scanned = "", None, False
+    text, small, scanned, page1 = "", None, False, None
     pr = W.get("probe", {}).get(doc.file_name or "") if size > MAX_DL else None
     if size and (size <= MAX_DL or pr) and not no_file:
         data = pr or await asyncio.wait_for(fetch_file(ctx, doc.file_id), 30)
@@ -1579,17 +1581,31 @@ async def analyze_pdf(ctx, doc, caption, bulk=False, no_file=False):
         except Exception:
             log.exception("pdf_head failed")
             text, small = "", None
-        del data
         scanned = not text
         stage_txt = stage_from_text(text)
+        if not stage_txt and not stage_list(f"{doc.file_name or ''} {caption or ''}"):
+            try:
+                page1 = await asyncio.to_thread(_fast().page1_pdf, data)
+            except Exception:
+                page1 = None
         if text:
             parts.append({"text": "نص أول صفحات الملف:\n" + text})
         elif small:
             parts.append({"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(small).decode()}})
+        del data
     out = await asyncio.wait_for(gemini(parts, system=ING_SYS, temperature=0.1, max_tokens=1024, fast=True), 45)
     m = re.search(r"\{.*\}", out, re.S)
     d = json.loads(m.group(0)) if m else {}
     res = {k: str(d.get(k) or "").strip() for k in ("stage", "subject", "teacher", "title", "type", "year", "quality")}
+    if page1:
+        try:
+            vs, vj = await _fast().vision_stage(page1)
+            if vs:
+                res["stage"] = vs
+            if vj and not res["subject"]:
+                res["subject"] = vj
+        except Exception as e:
+            log.warning("vision stage failed: %r", e)
     res["stage"] = canon_stage(res["stage"])   # invalid stage (e.g. "first preparatory") -> empty
     if text and stage_from_text(text):   # the stage written inside the PDF wins
         res["stage"] = stage_from_text(text)
@@ -1614,7 +1630,7 @@ ORD_W = {"اول": "الأول", "ثاني": "الثاني", "ثالث": "الث
 def stage_list(text):
     """Stages explicitly written in a text as '<ordinal> <stage word>' (e.g. الخامس العلمي). Distinct, in order."""
     s = re.sub(r"[\u064B-\u065F\u0640]", "", text or "").translate(str.maketrans("أإآىة", "ااايه")).lower()
-    w = [re.sub(r"^ال", "", t) for t in re.findall(r"[\u0621-\u063A\u0641-\u064A]+", s)]
+    w = [re.sub(r"^(ال|لل)", "", t) for t in re.findall(r"[\u0621-\u063A\u0641-\u064A]+", s)]
     out = []
     for i, t in enumerate(w[:-1]):
         o = ORD_W.get(t)
