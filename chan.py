@@ -199,7 +199,7 @@ def page1_pdf(data):
     w.add_page(r.pages[0])
     buf = __import__('io').BytesIO()
     w.write(buf)
-    return buf.getvalue() if buf.tell() <= 7 * 1024 * 1024 else None
+    return buf.getvalue() if buf.tell() <= 3 * 1024 * 1024 else None
 
 async def vision_stage(page1):
     """Gemini reads the header ovals/graphics on page 1 (stage + subject). Returns (canonical stage or "", subject)."""
@@ -256,14 +256,17 @@ async def resume_archive():
         log().exception("resume archive")
 
 
-async def _gtry(fn, errs):
+async def _gtry(fn, errs, streak):
     """Gemini is often busy: retry with pauses; count a final failure."""
     for k in range(3):
         try:
-            return await fn()
+            r = await fn()
+            streak.clear()
+            return r
         except Exception as e:
             if k == 2:
                 errs.append(repr(e)[:60])
+                streak.append(1)
                 raise
             await asyncio.sleep(30)
 
@@ -294,9 +297,10 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
               "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.kind='document'")
     if vision:
         rows = sorted(rows, key=lambda r: 0 if not G["canon_stage"](r[6]) else 1)
-    unres_ids, review, inferred, errs = [], [], [], []
+    unres_ids, review, inferred, errs, streak = [], [], [], [], []
     for hid, fname, title, fid, fsize, subj, stage, jid in rows:
-        if len(errs) >= 30:
+        if len(streak) >= 12:   # Gemini really down: stop (retried later)
+            errs.extend(["abort"] * 1000)
             break
         try:
             new = G["stage_from_text"](fname)
@@ -307,7 +311,7 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
                 p1 = await asyncio.to_thread(page1_pdf, data) if vision else None
                 if vision and (not new or (new.endswith("العلمي") and ("الخامس" in new or "السادس" in new))):
                     try:
-                        vs, _vj = await _gtry(lambda: vision_stage(p1), errs)
+                        vs, _vj = await _gtry(lambda: vision_stage(p1), errs, streak)
                         if vs and (not new or vs.startswith(new)):
                             new = vs
                     except Exception as e:
@@ -315,7 +319,7 @@ async def fix_stages(vision=False):  # returns the number of Gemini failures
                     await asyncio.sleep(6)
                     if not new:   # not written anywhere: infer from content, only high confidence is applied
                         try:
-                            ist, conf = await _gtry(lambda: infer_stage(text, p1, subj, title), errs)
+                            ist, conf = await _gtry(lambda: infer_stage(text, p1, subj, title), errs, streak)
                             cur0 = G["canon_stage"](stage)
                             if ist and conf >= 85:
                                 new = ist
@@ -637,7 +641,7 @@ def start(g):
             try:
                 for _try in range(3):
                     ne = await fix_stages(vision=True)
-                    if ne < 15:
+                    if ne < 60:
                         st_.set("stage_v2", "1")
                         break
                     log().warning("stage pass had %d Gemini failures, retrying in 20 min", ne)
