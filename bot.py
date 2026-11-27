@@ -1420,6 +1420,10 @@ async def chan_send(bot, uid, hid):
     except Exception:
         return False
 
+def _fast():
+    import chan
+    return chan
+
 def hcaption(hid):
     r = hq("SELECT f.title, f.teacher, f.year, f.quality, j.name, s.name FROM h_files f "
            "JOIN h_subjects j ON f.subject_id=j.id JOIN h_stages s ON j.stage_id=s.id WHERE f.id=?", (hid,))
@@ -3957,7 +3961,7 @@ async def watch_big(cid, mid):
             return False
         src, dst = os.path.join(tmpd, "in.pdf"), os.path.join(tmpd, "out.pdf")
         t0 = time.time()
-        await asyncio.wait_for(c.download_file(d, file=src, part_size_kb=512, file_size=d.size), 1800)   # 512KB parts: 4x fewer round trips
+        await asyncio.wait_for(_fast().fast_dl(c, d, src), 1800)   # 512KB parts: 4x fewer round trips
         t1 = time.time()
         drop = (False, False)
         if store.get("old_auto", "1") == "1":
@@ -3980,7 +3984,7 @@ async def watch_big(cid, mid):
             pr[fname] = st["probe"]
             while len(pr) > 40:
                 pr.pop(next(iter(pr)))
-        up = await c.upload_file(dst, part_size_kb=512, file_name=fname)
+        up = await _fast().fast_up(c, dst, fname)
         await c.send_file(W["bot_ent"], up, caption=(m.message or ""), force_document=True,
                           attributes=[a for a in (d.attributes or []) if getattr(a, "file_name", None)],
                           mime_type="application/pdf")
