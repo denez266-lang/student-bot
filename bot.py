@@ -2602,8 +2602,8 @@ WM_EMOJI = {
     "💡": "iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAMAAAC5zwKfAAAAkFBMVEUAAAD+1gL+/JH/7wBimqsveImFssT86V7+++jfmQWPsKizaQT/1QD/1QB6rcv/fwCUz97/sgBDQ0SxtnM4Xmc5gZN2dnZyr7fEeQAA////AAALZ2dgmKn////Mpkx7sctgmaqSpq+BrL6HsckzfaYtd4dAQUF///+DrsAAAP8uYW0udoczmZlXFRJCPT1BQUIBsl3IAAAAMHRSTlMA/f4M/f78/v/+/f9aoP4C/wPy/vj/BxH+AQEFUwH/E6gVkDANX5sCYQFlvQUXa2rOVrj8AAADy0lEQVR42q2YCXeiMBDHB9ImnCpSFe+qvbbdbr//t9vJgSaQhSTuvD6eqfLzPxeZCDBghEzFtZBGCBFLAmEmby/KSLOy4P+swnicFvWtxC8KEMnvsuGkTH+RqEDhGLOqhMpL5BQqEToWc7MhCy+3KyDlFcfNStwQd3+JgbMTywpIMM/qdQnVJpRnBSJx6pIPwuPX4cX2+ilcnCaiXmIHgWhknGh1+B8CudOjwKoq3Xnc6WqsAgunDN+cng5q3ExFRbvzxiT2IziMk8+eoZrZdDwe440legpmD4/z0OeB6iYbEulAB95wu0zBAEqefo2YH1DmpM2yuJklSSKvrF10bBhYaEDxMokjRMUJ/xOL2AdYKSC7OYw0yWRJpNAeaW6B0a3fEr7gpOguILsmmDMUkKmFVwxJ9+NdYC+Gw09ZYgMiA5kqhgnzAspO0S02s8wSr07B97rTAhJkinnw4rhfNWQE2PdZ5DVhqrBZf4Yg4JcV0RyqRZLEd58iFp9j2YGqb3oeVyNDl8Xn65VZioY47aJ6moU2ieo/Gxz20W4UD4IlnjaYnjT13Ua7lZPmItG8Drm8xgQSUjmMroZELomJBmax4vsJ7EYxNyVFuSnQCWhI7AANhYXjgGhITA2iuSLEaT7ko25pZ5i8wvkoUG2IVVVu8Epwn9qJ+RRTHDPDkc8RrVs6zbWCwgRiGA2JVqDfGVLM2UZx94FOE7vef+w629iAJfFymZfibbNvbEC/EykekrTxoc1yY252Gy+FRE047FYuRtn4JVntLYpoBRZ+QPS5HWVZbliTylASTyCXmDZ5mh5STuEYXDaNpKaOxzzNVmvIan4rmrhoL/Icsmzlx9vDKqMTmmX14XDQgYdDnWX41uwMfsj9aUdpNhGGXGUTZRlF3LufxiWcaVbXdWZaXQOL6gnd4Qc8g7gHmv3jJJFRetnvvX+5+aA8ht3hiGUiuEdYe/9wc0IhImDS1foaRZrR83rrLfCdS0SRVGI5SBhPMj16hxDzvDw+P1iNYkpOAT+m/Ybd4tE0xaOn/XsAcAm7vjbu8+TBPyXSLvz+GTeq4iewi+cw3hJWLW9GpUIZgsUOtkEC19Bm5RrEhXD8DPsg4BZeNYwWRQgoGuUzZ0y0IFLu+/MFfgUCL1jXszYrrfuL18AQoowjYuiMTrSMYC3u1qswIJY2LLp1jX33AaHAl/VOp7Vur5YQatuXr4VeMWLxGRpCUYkvX512fnyFewxb7OlJxz19wvIu4ha+5/On1uZz+F7B3fYH5srw5X+x7c/b23z+9rN0ycZfLuk6tqqwdxMAAAAASUVORK5CYII=",
 }
 
-def wm_mask(im):
-    """Magenta/pink brand-watermark pixels in the top/bottom bands of a page image."""
+def wm_mask(im, full=False):
+    """Magenta/pink brand-watermark pixels of a page image (only the top/bottom bands unless full)."""
     from PIL import Image, ImageChops
     r, g, b = im.convert("RGB").split()
     m = ImageChops.multiply(r.point(lambda v: 255 if v > 150 else 0), b.point(lambda v: 255 if v > 120 else 0))
@@ -2611,8 +2611,11 @@ def wm_mask(im):
     m = ImageChops.multiply(m, ImageChops.subtract(b, g).point(lambda v: 255 if v > 50 else 0))
     w, h = im.size
     zone = Image.new("L", (w, h), 0)
-    zone.paste(255, (int(w * 0.03), 0, int(w * 0.97), int(h * 0.08)))
-    zone.paste(255, (int(w * 0.03), int(h * 0.90), int(w * 0.97), h))
+    if full:
+        zone.paste(255, (int(w * 0.01), int(h * 0.005), int(w * 0.99), int(h * 0.995)))
+    else:
+        zone.paste(255, (int(w * 0.03), 0, int(w * 0.97), int(h * 0.08)))
+        zone.paste(255, (int(w * 0.03), int(h * 0.90), int(w * 0.97), h))
     return ImageChops.multiply(m, zone)
 
 # ---------------- Framed-label watermark replacement ----------------
@@ -2622,6 +2625,7 @@ WM_DEF = {"tl": "🎓 @TalibIQBot", "tr": "Talib AI | طالب AI 🎓", "bl": "
 WM_PH = "◆★●■▲▼♦♣♠♥"   # neutral placeholder symbols that stand in for emoji while the bidi order is computed
 WMJOB = {"run": False, "stop": False}
 WMST = {"tested": False}
+WMSTAT = {"regions": 0, "odd": 0}
 _WMEMO = {}
 
 def wm_texts():
@@ -2700,45 +2704,92 @@ def wm_label(text, w, h, S=4):
     return im
 
 def wm_find(p):
-    """Brand-colored (magenta) text regions on one page image: [(key, x0, x1, y0, y1)] in raster px."""
-    from PIL import ImageChops
+    """Brand-colored (magenta) text regions anywhere on one page image: [(key, x0, x1, y0, y1)] in raster px.
+    key = quadrant (t/b + l/r) of the region's center. Returns [] when the page looks unsafe (too much pink)."""
     w, h = p.size
-    m = wm_mask(p)
-    out = []
-    for band, (y0, y1) in (("t", (0, int(h * 0.08))), ("b", (int(h * 0.90), h))):
-        mm = m.crop((0, y0, w, y1)).point(lambda v: 255 if v else 0)
-        col = mm.resize((w, 1), 2).tobytes()   # BOX
-        cols = [x for x in range(w) if col[x]]
-        if not cols:
+    m = wm_mask(p, True)
+    d = m.tobytes()
+    runs = []   # (y, x0, x1)
+    for y in range(h):
+        row = d[y * w:(y + 1) * w]
+        if not any(row):
             continue
-        runs, s, pv = [], cols[0], cols[0]
-        for c in cols[1:]:
-            if c - pv > 60:
-                runs.append((s, pv)); s = c
-            pv = c
-        runs.append((s, pv))
-        side = {"l": [], "r": []}
-        for a, b in runs:
-            side["l" if (a + b) / 2 < w / 2 else "r"].append((a, b))
-        for sd, rs in side.items():
-            if not rs:
-                continue
-            a, b = min(r[0] for r in rs), max(r[1] for r in rs)
-            bb = mm.crop((a, 0, b + 1, y1 - y0)).getbbox()
-            cnt = sum(1 for v in mm.crop((a, 0, b + 1, y1 - y0)).getdata() if v)
-            if b - a < 25 or cnt < 120 or not bb:
-                continue
-            out.append((band + sd, a, b + 1, bb[1] + y0, bb[3] + y0))
+        x = 0
+        while x < w:
+            if row[x]:
+                s = x
+                last = x
+                x += 1
+                while x < w and x - last <= 12:
+                    if row[x]:
+                        last = x
+                    x += 1
+                runs.append((y, s, last))
+            else:
+                x += 1
+    if not runs:
+        return []
+    par = list(range(len(runs)))
+    def find(i):
+        while par[i] != i:
+            par[i] = par[par[i]]
+            i = par[i]
+        return i
+    byrow = {}
+    for i, (y, a, b) in enumerate(runs):
+        byrow.setdefault(y, []).append(i)
+    for i, (y, a, b) in enumerate(runs):
+        for dy in range(1, 5):
+            for j in byrow.get(y + dy, ()):
+                _, a2, b2 = runs[j]
+                if a2 <= b + 6 and a <= b2 + 6:
+                    par[find(i)] = find(j)
+    cl = {}
+    for i, (y, a, b) in enumerate(runs):
+        c = cl.setdefault(find(i), [10 ** 9, -1, 10 ** 9, -1, 0])
+        c[0] = min(c[0], a); c[1] = max(c[1], b + 1); c[2] = min(c[2], y); c[3] = max(c[3], y + 1)
+        c[4] += b - a + 1
+    boxes = [c for c in cl.values() if c[4] >= 100 and (c[1] - c[0]) >= 22 and 7 <= (c[3] - c[2]) <= 44]
+    # merge boxes that overlap horizontally and sit close vertically (two-line marks)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                A, B = boxes[i], boxes[j]
+                vov = min(A[3], B[3]) - max(A[2], B[2])
+                hgap = max(A[0], B[0]) - min(A[1], B[1])
+                same_col = A[0] <= B[1] and B[0] <= A[1] and max(A[2], B[2]) - min(A[3], B[3]) <= 10 and max(A[3], B[3]) - min(A[2], B[2]) <= 56
+                same_line = vov >= 0.5 * min(A[3] - A[2], B[3] - B[2]) and hgap <= 40
+                if same_col or same_line:
+                    boxes[i] = [min(A[0], B[0]), max(A[1], B[1]), min(A[2], B[2]), max(A[3], B[3]), A[4] + B[4]]
+                    del boxes[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    if not boxes or len(boxes) > 8:
+        return []
+    area = sum((c[1] - c[0]) * (c[3] - c[2]) for c in boxes)
+    if area > 0.06 * w * h:
+        return []
+    out = []
+    for a, b, ya, yb, _ in boxes:
+        key = ("t" if (ya + yb) / 2 < h / 2 else "b") + ("l" if (a + b) / 2 < w / 2 else "r")
+        out.append((key, a, b, ya, yb))
     return out
 
-def wm_layout(reg, texts):
-    """Label rectangle (cx, cy, w, h) in raster px (1px = 1pt of the reference raster)."""
+def wm_layout(reg, texts, ph=824):
+    """Label rectangle (key, cx, cy, w, h) in raster px (1px = 1pt of the reference raster)."""
     key, a, b, ya, yb = reg
     bh = yb - ya
-    if key[0] == "t":
-        h = min(26, max(22, bh + 6)); cy = (ya + yb) / 2
+    cy = (ya + yb) / 2
+    if cy > ph * 0.9:
+        h = min(21, max(19, bh + 2)); cy -= 1.5
+    elif cy < ph * 0.08:
+        h = min(26, max(22, bh + 6))
     else:
-        h = min(21, max(19, bh + 2)); cy = (ya + yb) / 2 - 1.5
+        h = min(46, max(22, bh + 6))
     return key, (a + b) / 2, cy, max(b - a + 8, 60), h
 
 def wm_best_image(pg):
@@ -2755,6 +2806,22 @@ def wm_best_image(pg):
             best = pi
     return best
 
+def wm_probe(data):
+    """Cheap check on the first, second and last page: does this file carry the brand watermark at all?"""
+    from pypdf import PdfReader
+    r = PdfReader(io.BytesIO(data))
+    if r.is_encrypted:
+        r.decrypt("")
+    n = len(r.pages)
+    for i in sorted({0, min(1, n - 1), n - 1}):
+        try:
+            p = wm_best_image(r.pages[i])
+            if p is not None and wm_find(p.convert("RGB")):
+                return True
+        except Exception:
+            continue
+    return False
+
 def wm_process(data, texts, previews=0):
     """Cover every brand watermark region with a framed label. Returns (pdf_bytes|None, pages_changed, pages_total, previews)."""
     from pypdf import PdfReader, PdfWriter
@@ -2766,6 +2833,7 @@ def wm_process(data, texts, previews=0):
         r.decrypt("")
     w = PdfWriter()
     w.append(r)
+    WMSTAT.update(regions=0, odd=0)
     cache, changed, prev = {}, 0, []
     def lab(key, lw, lh):
         k = (key, texts[key], round(lw), round(lh))
@@ -2797,7 +2865,10 @@ def wm_process(data, texts, previews=0):
             if pi < previews:
                 after = p.resize((p.width * 2, p.height * 2), Image.LANCZOS).convert("RGBA")
             for reg in regs:
-                key, cx, cy, lw, lh = wm_layout(reg, texts)
+                WMSTAT["regions"] += 1
+                if not ((reg[3] + reg[4]) / 2 < p.height * 0.08 or (reg[3] + reg[4]) / 2 > p.height * 0.9):
+                    WMSTAT["odd"] += 1
+                key, cx, cy, lw, lh = wm_layout(reg, texts, p.height)
                 full, small = lab(key, lw, lh)
                 c.drawImage(ImageReader(small), ix + (cx - lw / 2) * sx, iy + ih - (cy + lh / 2) * sy, lw * sx, lh * sy, mask="auto")
                 if after is not None:
@@ -2848,7 +2919,7 @@ def wm_menu():
     done = hq("SELECT COUNT(*) FROM h_files WHERE COALESCE(wm_done,0)=1")[0][0]
     total = hq("SELECT COUNT(*) FROM h_files")[0][0]
     t = ("🧴 استبدال علامة ملازم (إطارات أنيقة)\n"
-         "تُغطّى كتابة العلامة الوردية القديمة (اللون الوردي فقط، أعلى وأسفل الصفحة) بإطار أبيض بحواف دائرية وفيه النص الجديد. محتوى الصفحة لا يُمسّ.\n\n"
+         "تُكتشف كتابة العلامة الوردية القديمة تلقائياً في أي مكان بالصفحة (اللون الوردي فقط) وتُغطّى بإطار أبيض بحواف دائرية بحجمها وفيه النص الجديد. النص يُختار حسب مكان العلامة (أعلى/أسفل، يسار/يمين). العلامة الرمادية الشفافة بالوسط لا تُزال.\n\n"
          + "\n".join(f"• {WM_NAMES[k]}: {tx[k]}" for k in WM_KEYS)
          + f"\n\nالمعالجة: {done} من {total} ملزمة."
          + ("\nالتجربة: ✅ تمّت" if WMST["tested"] else "\nالتسلسل: عدّل النصوص ← 🧪 تجربة على ملف ← ▶️ تطبيق على الكل. ويمكن التراجع."))
@@ -2857,12 +2928,14 @@ def wm_menu():
         [hb("✏️ " + WM_NAMES[k], "k:o:we:" + k) for k in ("bl", "br")],
         [hb("🧪 تجربة على ملف", "k:o:wt"), hb("▶️ تطبيق على الكل", "k:o:wg")],
         [hb("↩️ تراجع عن الاستبدال", "k:o:wu")],
-        [hb(("✅ " if store.get("wm_auto", "0") == "1" else "⬜ ") + "تلقائي للملازم الجديدة", "k:o:wa")],
+        [hb(("✅ " if store.get("wm_auto", "1") == "1" else "⬜ ") + "تلقائي للملازم الجديدة", "k:o:wa")],
         [hb("🔙 رجوع", "k:o:m")]])
     return t, kb
 
 async def wm_fix_one(data, cfg, st=0):
     """(cleaned, final_or_None, pages_changed, pages_total) or None when no watermark was found."""
+    if not await asyncio.to_thread(wm_probe, data):
+        return None
     out, ch, n, _ = await asyncio.to_thread(wm_process, data, wm_texts(), 0)
     if not out:
         return None
@@ -2930,7 +3003,7 @@ async def wm_apply(ctx, chat, mid):
 
 async def wm_auto_ingest(ctx, rec):
     try:
-        if store.get("wm_auto", "0") != "1" or int(rec.get("fsize", 0) or 0) > MAX_DL:
+        if store.get("wm_auto", "1") != "1" or int(rec.get("fsize", 0) or 0) > MAX_DL:
             return
         async with STAMP_LOCK:
             data = await asyncio.wait_for(fetch_file(ctx, rec["fid"]), 60)
@@ -2963,7 +3036,7 @@ async def wm_cb(q, ctx, x, parts):
         await q.message.reply_text("🧪 أرسل ملف PDF واحد للتجربة (حتى 20MB). سأرجع لك صور قبل/بعد وملف النتيجة، ولن يتغير شيء في المكتبة.")
         return True
     if x == "wa":
-        store.set("wm_auto", "0" if store.get("wm_auto", "0") == "1" else "1")
+        store.set("wm_auto", "0" if store.get("wm_auto", "1") == "1" else "1")
         t, kb = wm_menu()
         await q.message.edit_text(t, reply_markup=kb)
         return True
@@ -3037,7 +3110,7 @@ async def wm_input(update, ctx, act):
                 else:
                     await msg.reply_document(InputFile(io.BytesIO(b), filename="zoom.png"), caption=cap)
             await msg.reply_document(InputFile(io.BytesIO(out), filename="wm_test_" + (d.file_name or "test.pdf")),
-                                     caption=f"🧪 غُطّيت العلامة في {ch} من {n} صفحة · الزمن {el:.1f} ثانية · الحجم {len(out) // 1024}KB\nإذا النتيجة صحيحة اضغط ▶️ تطبيق على الكل.")
+                                     caption=f"🧪 غُطّيت العلامة في {ch} من {n} صفحة ({WMSTAT['regions']} علامة" + (f"، منها {WMSTAT['odd']} بمكان غير معتاد وسط الصفحة، راجعها" if WMSTAT["odd"] else "") + f") · الزمن {el:.1f} ثانية · الحجم {len(out) // 1024}KB\nإذا النتيجة صحيحة اضغط ▶️ تطبيق على الكل.")
             WMST["tested"] = True
             log.info("wm test: %d/%d pages in %.1fs", ch, n, el)
             await st.delete()
