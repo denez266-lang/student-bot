@@ -3484,6 +3484,15 @@ async def bulk_edit(ctx, chat, st, final=False):
             log.warning("bulk edit: %r", e)
 
 async def bulk_save(rec, ctx):
+    fn_, fs_ = rec.get("fname") or "", int(rec.get("fsize", 0) or 0)
+    if fn_ and fs_ > MAX_DL and fn_ in W.get("pre", {}):   # a big file reprocessed by the watcher: replace the old unprocessed entry, never duplicate
+        if hq("SELECT 1 FROM h_files WHERE fname=? AND COALESCE(stamped,0)=1 AND COALESCE(fsize,0)>?", (fn_, MAX_DL)):
+            return "dup"
+        old = hq("SELECT id, file_id FROM h_files WHERE fname=? AND COALESCE(stamped,0)=0 AND COALESCE(fsize,0)>?", (fn_, MAX_DL))
+        if old:
+            hq("UPDATE h_files SET file_id=?, file_uid=?, fsize=?, stamped=1, orig_fid=? WHERE id=?", (rec["fid"], rec["uid"], fs_, old[0][1], old[0][0]), False)
+            backup_soon()
+            return "ok"
     sid = get_stage(rec["stage"])
     jid = get_subject(sid, rec["subject"])
     title = compose_title(rec["title"] or stem(rec["name"]), rec["teacher"])
@@ -3776,7 +3785,7 @@ def _trim_mem():
     except Exception:
         pass
 
-def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True):
+def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True, drop=(False, False)):
     """Disk-to-disk: nothing but one page raster is decoded at a time; image streams are copied by qpdf, never re-encoded.
     Returns {"pages", "changed", "stamped"}."""
     import pikepdf
@@ -3788,7 +3797,15 @@ def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True):
     n = len(pdf.pages)
     if n == 0:
         raise ValueError("empty pdf")
-    st = {"pages": n, "changed": 0, "stamped": 0}
+    st = {"pages": n, "changed": 0, "stamped": 0, "dropped": 0}
+    if n > 2:   # old promo/stamp page at the very start or end (never any other page)
+        if drop[1]:
+            del pdf.pages[n - 1]
+            st["dropped"] += 1
+        if drop[0]:
+            del pdf.pages[0]
+            st["dropped"] += 1
+        n = len(pdf.pages)
     def dims(pg):
         mb = [float(v) for v in (pg.get("/CropBox") or pg.MediaBox)]
         W, H = abs(mb[2] - mb[0]), abs(mb[3] - mb[1])
@@ -3870,6 +3887,40 @@ def big_process(src, dst, cfg, texts, do_stamp=True, do_wm=True):
         o.close()
     return st
 
+def _big_ends(src):
+    """First + last page of a big PDF as a tiny PDF (for the old-stamp check), or None when it has 2 pages or fewer."""
+    from pikepdf import Pdf
+    pdf = Pdf.open(src)
+    n = len(pdf.pages)
+    if n <= 2:
+        pdf.close()
+        return None
+    o = Pdf.new()
+    o.pages.append(pdf.pages[0])
+    o.pages.append(pdf.pages[n - 1])
+    b = io.BytesIO()
+    o.save(b)
+    o.close()
+    pdf.close()
+    return b.getvalue()
+
+async def old_decide_ends(ends):
+    """Same decision as old_fix_one, on the tiny first+last-page PDF: (remove_first, remove_last)."""
+    o = await asyncio.to_thread(pdf_scan, ends)
+    refs = old_refs()
+    af = al = ""
+    if store.get("old_ai", "1") == "1":
+        for k in ("f", "l"):
+            if o["j" + k] and not old_match(o["s" + k], refs)[1] and not o["t" + k]:
+                v = await ai_promo(o["j" + k])
+                if k == "f":
+                    af = v or ""
+                else:
+                    al = v or ""
+    mf = old_match(o["sf"], refs)[1] or o["tf"] == "p" or af == "p"
+    ml = o["n"] > 1 and (old_match(o["sl"], refs)[1] or o["tl"] == "p" or al == "p")
+    return bool(mf), bool(ml)
+
 BIG_MAX = 450 * 1024 * 1024   # disk-to-disk path: RAM does not grow with file size, only disk space does
 W["pre"] = {}   # fname -> ts : files the watcher already processed and uploaded (bot must not re-stamp)
 
@@ -3901,12 +3952,20 @@ async def watch_big(cid, mid):
         t0 = time.time()
         await asyncio.wait_for(c.download_file(d, file=src, part_size_kb=512, file_size=d.size), 1800)   # 512KB parts: 4x fewer round trips
         t1 = time.time()
+        drop = (False, False)
+        if store.get("old_auto", "1") == "1":
+            try:
+                ends = await asyncio.to_thread(_big_ends, src)
+                if ends:
+                    drop = await asyncio.wait_for(old_decide_ends(ends), 90)
+            except Exception as e:
+                log.warning("big old-stamp check failed: %r", e)
         async with STAMP_LOCK:   # only the CPU/RAM step is serialized, so one file can transfer while another is processed
             t1 = time.time()
-            st = await asyncio.wait_for(asyncio.to_thread(big_process, src, dst, cfg if do_stamp else None, wm_texts(), do_stamp, do_wm), 1500)
+            st = await asyncio.wait_for(asyncio.to_thread(big_process, src, dst, cfg if do_stamp else None, wm_texts(), do_stamp, do_wm, drop), 1500)
             t2 = time.time()
         os.remove(src)
-        if not st["changed"] and not st["stamped"]:
+        if not st["changed"] and not st["stamped"] and not st["dropped"]:
             return False
         W["pre"][fname] = time.time()
         if st.get("probe"):
@@ -3924,7 +3983,7 @@ async def watch_big(cid, mid):
             hwm = [l for l in open("/proc/self/status") if l.startswith(("VmHWM", "VmRSS"))]
         except Exception:
             hwm = []
-        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d | dl %ds proc %ds up %ds | %s", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"], t1 - t0, t2 - t1, t3 - t2, " ".join(x.split(":")[0] + x.split(":")[1].strip().replace(" ", "") for x in hwm))
+        log.info("big done %s: %d MB, pages %d, watermark pages %d, stamp pages %d, promo pages removed %d | dl %ds proc %ds up %ds | %s", fname, d.size >> 20, st["pages"], st["changed"], st["stamped"], st["dropped"], t1 - t0, t2 - t1, t3 - t2, " ".join(x.split(":")[0] + x.split(":")[1].strip().replace(" ", "") for x in hwm))
         return True
     except Exception:
         log.exception("big process failed")
