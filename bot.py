@@ -232,6 +232,9 @@ def tick(on):
 FALLBACKS = [m for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest").split(",") if m.strip()]
 
 async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192, fast=False):
+    r = await _fast().ds_call(parts, system, temperature, max_tokens)
+    if r:
+        return r
     body = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
@@ -450,6 +453,9 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "m:menu":
         ctx.user_data.clear()
         await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+        return
+    if data == "m:eng":
+        await _fast().chat_eng(q, ctx)
         return
     if data == "m:aichat":
         await _fast().chat_cb(q, ctx)
@@ -4891,7 +4897,8 @@ class ApiH(tornado.web.RequestHandler):
             return self.write({"ok": True})
         if name == "aichat":
             try:
-                return self.write({"text": await _fast().chat_api(uid, body)})
+                r = await _fast().chat_api(uid, body)
+                return self.write(r if isinstance(r, dict) else {"text": r})
             except RuntimeError as e:
                 return self.fail(429, str(e))
         if name == "timer":
