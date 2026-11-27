@@ -245,16 +245,20 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192, fast=
     async with httpx.AsyncClient(timeout=20 if fast else 180) as c:
         for attempt, m in enumerate(models if fast else models + models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+            kk = _fast().gk()
             try:
-                r = await c.post(url, params={"key": GKEY}, json=body)
+                r = await c.post(url, params={"key": kk}, json=body)
             except httpx.HTTPError as e:
                 log.warning("gemini network %s: %s", m, e)
                 r = None
                 await asyncio.sleep(2)
                 continue
             if r.status_code == 200:
+                _fast().gk_ok(kk)
                 break
             log.warning("gemini %s (%s): %s", r.status_code, m, r.text[:200])
+            if r.status_code == 429:
+                _fast().gk_bad(kk)
             if r.status_code in (429, 500, 503, 404):
                 await asyncio.sleep(1.5)
                 continue
@@ -4957,7 +4961,7 @@ async def serve(url):
     await app.bot.set_webhook(url=f"{url.rstrip('/')}/{TOKEN}", allowed_updates=Update.ALL_TYPES)
     web = tornado.web.Application([
         (rf"/{re.escape(TOKEN)}", WebhookH),
-        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH), (r"/tglogin/([A-Za-z0-9_\-]+)", TgLoginH), (r"/tglqr/([A-Za-z0-9_\-]+)", TgQrH),
+        (r"/app", PageH), (r"/", PageH), (r"/health", HealthH), (r"/tglogin/([A-Za-z0-9_\-]+)", TgLoginH), (r"/tglqr/([A-Za-z0-9_\-]+)", TgQrH), (r"/gkeys/([A-Za-z0-9_\-]+)", _fast().KeysH),
         (r"/api/(\w+)", ApiH),
     ], tgapp=app)
     web.listen(int(os.environ.get("PORT", "10000")), address="0.0.0.0")
