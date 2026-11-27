@@ -348,6 +348,9 @@ class KeysH(tornado.web.RequestHandler):
                                "<hr><h2>DeepSeek</h2><p><small>" + ("✅ مفتاح DeepSeek محفوظ." if ds_key() else "لا يوجد مفتاح DeepSeek.") + " يُستعمل للدردشة والمهام النصية، والباقي على Gemini.</small></p>"
                                "<form method=post><input type=hidden name=a value=ds><input name=dskey type=password autocomplete=off placeholder='sk-...'><button>💾 حفظ مفتاح DeepSeek</button></form>"
                                "<form method=post style='margin-top:10px'><input type=hidden name=a value=dsclear><button style='background:#d9534f'>🗑 حذف مفتاح DeepSeek</button></form>"
+                               "<hr><h2>Groq (مجاني)</h2><p><small>" + (f"✅ مفاتيح Groq المحفوظة: {len(gr_keys())}." if gr_keys() else "لا يوجد مفتاح Groq.") + " مفتاح في كل سطر، يُستعمل للدردشة والمهام النصية.</small></p>"
+                               "<form method=post><input type=hidden name=a value=gr><textarea name=grkeys rows=3 autocomplete=off placeholder='gsk_...' style='width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0F0;border-radius:12px'></textarea><button>💾 حفظ مفاتيح Groq</button></form>"
+                               "<form method=post style='margin-top:10px'><input type=hidden name=a value=grclear><button style='background:#d9534f'>🗑 حذف مفاتيح Groq</button></form>"
                                "<form method=post style='margin-top:14px'><input type=hidden name=a value=clear><button style='background:#d9534f'>🗑 حذف المفاتيح الإضافية</button></form>")
 
     def get(self, tok):
@@ -360,6 +363,40 @@ class KeysH(tornado.web.RequestHandler):
             G["store"].set("dskey", "")
             _DS["until"] = 0
             self.finish(self._form("<p><b>✅ حُذف مفتاح DeepSeek.</b></p>"))
+            return
+        if a == "grclear":
+            G["store"].set("grkeys", "")
+            self.finish(self._form("<p><b>✅ حُذفت مفاتيح Groq.</b></p>"))
+            return
+        if a == "gr":
+            import httpx
+            ks = [x.strip().strip("\"'`") for x in re.split(r"[\s,]+", self.get_body_argument("grkeys", "")) if x.strip()]
+            old, msgs, new = gr_keys(), [], []
+            async with httpx.AsyncClient(timeout=20) as c:
+                for k in ks[:5]:
+                    tail = "…" + k[-4:]
+                    if not re.fullmatch(r"gsk_[A-Za-z0-9]{20,150}", k):
+                        msgs.append(f"{tail}: صيغة غير صحيحة (يبدأ بـ gsk_)")
+                        continue
+                    try:
+                        r = await c.get("https://api.groq.com/openai/v1/models", headers={"Authorization": "Bearer " + k})
+                    except Exception:
+                        msgs.append(f"{tail}: تعذر الاتصال")
+                        continue
+                    if r.status_code in (200, 429):
+                        if k not in old and k not in new:
+                            new.append(k)
+                            msgs.append(f"{tail}: ✅ تمت الإضافة")
+                        else:
+                            msgs.append(f"{tail}: موجود مسبقاً")
+                    elif r.status_code in (401, 403):
+                        msgs.append(f"{tail}: ❌ مفتاح غير صحيح")
+                    else:
+                        msgs.append(f"{tail}: ردّ غير متوقع ({r.status_code})")
+            if new:
+                G["store"].set("grkeys", G["_fernet"]().encrypt(json.dumps((old + new)[:8]).encode()).decode())
+                log().info("groq keys saved: %d new", len(new))
+            self.finish(self._form("<div class=e>" + "<br>".join(msgs or ["لم يتم إدخال أي مفتاح."]) + "</div>"))
             return
         if a == "ds":
             import httpx
@@ -474,7 +511,7 @@ def ds_key():
         return ""
 
 
-async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepseek-flash"):
+async def ds_one(parts, system, temperature=0.5, max_tokens=4000, model="deepseek-flash"):
     """DeepSeek (OpenAI-compatible) for plain text work. Returns None (caller uses Gemini) when there is no key, the request has images/audio/PDF text,
     it is archive/stage classification, or DeepSeek fails or is resting."""
     try:
@@ -511,14 +548,82 @@ async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepse
     return None
 
 
+_GR = {"rest": {}, "i": 0, "day": 0, "n": 0}
+
+
+def gr_keys():
+    try:
+        v = G["store"].get("grkeys", "")
+        return [k for k in json.loads(G["_fernet"]().decrypt(v.encode()).decode()) if isinstance(k, str)] if v else []
+    except Exception:
+        return []
+
+
+async def groq_call(parts, system, temperature=0.5, max_tokens=4000):
+    """Groq free plan (openai/gpt-oss-120b). Keys rotate; a key gets a rest on 429 (retry-after). None -> caller falls back."""
+    try:
+        ks = gr_keys()
+        if not ks or not system or system == G["ING_SYS"]:
+            return None
+        if any(("inline_data" in p) or str(p.get("text", "")).startswith("محتوى ملف PDF") for p in parts):
+            return None
+        now = time.time()
+        live = [k for k in ks if _GR["rest"].get(k, 0) < now]
+        if not live:
+            return None
+        d = int(now // 86400)
+        if _GR["day"] != d:
+            _GR["day"], _GR["n"] = d, 0
+        if _GR["n"] >= 5000:
+            return None
+        import httpx
+        solve = system == G.get("SOLVE_SYS")
+        body = {"model": "openai/gpt-oss-120b", "stream": False, "temperature": temperature,
+                "max_completion_tokens": 12000 if solve else max(1500, min(int(max_tokens), 4000)),
+                "reasoning_effort": "medium" if solve else "low", "include_reasoning": False,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}]}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60 if solve else 20)) as c:
+            for _ in range(min(2, len(live))):
+                _GR["i"] += 1
+                k = live[_GR["i"] % len(live)]
+                live = [x for x in live if x != k]
+                _GR["n"] += 1
+                r = await c.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": "Bearer " + k}, json=body)
+                if r.status_code == 200:
+                    t = str(r.json()["choices"][0]["message"].get("content") or "").strip()
+                    if t:
+                        return t
+                    continue
+                if r.status_code == 429:
+                    try:
+                        ra = float(r.headers.get("retry-after", 60))
+                    except Exception:
+                        ra = 60
+                    _GR["rest"][k] = time.time() + min(max(ra, 10), 900)
+                elif r.status_code in (401, 403):
+                    _GR["rest"][k] = time.time() + 900
+                log().warning("groq %s, next", r.status_code)
+    except Exception as e:
+        log().warning("groq failed (%s)", type(e).__name__)
+    return None
+
+
+async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepseek-flash", only=False):
+    """Text work: DeepSeek (if key) then Groq (if keys); None means use Gemini."""
+    r = await ds_one(parts, system, temperature, max_tokens, model)
+    if r or only:
+        return r
+    return await groq_call(parts, system, temperature, max_tokens)
+
+
 CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.7-flash"]
 
 
-ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("gem", "✨ جيميني")]
+ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("gem", "✨ جيميني")]
 
 
 def engines():
-    return [e for e in ENGS if e[0] == "gem" or ds_key()]
+    return [e for e in ENGS if e[0] == "gem" or (e[0] == "grq" and gr_keys()) or (e[0] in ("dsp", "ds") and ds_key())]
 
 
 def get_eng(uid):
@@ -534,7 +639,11 @@ def eng_label(e):
 async def chat_call(prompt, eng="gem"):
     """Fast chat call: fastest lite model first, 9 s per try, next key (not resting) on 429/timeout, then next model; 28 s budget."""
     if eng in ("dsp", "ds"):
-        r0 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200, "deepseek-v4-pro" if eng == "dsp" else "deepseek-flash")
+        r0 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200, "deepseek-v4-pro" if eng == "dsp" else "deepseek-flash", True)
+        if r0:
+            return r0
+    if eng == "grq":
+        r0 = await groq_call([{"text": prompt}], CHAT_SYS, 0.7, 1200)
         if r0:
             return r0
     import httpx
