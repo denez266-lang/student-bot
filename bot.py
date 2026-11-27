@@ -317,7 +317,7 @@ TOOLS = [
     dict(id="schedule",  icon="📅", name="جدول دراستي",         input="text",  group="main"),
     dict(id="voice",     icon="🎤", name="حوّل صوتاً إلى نص",   input="audio", group="main"),
     dict(id="pdf",       icon="📄", name="أنشئ PDF",            input="both",  group="main"),
-    dict(id="solve",     icon="🧮", name="حل المسائل",          input="both",  group="main"),
+    dict(id="solve",     icon="📸", name="حل مسألة رياضيات",          input="both",  group="main"),
     dict(id="simple",    icon="🧒", name="اشرحها ببساطة",       input="both",  group="more"),
     dict(id="cards",     icon="🃏", name="بطاقات حفظ",          input="both",  group="more"),
     dict(id="check",     icon="✅", name="صحّح إجابتي",         input="both",  group="more"),
@@ -365,7 +365,7 @@ MODE_PROMPTS = {
     "check":     "✅ أرسل السؤال ثم إجابتك في رسالة واحدة (نصاً أو صورة)، وسأصححها وأعطيك درجة وملاحظات لتحسينها.",
     "translate": "🌐 أرسل النص (أو صورة فيها نص) وسأترجمه: من العربية إلى الإنجليزية، ومن أي لغة أخرى إلى العربية، مع شرح المصطلحات الصعبة.",
     "formulas":  "📐 اكتب المادة والموضوع أو الفصل (مثال: الفيزياء - الحركة)، وسأجهز لك ورقة بكل القوانين المهمة مع معنى كل رمز.",
-    "solve":     "🧮 أرسل المسألة نصاً أو صورة (رياضيات، فيزياء، كيمياء، أحياء، أو أي مادة)، وسأحلها لك خطوة بخطوة بأسلوب المنهج العراقي.\n\nيمكنك إضافة تعليق مع الصورة مثل: حل السؤال 3 فقط.",
+    "solve":     "📸 صوّر المسألة أو اكتبها (رياضيات، فيزياء، كيمياء، أحياء)، وسأحلها لك خطوة بخطوة مع تمييز الجواب النهائي.\n\nيمكنك إضافة تعليق مع الصورة مثل: حل السؤال 3 فقط.",
 }
 
 def back_markup():
@@ -453,6 +453,9 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "m:menu":
         ctx.user_data.clear()
         await q.message.reply_text(store.get("welcome", DEFAULT_WELCOME), reply_markup=menu_markup(is_admin(update)))
+        return
+    if data == "m:xs":
+        await _fast().solve_more(q, ctx)
         return
     if data == "m:eng":
         await _fast().chat_eng(q, ctx)
@@ -705,7 +708,7 @@ async def run_ai(mode, parts):
     """Shared AI call for a tool mode (bot and Mini App)."""
     ask = MODE_ASKS.get(mode)
     if mode == "solve":
-        return await gemini(parts + [{"text": ask}], system=SOLVE_SYS, temperature=0.2, max_tokens=16384)
+        return await _fast().solve(parts)
     return await gemini(parts + ([{"text": ask}] if ask else []))
 
 FEAT_NAMES = {
@@ -810,7 +813,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_long(msg, result)
     if not ask:
         return
-    await msg.reply_text("هل تريد شيئاً آخر؟", reply_markup=back_markup())
+    await msg.reply_text("هل تريد شيئاً آخر؟", reply_markup=_fast().solve_kb(mode, u.id, back_markup()))
 
 # ---------------- admin panel ----------------
 
