@@ -1693,6 +1693,14 @@ def start(g):
             for a in G["ADMIN_IDS"]:
                 await bot.set_my_commands(adm, scope=BotCommandScopeChat(chat_id=a))
             log().info("bot commands set: public 1, admin %d for %d admins", len(adm), len(G["ADMIN_IDS"]))
+            try:
+                from telegram import MenuButtonWebApp, WebAppInfo
+                base = os.environ.get("RENDER_EXTERNAL_URL", "")
+                if base:
+                    await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app")))
+                    log().info("menu button set: web app")
+            except Exception as e:
+                log().warning("menu button failed (%s)", type(e).__name__)
         except Exception as e:
             log().warning("set commands failed (%s)", type(e).__name__)
     asyncio.create_task(_cmds())
