@@ -146,34 +146,13 @@ async def do_backup():
     global _backup_dirty, _last_backup
     if not APP or not ADMIN_BACKUP_CHAT or not store:
         return
+    _backup_dirty = False
     try:
-        _backup_dirty = False
         store.db.commit()
-        old_id = None
-        try:
-            ch = await APP.bot.get_chat(ADMIN_BACKUP_CHAT)
-            if ch.pinned_message and ch.pinned_message.document:
-                old_id = ch.pinned_message.message_id
-        except Exception:
-            pass
-        with open(DB_PATH, "rb") as f:
-            msg = await APP.bot.send_document(
-                ADMIN_BACKUP_CHAT, InputFile(f, filename="student.db"),
-                caption="💾 نسخة احتياطية من بيانات البوت", disable_notification=True)
-        _last_backup = time.time()
-        try:
-            log.info("backup saved, %d bytes", os.path.getsize(DB_PATH))
-        except Exception:
-            pass
-        try:
-            await APP.bot.pin_chat_message(ADMIN_BACKUP_CHAT, msg.message_id, disable_notification=True)
-        except Exception:
-            log.exception("pin failed")
-        if old_id and old_id != msg.message_id:
-            try:
-                await APP.bot.delete_message(ADMIN_BACKUP_CHAT, old_id)
-            except Exception:
-                pass
+        if await _fast().backup_run(APP.bot, ADMIN_BACKUP_CHAT, DB_PATH):
+            _last_backup = time.time()
+        else:
+            _backup_dirty = True
     except Exception:
         _backup_dirty = True
         log.exception("backup failed")
@@ -202,7 +181,7 @@ async def restore_backup(app):
                 _last_backup = pin.date.timestamp()
             except Exception:
                 _last_backup = time.time()
-            log.info("backup restored, %d bytes", len(out.getvalue()))
+            log.info("backup restored, %d bytes sha %s", len(out.getvalue()), _fast().sha(out.getvalue()))
             return True
     except Exception:
         log.exception("restore failed")
