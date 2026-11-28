@@ -724,22 +724,54 @@ NB_ASKS = {
     "map": "ارسم خريطة ذهنية نصية للمصادر: الموضوع الرئيسي في السطر الأول، ثم الفروع بشرطة (-) وفروع الفروع بمسافتين وشرطة، بدون إطالة.",
 }
 _NB = {}
-NB_MAX = 150000
+NB_MAX = 100000
+
+
+def nb_get(uid):
+    """Sources are kept in memory and saved in the store (survive restarts; backed up)."""
+    if uid not in _NB:
+        try:
+            v = G["store"].get("nb:%s" % uid, "")
+            _NB[uid] = [(str(x[0]), str(x[1])) for x in json.loads(v)] if v else []
+        except Exception:
+            _NB[uid] = []
+    return _NB[uid]
+
+
+def nb_save(uid):
+    st = G["store"]
+    s = _NB.get(uid) or []
+    st.set("nb:%s" % uid, json.dumps(s, ensure_ascii=False) if s else "")
+    try:
+        idx = [x for x in json.loads(st.get("nb_idx", "[]") or "[]") if x != uid]
+    except Exception:
+        idx = []
+    if s:
+        idx.append(uid)
+    while len(idx) > 40:   # keep the backup small: oldest notebooks are dropped
+        old = idx.pop(0)
+        _NB.pop(old, None)
+        st.set("nb:%s" % old, "")
+    st.set("nb_idx", json.dumps(idx))
+
+
+def nb_clear(uid):
+    _NB[uid] = []
+    nb_save(uid)
 
 
 def nb_add(uid, name, text):
     text = (text or "").strip()
     if len(text) < 30:
         raise RuntimeError("لم أجد نصاً كافياً في هذا المصدر.")
-    if uid not in _NB and len(_NB) > 300:
-        _NB.pop(next(iter(_NB)))
-    s = _NB.setdefault(uid, [])
+    s = nb_get(uid)
     if len(s) >= 6:
         raise RuntimeError("الحد 6 مصادر. امسح المصادر ثم أضف من جديد 🗑")
-    text = text[:60000]
+    text = text[:50000]
     if sum(len(x[1]) for x in s) + len(text) > NB_MAX:
         raise RuntimeError("حجم المصادر كبير. امسح بعضها وأضف الأهم 🗑")
     s.append((str(name)[:60] or "مصدر", text))
+    nb_save(uid)
     return len(s), len(text)
 
 
@@ -759,7 +791,7 @@ async def nb_extract(data, mime, fname):
 
 async def nb_run(uid, kind, text=""):
     LANE.set("chat")
-    s = _NB.get(uid) or []
+    s = nb_get(uid)
     if not s:
         raise RuntimeError("📓 أضف مصدراً أولاً: أرسل ملف PDF أو صورة أو الصق نصاً طويلاً.")
     now = time.time()
@@ -799,7 +831,7 @@ def nb_kb():
 
 
 def nb_list(uid):
-    s = _NB.get(uid) or []
+    s = nb_get(uid)
     return "\n".join("%d) %s" % (i + 1, n) for i, (n, _) in enumerate(s)) or "لا توجد مصادر بعد."
 
 
@@ -814,7 +846,7 @@ async def nb_cb(q, ctx):
         return
     ctx.user_data["mode"] = "nb"
     if d == "m:nbc":
-        _NB.pop(uid, None)
+        nb_clear(uid)
         await q.message.reply_text("🗑 تم مسح كل المصادر. أرسل مصادر جديدة.", reply_markup=nb_kb())
         return
     kind = {"m:nbs": "sum", "m:nbq": "q", "m:nbm": "map"}.get(d)
@@ -854,7 +886,7 @@ async def nb_msg(update, ctx):
             await msg.reply_text("أرسل ملف PDF أو صورة أو نصاً 🙂", reply_markup=nb_kb())
             return
         if len(text) >= 600:
-            n, ln = nb_add(uid, "نص ملصق %d" % (len(_NB.get(uid) or []) + 1), text)
+            n, ln = nb_add(uid, "نص ملصق %d" % (len(nb_get(uid)) + 1), text)
             await msg.reply_text("✅ أضفت النص كمصدر %d (%d حرف)." % (n, ln), reply_markup=nb_kb())
             return
         stop = asyncio.Event()
@@ -875,7 +907,7 @@ async def nb_msg(update, ctx):
 async def nb_api(uid, body):
     act = body.get("act", "state")
     if act == "clear":
-        _NB.pop(uid, None)
+        nb_clear(uid)
     elif act == "add":
         f = body.get("file")
         if f:
@@ -886,12 +918,12 @@ async def nb_api(uid, body):
             text = await nb_extract(data, f.get("mime", ""), f.get("name", ""))
             nb_add(uid, f.get("name") or "ملف", text)
         else:
-            nb_add(uid, "نص ملصق %d" % (len(_NB.get(uid) or []) + 1), str(body.get("text", ""))[:60000])
+            nb_add(uid, "نص ملصق %d" % (len(nb_get(uid)) + 1), str(body.get("text", ""))[:60000])
     elif act in ("ask", "sum", "q", "map"):
         out = await nb_run(uid, act, str(body.get("text", "")))
         G["store"].event(uid, "notebook")
-        return {"text": out, "srcs": [n for n, _ in _NB.get(uid, [])]}
-    return {"srcs": [n for n, _ in _NB.get(uid, [])]}
+        return {"text": out, "srcs": [n for n, _ in nb_get(uid)]}
+    return {"srcs": [n for n, _ in nb_get(uid)]}
 
 
 ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("gem", "✨ جيميني")]
