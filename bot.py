@@ -30,7 +30,7 @@ BASE_SYS = (
     "وتجنّب الحشو. إذا كان السؤال خارج الدراسة أجب عنه باختصار مفيد."
 )
 
-DEFAULT_WELCOME = "🎓 أهلاً بك في بوت الطالب الذكي!\n\nاختر ماذا تريد من القائمة، أو أرسل سؤالك مباشرة وسأجيبك:"
+DEFAULT_WELCOME = "🎓 أهلاً بك في بوت الطالب الذكي!\n\nاختر ماذا تريد من القائمة، أو أرسل سؤالك مباشرة وسأجيبك:\n\n👨‍💻 المطور: @DenezZE"
 DEFAULT_GATE_MSG = "🔐 لاستخدام البوت اشترك أولاً في القناة ثم اضغط تحقق."
 DEFAULT_MAINT_MSG = "🛠 البوت في وضع الصيانة حالياً، عد لاحقاً."
 
@@ -220,7 +220,7 @@ async def gemini(parts, system=BASE_SYS, temperature=0.5, max_tokens=8192, fast=
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
     if system:
-        body["system_instruction"] = {"parts": [{"text": system}]}
+        body["system_instruction"] = {"parts": [{"text": _fast().ident(system)}]}
     models = [MODEL] + [m.strip() for m in FALLBACKS if m.strip() != MODEL]
     if fast:
         models = models[:3]
@@ -318,6 +318,7 @@ def menu_markup(adm=False):
         [B("💬 دردشة", callback_data="m:aichat"), B("📓 دفتر المصادر", callback_data="m:nb")],
         [B("📚 الملازم", callback_data="h:s")],
         [B("✨ أدوات إضافية", callback_data="m:more")],
+        [B("👨‍💻 المطور", url="https://t.me/DenezZE"), B("🛠 إبلاغ عن مشكلة", url="https://t.me/TalibSupportBot")],
     ] + rows)
 
 def more_markup():
@@ -604,6 +605,9 @@ def build_pdf(title, body_text):
             y -= 22 if heading else 19
         if heading:
             y -= 4
+    c.setFont("Amiri", 10)
+    c.setFillGray(0.5)
+    c.drawCentredString(W / 2, 28, shape("طالب AI | المطور: @DenezZE"))
     c.save()
     buf.seek(0)
     return buf
