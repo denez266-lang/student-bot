@@ -125,7 +125,7 @@ store = None
 
 _backup_dirty = False
 _last_backup = 0.0
-BACKUP_EVERY = 1200   # silent; keeps settings/library across restarts (Render restarts lose anything newer than the last backup)
+BACKUP_EVERY = 3600   # silent; keeps settings/library across restarts (Render restarts lose anything newer than the last backup)
 APP = None
 
 def backup_soon():
