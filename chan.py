@@ -1707,7 +1707,7 @@ def start(g):
                 from telegram import MenuButtonWebApp, WebAppInfo
                 base = os.environ.get("RENDER_EXTERNAL_URL", "")
                 if base:
-                    await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="افتح التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app")))
+                    await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="التطبيق", web_app=WebAppInfo(url=base.rstrip("/") + "/app")))
                     log().info("menu button set: web app")
             except Exception as e:
                 log().warning("menu button failed (%s)", type(e).__name__)
