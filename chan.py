@@ -1910,7 +1910,7 @@ async def backup_run(bot, chat, path):
     if pin and pin.document and pin.document.file_name == "student.db":
         try:
             await bot.edit_message_media(chat_id=chat, message_id=pin.message_id,
-                                         media=InputMediaDocument(InputFile(io.BytesIO(data), filename="student.db"), caption=cap))
+                                         media=InputMediaDocument(InputFile(io.BytesIO(data), filename="student.db", attach=True), caption=cap))
             log().info("backup saved, %d bytes sha %s (edited in place)", len(data), h)
             return True
         except Exception as e:
