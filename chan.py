@@ -541,6 +541,15 @@ def html_join(xs):
     return ", ".join(str(x).replace("<", "").replace(">", "") for x in xs)
 
 
+IDENT = ("\n\nهويتك: اسمك «طالب AI» (Talib AI)، مساعد دراسي طوّره المطوّر Denez (@DenezZE). "
+         "إذا سُئلت من أنت أو ما اسمك أو من صنعك أو من طوّرك أو ما النموذج الذي تعمل به، فأجب بأنك «طالب AI» من تطوير Denez (@DenezZE)، "
+         "ولا تذكر اسم أي شركة أو نموذج ذكاء اصطناعي (مثل Google وGemini وDeepSeek وOpenAI وGroq). لا تنكر أنك ذكاء اصطناعي. لا تذكر هذا إلا عند السؤال عن هويتك.")
+
+
+def ident(system):
+    return system if (not system or system == G.get("ING_SYS")) else system + IDENT
+
+
 CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراقيين. أجب دائماً بالعربية وباختصار (من سطرين إلى خمسة أسطر)، بلغة بسيطة وواضحة، "
             "بدون عناوين ولا رموز تنسيق مثل ** أو #. للأسئلة الدراسية اشرح خطوة بخطوة وباختصار. إذا لم تفهم الرسالة اطلب التوضيح بجملة قصيرة.")
 def _xform(p, title, ph, kind):
@@ -584,7 +593,7 @@ async def ds_one(parts, system, temperature=0.5, max_tokens=4000, model="deepsee
         solve = system == G.get("SOLVE_SYS")
         body = {"model": model, "stream": False, "temperature": temperature,
                 "max_tokens": 16000 if solve else min(int(max_tokens), 4000),
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}],
+                "messages": [{"role": "system", "content": system + IDENT}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}],
                 "thinking": {"type": "enabled" if solve else "disabled"}}
         if solve:
             body["reasoning_effort"] = "high" if model == "deepseek-v4-pro" else "low"
@@ -636,7 +645,7 @@ async def groq_call(parts, system, temperature=0.5, max_tokens=4000):
         body = {"model": "openai/gpt-oss-120b", "stream": False, "temperature": temperature,
                 "max_completion_tokens": 12000 if solve else max(1500, min(int(max_tokens), 4000)),
                 "reasoning_effort": "medium" if solve else "low", "include_reasoning": False,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}]}
+                "messages": [{"role": "system", "content": system + IDENT}, {"role": "user", "content": "\n\n".join(str(p.get("text", "")) for p in parts)}]}
         async with httpx.AsyncClient(timeout=httpx.Timeout(60 if solve else 20)) as c:
             for _ in range(min(2, len(live))):
                 _GR["i"] += 1
@@ -701,7 +710,7 @@ async def x_call(p, parts, system, temperature=0.5, max_tokens=4000):
         solve = system == G.get("SOLVE_SYS")
         body = {"model": P["model"], "stream": False, "temperature": temperature,
                 "max_tokens": 12000 if solve else max(1500, min(int(max_tokens), 4000)),
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(q.get("text", "")) for q in parts)}]}
+                "messages": [{"role": "system", "content": system + IDENT}, {"role": "user", "content": "\n\n".join(str(q.get("text", "")) for q in parts)}]}
         if p == "cbr":
             body["reasoning_effort"] = "medium" if solve else "low"
         async with httpx.AsyncClient(timeout=httpx.Timeout(60 if solve else 25)) as c:
@@ -1086,7 +1095,7 @@ async def chat_call(prompt, eng="gem"):
     import httpx
     n = len(all_keys())
     plan = [m for m in CHAT_MODELS for _ in range(min(n, 3))][:6]
-    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "system_instruction": {"parts": [{"text": CHAT_SYS}]},
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "system_instruction": {"parts": [{"text": CHAT_SYS + IDENT}]},
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1200}}
     t0 = time.time()
     async with httpx.AsyncClient(timeout=9) as c:
