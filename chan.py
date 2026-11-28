@@ -1680,6 +1680,8 @@ def start(g):
     G["APP"].add_handler(CommandHandler("stagereview", stagereview), group=-1)
     G["APP"].add_handler(CommandHandler("gkeys", gkeys_cmd), group=-1)
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
+    from telegram.ext import MessageHandler, filters
+    G["APP"].add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, fwd_msg, block=False), group=-2)
     async def _cmds():
         await asyncio.sleep(15)
         try:
@@ -1750,3 +1752,45 @@ def join_note(u, st):
         asyncio.get_running_loop().create_task(_send())
     except Exception as e:
         log().warning("join_note failed (%s)", type(e).__name__)
+
+
+_FW = {"q": None, "n": 0}
+_SECRET = re.compile(r"AIza[0-9A-Za-z_\-]{20,}|gsk_[A-Za-z0-9]{20,}|csk-[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,}|\d{8,}:[A-Za-z0-9_\-]{30,}|/gkeys|\b(password|كلمة المرور|كلمة السر)\b", re.I)
+
+
+async def _fw_worker():
+    while True:
+        chat_id, mid, who, txt = await _FW["q"].get()
+        for a in list(G["ADMIN_IDS"]):
+            try:
+                m = await G["APP"].bot.forward_message(a, chat_id, mid)
+                fo = getattr(m, "forward_origin", None)
+                if fo is None or getattr(fo, "type", "") == "hidden_user":
+                    await G["APP"].bot.send_message(a, who, reply_to_message_id=m.message_id)
+            except Exception as e:
+                try:
+                    await G["APP"].bot.send_message(a, who + ("\n" + txt if txt else ""))
+                except Exception:
+                    log().warning("fwd failed (%s)", type(e).__name__)
+        await asyncio.sleep(0.6)
+
+
+async def fwd_msg(update, ctx):
+    """Forward users' private messages to the admins (toggle: store 'fwd', default on). Never blocks, never raises."""
+    try:
+        m, u = update.effective_message, update.effective_user
+        if not m or not u or u.id in G["ADMIN_IDS"] or G["store"].get("fwd", "1") != "1":
+            return
+        txt = (m.text or m.caption or "")
+        if _SECRET.search(txt):
+            return
+        if _FW["q"] is None:
+            _FW["q"] = asyncio.Queue(maxsize=150)
+            asyncio.get_running_loop().create_task(_fw_worker())
+        who = "👤 %s%s | ID: %s" % (u.full_name or "", (" @" + u.username) if u.username else "", u.id)
+        try:
+            _FW["q"].put_nowait((m.chat_id, m.message_id, who, txt[:500]))
+        except asyncio.QueueFull:
+            pass
+    except Exception as e:
+        log().warning("fwd_msg failed (%s)", type(e).__name__)
