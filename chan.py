@@ -1519,6 +1519,20 @@ def start(g):
     G["APP"].add_handler(CommandHandler("stagereview", stagereview), group=-1)
     G["APP"].add_handler(CommandHandler("gkeys", gkeys_cmd), group=-1)
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
+    async def _cmds():
+        await asyncio.sleep(15)
+        try:
+            from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+            bot = G["APP"].bot
+            await bot.set_my_commands([BotCommand("start", "القائمة الرئيسية")], scope=BotCommandScopeDefault())
+            adm = [BotCommand("start", "القائمة الرئيسية"), BotCommand("admin", "لوحة الأدمن"), BotCommand("gkeys", "رابط إدخال مفاتيح الذكاء الاصطناعي"),
+                   BotCommand("stagereview", "مراجعة الملازم غير المصنفة"), BotCommand("chanlist", "قائمة قنوات المصدر"), BotCommand("myid", "معرّفي")]
+            for a in G["ADMIN_IDS"]:
+                await bot.set_my_commands(adm, scope=BotCommandScopeChat(chat_id=a))
+            log().info("bot commands set: public 1, admin %d for %d admins", len(adm), len(G["ADMIN_IDS"]))
+        except Exception as e:
+            log().warning("set commands failed (%s)", type(e).__name__)
+    asyncio.create_task(_cmds())
     async def _fix():
         await asyncio.sleep(90)
         try:
