@@ -829,7 +829,7 @@ def screen(name):
         rows = [
             [B(f"🛠 الصيانة {tick(s.on('maintenance'))}", callback_data="a:tmaint"),
              B(f"🔔 إشعار الدخول {tick(s.on('join_notice'))}", callback_data="a:tjoin")],
-            [B("✏️ رسالة الصيانة", callback_data="a:maintmsg")],
+            [B("✏️ رسالة الصيانة", callback_data="a:maintmsg"), B(f"📨 توجيه الرسائل {tick(s.get('fwd','1')=='1')}", callback_data="a:tfwd")],
             [B("🔙 رجوع", callback_data="a:main")],
         ]
         return "⚙️ الإعدادات", M(rows)
@@ -931,6 +931,9 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         t, kb = screen("settings")
     elif act == "tjoin":
         s.set("join_notice", "0" if s.on("join_notice") else "1")
+        t, kb = screen("settings")
+    elif act == "tfwd":
+        s.set("fwd", "0" if s.get("fwd", "1") == "1" else "1")
         t, kb = screen("settings")
     elif act == "tgate":
         s.set("gate_on", "0" if s.on("gate_on") else "1")
