@@ -351,14 +351,60 @@ class KeysH(tornado.web.RequestHandler):
                                "<hr><h2>Groq (مجاني)</h2><p><small>" + (f"✅ مفاتيح Groq المحفوظة: {len(gr_keys())}." if gr_keys() else "لا يوجد مفتاح Groq.") + " مفتاح في كل سطر، يُستعمل للدردشة والمهام النصية.</small></p>"
                                "<form method=post><input type=hidden name=a value=gr><textarea name=grkeys rows=3 autocomplete=off placeholder='gsk_...' style='width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0F0;border-radius:12px'></textarea><button>💾 حفظ مفاتيح Groq</button></form>"
                                "<form method=post style='margin-top:10px'><input type=hidden name=a value=grclear><button style='background:#d9534f'>🗑 حذف مفاتيح Groq</button></form>"
+                               + _xform("cbr", "Cerebras (مجاني)", "csk-...", "cb") + _xform("orr", "OpenRouter (مجاني)", "sk-or-v1-...", "or") +
                                "<form method=post style='margin-top:14px'><input type=hidden name=a value=clear><button style='background:#d9534f'>🗑 حذف المفاتيح الإضافية</button></form>")
 
     def get(self, tok):
         self.finish(self._form())
 
+    async def _xpost(self, a):
+        import httpx
+        p, kind = ("cbr", "cb") if a.startswith("cb") else ("orr", "or")
+        st = _XP[p]["store"]
+        if a.endswith("clear"):
+            G["store"].set(st, "")
+            _XP[p]["rest"].clear()
+            self.finish(self._form("<p><b>✅ تم حذف المفاتيح.</b></p>"))
+            return
+        pat, vurl = (r"csk-[A-Za-z0-9]{20,150}", "https://api.cerebras.ai/v1/models") if p == "cbr" else (r"sk-or-v1-[A-Za-z0-9]{20,150}", "https://openrouter.ai/api/v1/key")
+        ks = [x.strip().strip("\"'`") for x in re.split(r"[\s,]+", self.get_body_argument(kind + "keys", "")) if x.strip()]
+        old, msgs, new = x_keys(p), [], []
+        async with httpx.AsyncClient(timeout=20) as c:
+            for k in ks[:5]:
+                tail = "…" + k[-4:]
+                if not re.fullmatch(pat, k):
+                    msgs.append(f"{tail}: صيغة غير صحيحة")
+                    continue
+                try:
+                    r = await c.get(vurl, headers={"Authorization": "Bearer " + k})
+                except Exception:
+                    msgs.append(f"{tail}: تعذر الاتصال")
+                    continue
+                if r.status_code in (200, 429):
+                    if k not in old and k not in new:
+                        new.append(k)
+                        msgs.append(f"{tail}: ✅ تمت الإضافة")
+                    else:
+                        msgs.append(f"{tail}: موجود مسبقاً")
+                elif r.status_code in (401, 403):
+                    msgs.append(f"{tail}: ❌ مفتاح غير صحيح")
+                else:
+                    msgs.append(f"{tail}: ردّ غير متوقع ({r.status_code})")
+        if new:
+            G["store"].set(st, G["_fernet"]().encrypt(json.dumps((old + new)[:8]).encode()).decode())
+            log().info("%s keys saved: %d new", p, len(new))
+            try:
+                G["backup_soon"]()
+            except Exception:
+                pass
+        self.finish(self._form("<div class=e>" + "<br>".join(msgs or ["لم يتم إدخال أي مفتاح."]) + "</div>"))
+
     async def post(self, tok):
         import httpx
         a = self.get_body_argument("a", "")
+        if a in ("cb", "or", "cbclear", "orclear"):
+            await self._xpost(a)
+            return
         if a == "dsclear":
             G["store"].set("dskey", "")
             _DS["until"] = 0
@@ -497,6 +543,13 @@ def html_join(xs):
 
 CHAT_SYS = ("أنت مساعد ذكي ودود يتحدث مع طلاب عراقيين. أجب دائماً بالعربية وباختصار (من سطرين إلى خمسة أسطر)، بلغة بسيطة وواضحة، "
             "بدون عناوين ولا رموز تنسيق مثل ** أو #. للأسئلة الدراسية اشرح خطوة بخطوة وباختصار. إذا لم تفهم الرسالة اطلب التوضيح بجملة قصيرة.")
+def _xform(p, title, ph, kind):
+    n = len(x_keys(p))
+    return ("<hr><h2>" + title + "</h2><p><small>" + (f"✅ مفاتيح محفوظة: {n}." if n else "لا يوجد مفتاح.") + " مفتاح في كل سطر، احتياطي تلقائي للدردشة والمهام النصية.</small></p>"
+            f"<form method=post><input type=hidden name=a value={kind}><textarea name={kind}keys rows=3 autocomplete=off placeholder='{ph}' style='width:100%;padding:12px;margin:6px 0 14px;border:2px solid #D9D0F0;border-radius:12px;direction:ltr;text-align:left'></textarea><button>💾 حفظ المفاتيح</button></form>"
+            f"<form method=post style='margin-top:10px'><input type=hidden name=a value={kind}clear><button style='background:#d9534f'>🗑 حذف المفاتيح</button></form>")
+
+
 _CH = {"sem": None, "last": {}, "hour": {}}
 
 
@@ -610,12 +663,85 @@ async def groq_call(parts, system, temperature=0.5, max_tokens=4000):
     return None
 
 
+_XP = {
+    "cbr": {"store": "cbkeys", "url": "https://api.cerebras.ai/v1/chat/completions", "model": "gpt-oss-120b", "rest": {}, "i": 0, "day": 0, "n": 0, "cap": 3000},
+    "orr": {"store": "orkeys", "url": "https://openrouter.ai/api/v1/chat/completions", "model": "openrouter/free", "rest": {}, "i": 0, "day": 0, "n": 0, "cap": 400},
+}
+
+
+def x_keys(p):
+    try:
+        v = G["store"].get(_XP[p]["store"], "")
+        return [k for k in json.loads(G["_fernet"]().decrypt(v.encode()).decode()) if isinstance(k, str)] if v else []
+    except Exception:
+        return []
+
+
+async def x_call(p, parts, system, temperature=0.5, max_tokens=4000):
+    """Cerebras (gpt-oss-120b) or OpenRouter free router. Keys rotate, rest on 429. None -> caller falls back."""
+    try:
+        P = _XP[p]
+        ks = x_keys(p)
+        if not ks or not system or system == G["ING_SYS"]:
+            return None
+        if any(("inline_data" in q) or str(q.get("text", "")).startswith("محتوى ملف PDF") for q in parts):
+            return None
+        if sum(len(str(q.get("text", ""))) for q in parts) > 24000:
+            return None
+        now = time.time()
+        live = [k for k in ks if P["rest"].get(k, 0) < now]
+        if not live:
+            return None
+        d = int(now // 86400)
+        if P["day"] != d:
+            P["day"], P["n"] = d, 0
+        if P["n"] >= P["cap"]:
+            return None
+        import httpx
+        solve = system == G.get("SOLVE_SYS")
+        body = {"model": P["model"], "stream": False, "temperature": temperature,
+                "max_tokens": 12000 if solve else max(1500, min(int(max_tokens), 4000)),
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(str(q.get("text", "")) for q in parts)}]}
+        if p == "cbr":
+            body["reasoning_effort"] = "medium" if solve else "low"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60 if solve else 25)) as c:
+            for _ in range(min(2, len(live))):
+                P["i"] += 1
+                k = live[P["i"] % len(live)]
+                live = [x for x in live if x != k]
+                P["n"] += 1
+                r = await c.post(P["url"], headers={"Authorization": "Bearer " + k}, json=body)
+                if r.status_code == 200:
+                    t = str(r.json()["choices"][0]["message"].get("content") or "").strip()
+                    if t:
+                        return t
+                    continue
+                if r.status_code == 429:
+                    try:
+                        ra = float(r.headers.get("retry-after", 60))
+                    except Exception:
+                        ra = 60
+                    P["rest"][k] = time.time() + min(max(ra, 10), 900)
+                elif r.status_code in (401, 402, 403):
+                    P["rest"][k] = time.time() + 900
+                log().warning("%s %s, next", p, r.status_code)
+    except Exception as e:
+        log().warning("%s failed (%s)", p, type(e).__name__)
+    return None
+
+
 async def ds_call(parts, system, temperature=0.5, max_tokens=4000, model="deepseek-flash", only=False):
-    """Text work: DeepSeek (if key) then Groq (if keys); None means use Gemini."""
+    """Text work: DeepSeek, then Groq, Cerebras, OpenRouter (each only if it has a key); None means use Gemini."""
     r = await ds_one(parts, system, temperature, max_tokens, model)
     if r or only:
         return r
-    return await groq_call(parts, system, temperature, max_tokens)
+    r = await groq_call(parts, system, temperature, max_tokens)
+    if r:
+        return r
+    r = await x_call("cbr", parts, system, temperature, max_tokens)
+    if r:
+        return r
+    return await x_call("orr", parts, system, temperature, max_tokens)
 
 
 CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.7-flash"]
@@ -926,11 +1052,11 @@ async def nb_api(uid, body):
     return {"srcs": [n for n, _ in nb_get(uid)]}
 
 
-ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("gem", "✨ جيميني")]
+ENGS = [("dsp", "🧠 ديب سيك برو (الأقوى)"), ("ds", "⚡ ديب سيك (سريع)"), ("grq", "🆓 جروك (مجاني)"), ("cbr", "⚡ سيريبراس (مجاني)"), ("orr", "🌐 اوبن راوتر (مجاني)"), ("gem", "✨ جيميني")]
 
 
 def engines():
-    return [e for e in ENGS if e[0] == "gem" or (e[0] == "grq" and gr_keys()) or (e[0] in ("dsp", "ds") and ds_key())]
+    return [e for e in ENGS if e[0] == "gem" or (e[0] == "grq" and gr_keys()) or (e[0] in ("cbr", "orr") and x_keys(e[0])) or (e[0] in ("dsp", "ds") and ds_key())]
 
 
 def get_eng(uid):
@@ -951,6 +1077,10 @@ async def chat_call(prompt, eng="gem"):
             return r0
     if eng == "grq":
         r0 = await groq_call([{"text": prompt}], CHAT_SYS, 0.7, 1200)
+        if r0:
+            return r0
+    if eng in ("cbr", "orr"):
+        r0 = await x_call(eng, [{"text": prompt}], CHAT_SYS, 0.7, 1200)
         if r0:
             return r0
     import httpx
@@ -981,10 +1111,9 @@ async def chat_call(prompt, eng="gem"):
             if r.status_code == 429:
                 gk_bad(k)
             log().warning("chat gemini %s (%s)", r.status_code, m)
-    if eng == "gem":
-        r1 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200)
-        if r1:
-            return r1
+    r1 = await ds_call([{"text": prompt}], CHAT_SYS, 0.7, 1200)
+    if r1:
+        return r1
     raise RuntimeError("الخدمة مزدحمة حالياً، حاول بعد دقيقة.")
 
 
