@@ -1691,6 +1691,7 @@ def start(g):
     G["APP"].add_handler(CommandHandler("chanregroup", chanregroup), group=-1)
     from telegram.ext import MessageHandler, filters
     G["APP"].add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, fwd_msg, block=False), group=-2)
+    G["APP"].add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & ~filters.StatusUpdate.ALL, fw_admin_reply), group=-3)
     async def _cmds():
         await asyncio.sleep(15)
         try:
@@ -1771,25 +1772,99 @@ def join_note(u, st):
         log().warning("join_note failed (%s)", type(e).__name__)
 
 
-_FW = {"q": None, "n": 0}
+_FW = {"q": None, "n": 0, "map": None}
 _SECRET = re.compile(r"AIza[0-9A-Za-z_\-]{20,}|gsk_[A-Za-z0-9]{20,}|csk-[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,}|\d{8,}:[A-Za-z0-9_\-]{30,}|/gkeys|\b(password|كلمة المرور|كلمة السر)\b", re.I)
+
+
+def fw_map():
+    """{'m': {'<admin>:<msgid>': uid}, 'l': {'<uid>': lang}} persisted in the store (backed up)."""
+    if _FW["map"] is None:
+        try:
+            _FW["map"] = json.loads(G["store"].get("fwmap", "") or "{}")
+        except Exception:
+            _FW["map"] = {}
+        _FW["map"].setdefault("m", {})
+        _FW["map"].setdefault("l", {})
+    return _FW["map"]
+
+
+def fw_save():
+    d = fw_map()
+    if len(d["m"]) > 1500:
+        for k in list(d["m"])[:len(d["m"]) - 1500]:
+            d["m"].pop(k, None)
+    G["store"].set("fwmap", json.dumps(d))
 
 
 async def _fw_worker():
     while True:
-        chat_id, mid, who, txt = await _FW["q"].get()
+        chat_id, mid, who, txt, uid, lang = await _FW["q"].get()
+        d = fw_map()
+        d["l"][str(uid)] = lang
         for a in list(G["ADMIN_IDS"]):
             try:
                 m = await G["APP"].bot.forward_message(a, chat_id, mid)
-                fo = getattr(m, "forward_origin", None)
-                if fo is None or getattr(fo, "type", "") == "hidden_user":
-                    await G["APP"].bot.send_message(a, who, reply_to_message_id=m.message_id)
+                d["m"]["%s:%s" % (a, m.message_id)] = uid
             except Exception as e:
                 try:
-                    await G["APP"].bot.send_message(a, who + ("\n" + txt if txt else ""))
+                    m = await G["APP"].bot.send_message(a, who + ("\n" + txt if txt else ""))
+                    d["m"]["%s:%s" % (a, m.message_id)] = uid
                 except Exception:
                     log().warning("fwd failed (%s)", type(e).__name__)
+        try:
+            fw_save()
+        except Exception:
+            pass
         await asyncio.sleep(0.6)
+
+
+def fw_info(uid):
+    st = G["store"]
+    r = st.q("SELECT name,username,joined,last_seen,banned FROM users WHERE id=?", (uid,), fetch=True)
+    if not r:
+        return "👤 ID: %s\nلا توجد بيانات محفوظة لهذا المستخدم." % uid
+    name, un, joined, seen, banned = r[0]
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.gmtime((t or 0) + 3 * 3600)) if t else "-"
+    ev = st.q("SELECT kind, COUNT(*) FROM events WHERE user_id=? GROUP BY kind ORDER BY 2 DESC", (uid,), fetch=True)
+    ev24 = st.q("SELECT COUNT(*) FROM events WHERE user_id=? AND ts>?", (uid, time.time() - 86400), fetch=True)[0][0]
+    sr = st.q("SELECT COUNT(*) FROM searches WHERE user_id=?", (uid,), fetch=True)[0][0]
+    try:
+        eng = st.get("eng:%s" % uid, "") or "-"
+        nbn = len(nb_get(uid))
+    except Exception:
+        eng, nbn = "-", 0
+    lang = fw_map()["l"].get(str(uid), "-")
+    return ("👤 معلومات المستخدم\n• الاسم: %s\n• المعرف: %s\n• الآيدي: %s\n• 🌐 اللغة: %s\n• الانضمام: %s (بتوقيت بغداد)\n• آخر نشاط: %s\n• محظور: %s\n"
+            "• نشاط آخر 24 ساعة: %s\n• عمليات البحث: %s\n• المحرك المختار: %s\n• مصادر دفتر المصادر: %s\n• الاستخدام: %s"
+            % (name or "-", ("@" + un) if un else "-", uid, lang, fmt(joined), fmt(seen), "نعم" if banned else "لا", ev24, sr, eng, nbn,
+               "، ".join("%s ×%s" % (k, n) for k, n in ev) or "-"))
+
+
+async def fw_admin_reply(update, ctx):
+    """Admin replies to a forwarded user message: info word -> user info; anything else -> delivered to that user."""
+    from telegram.ext import ApplicationHandlerStop
+    try:
+        m, u = update.effective_message, update.effective_user
+        if not m or not u or u.id not in G["ADMIN_IDS"] or not m.reply_to_message:
+            return
+        uid = fw_map()["m"].get("%s:%s" % (m.chat_id, m.reply_to_message.message_id))
+        if not uid:
+            return
+        t = (m.text or "").strip().lower()
+        if t in ("معلومات", "/info", "info", "معلوماته", "/معلومات"):
+            await m.reply_text(fw_info(uid))
+        else:
+            await G["APP"].bot.copy_message(uid, m.chat_id, m.message_id)
+            await m.reply_text("✅ وصلت الرسالة")
+    except ApplicationHandlerStop:
+        raise
+    except Exception as e:
+        log().warning("fw reply failed (%s)", type(e).__name__)
+        try:
+            await update.effective_message.reply_text("❌ تعذر الإرسال (قد يكون المستخدم حظر البوت).")
+        except Exception:
+            pass
+    raise ApplicationHandlerStop
 
 
 async def fwd_msg(update, ctx):
@@ -1806,7 +1881,7 @@ async def fwd_msg(update, ctx):
             asyncio.get_running_loop().create_task(_fw_worker())
         who = "👤 %s%s | ID: %s" % (u.full_name or "", (" @" + u.username) if u.username else "", u.id)
         try:
-            _FW["q"].put_nowait((m.chat_id, m.message_id, who, txt[:500]))
+            _FW["q"].put_nowait((m.chat_id, m.message_id, who, txt[:500], u.id, getattr(u, "language_code", "") or "-"))
         except asyncio.QueueFull:
             pass
     except Exception as e:
@@ -1842,7 +1917,7 @@ async def backup_run(bot, chat, path):
             if "not modified" in str(e).lower():
                 log().info("backup saved, %d bytes sha %s (unchanged)", len(data), h)
                 return True
-            log().warning("backup edit failed (%s), sending new", type(e).__name__)
+            log().warning("backup edit failed (%s: %s), sending new", type(e).__name__, str(e)[:100])
     msg = await bot.send_document(chat, InputFile(io.BytesIO(data), filename="student.db"), caption=cap, disable_notification=True)
     log().info("backup saved, %d bytes sha %s (new message)", len(data), h)
     try:
