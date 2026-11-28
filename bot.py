@@ -4736,7 +4736,7 @@ async def keepalive():
                 await c.get(url + "/health")
             except Exception as e:
                 log.warning("keepalive failed: %s", e)
-            await asyncio.sleep(540)
+            await asyncio.sleep(240)
 
 async def list_models():
     try:
