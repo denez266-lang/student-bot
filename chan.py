@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Handout channel: processed handouts are mirrored to a channel and served with copyMessage."""
-import asyncio, time, re
+import asyncio, time, re, os
 from telegram.error import RetryAfter
 
 G = {}
@@ -1902,6 +1902,9 @@ async def backup_run(bot, chat, path):
     with open(path, "rb") as f:
         data = f.read()
     h = sha(data)
+    if BW["day"] == time.strftime("%Y-%m-%d", time.gmtime()) and BW["bytes"] > 3 * BW_BUDGET_MB * 1024 * 1024:
+        log().warning("backup skipped: outbound far over daily budget (%d MB)", BW["bytes"] >> 20)
+        return False
     pin = None
     try:
         pin = (await bot.get_chat(chat)).pinned_message
@@ -1930,3 +1933,50 @@ async def backup_run(bot, chat, path):
         except Exception:
             pass
     return True
+
+
+# ---------------- outbound bandwidth guard (Render counts all outbound bytes) ----------------
+BW = {"day": "", "bytes": 0, "next_log": 50 * 1024 * 1024}
+BW_BUDGET_MB = int(os.environ.get("BW_BUDGET_MB", "150"))   # per day; 5 GB/month is about 165 MB/day
+
+
+def bw_add(n):
+    try:
+        d = time.strftime("%Y-%m-%d", time.gmtime())
+        if BW["day"] != d:
+            BW.update(day=d, bytes=0, next_log=50 * 1024 * 1024)
+        BW["bytes"] += int(n)
+        if BW["bytes"] >= BW["next_log"]:
+            BW["next_log"] += 50 * 1024 * 1024
+            log().info("outbound today (UTC %s): %d MB (budget %d MB)", d, BW["bytes"] >> 20, BW_BUDGET_MB)
+    except Exception:
+        pass
+
+
+def bw_over():
+    """True when today's counted outbound bytes passed the daily budget (heavy optional transfers should skip)."""
+    return BW["day"] == time.strftime("%Y-%m-%d", time.gmtime()) and BW["bytes"] > BW_BUDGET_MB * 1024 * 1024
+
+
+def _bw_install():
+    try:
+        import httpx
+        if getattr(httpx.AsyncClient, "_bw_patched", False):
+            return
+        orig = httpx.AsyncClient.send
+
+        async def send(self, request, *a, **k):
+            try:
+                host = request.url.host or ""
+                if host not in ("127.0.0.1", "localhost") and not host.endswith(".onrender.com"):
+                    bw_add(int(request.headers.get("content-length", "0") or 0))
+            except Exception:
+                pass
+            return await orig(self, request, *a, **k)
+        httpx.AsyncClient.send = send
+        httpx.AsyncClient._bw_patched = True
+    except Exception:
+        pass
+
+
+_bw_install()
