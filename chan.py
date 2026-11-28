@@ -1730,3 +1730,23 @@ def start(g):
             await resume_archive()
     asyncio.create_task(_fix())
     asyncio.create_task(loop())
+
+
+def join_note(u, st):
+    """Admin-only notice for a genuinely new user. Never raises, never blocks the user's flow."""
+    try:
+        if st.get("join_notice", "1") == "0" or u.id in G.get("ADMIN_IDS", ()):
+            return
+        total = st.q("SELECT COUNT(*) FROM users", fetch=True)[0][0]
+        txt = ("👾 شخص جديد دخل البوت\n\n👤 معلومات العضو الجديد:\n• الاسم: %s\n• المعرف: %s\n• الآيدي: %s\n\n• 🌐 اللغة: %s\n\n📊 إجمالي المستخدمين: %s"
+               % (u.full_name or "", ("@" + u.username) if u.username else "", u.id, getattr(u, "language_code", "") or "", total))
+
+        async def _send():
+            for a in G["ADMIN_IDS"]:
+                try:
+                    await G["APP"].bot.send_message(a, txt)
+                except Exception as e:
+                    log().warning("join notice failed (%s)", type(e).__name__)
+        asyncio.get_running_loop().create_task(_send())
+    except Exception as e:
+        log().warning("join_note failed (%s)", type(e).__name__)
