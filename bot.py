@@ -85,6 +85,7 @@ class Store:
         self.q("INSERT INTO users(id,name,username,joined,last_seen) VALUES(?,?,?,?,?)",
                (u.id, u.full_name or "", u.username or "", now, now))
         backup_soon()
+        _fast().join_note(u, self)
         return True
 
     def event(self, user_id, kind):
@@ -424,12 +425,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     is_new = store.upsert_user(u)
     if is_new:
         store.event(u.id, "join")
-        if store.on("join_notice"):
-            for aid in ADMIN_IDS:
-                try:
-                    await ctx.bot.send_message(aid, f"🔔 مستخدم جديد: {u.full_name} (@{u.username or '—'}) id={u.id}")
-                except Exception:
-                    pass
     if not await gate_ok(update, ctx):
         return
     ctx.user_data.clear()
