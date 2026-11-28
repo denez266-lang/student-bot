@@ -106,6 +106,7 @@ function nav(){
   $("nav").innerHTML = items.map(i=>`<button class="${tab===i[0]||(tab==="tool"&&i[0]==="tools")?"on":""}" onclick="go('${i[0]}')"><span>${i[1]}</span>${i[2]}</button>`).join("");
 }
 function go(t){tab=t;QZ=null;if(t==="lib"){sel={stage:null,subject:null,teacher:null,type:null,search:false}}render();window.scrollTo(0,0)}
+function tileNb(k){return `<button class="t c${k%8}" onclick="go('nb')"><div class="ico">📓</div>دفتر المصادر</button>`}
 function tile(t,k){return `<button class="t c${k%8}" onclick="openTool('${t.id}')"><div class="ico">${t.icon}</div>${esc(t.name)}</button>`}
 function render(){
   nav();
@@ -114,15 +115,15 @@ function render(){
     const main=TOOLS.filter(t=>t.group==="main"),more=TOOLS.filter(t=>t.group!=="main");
     v.innerHTML=`<div class="top"><h1>يلا نذاكر${NAME?" يا "+esc(NAME):""}! 📖</h1>${STREAK>=2?`<div class="chip">🔥 ${STREAK} أيام متواصلة</div>`:""}</div>
       <div class="big"><button class="a" onclick="go('lib')"><div class="ico">📚</div>الملازم</button><button class="b" onclick="go('timer')"><div class="ico">⏱</div>المؤقت</button></div>
-      <button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('chat')"><span>💬 الدردشة مع الذكاء الاصطناعي</span><small>‹</small></button><button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('nb')"><span>📓 دفتر المصادر (اسأل من ملازمك)</span><small>‹</small></button><h2>🎓 أدوات الدراسة</h2><div class="grid">${main.map(tile).join("")}</div>
-      <div style="height:3px;border-radius:3px;background:currentColor;opacity:.18;margin:26px 4px 0"></div><h2>✨ أدوات إضافية</h2><div class="grid">${more.map((t,k)=>tile(t,k+main.length)).join("")}</div>`;
+      <button class="row" style="width:100%;border:0;color:inherit;font-family:inherit;font-size:15px;margin-top:10px" onclick="go('chat')"><span>💬 الدردشة مع الذكاء الاصطناعي</span><small>‹</small></button><h2>🎓 أدوات الدراسة</h2><div class="grid">${main.map(tile).join("")}</div>
+      <div style="height:3px;border-radius:3px;background:currentColor;opacity:.18;margin:26px 4px 0"></div><h2>✨ أدوات إضافية</h2><div class="grid">${tileNb(main.length)}${more.map((t,k)=>tile(t,k+main.length+1)).join("")}</div>`;
   } else if(tab==="chat"){ renderChat(v) }
   else if(tab==="nb"){ renderNb(v) }
   else if(tab==="lib"){ renderLib(v) }
   else if(tab==="timer"){ renderTimer(v) }
   else if(tab==="tools"){
     const g=n=>TOOLS.filter(t=>t.group===n).map(tile).join("");
-    v.innerHTML=`<div class="top"><h1>🤖 كل الأدوات</h1></div><h2>🎓 الأساسية</h2><div class="grid">${g("main")}</div><h2>✨ إضافية</h2><div class="grid">${g("more")}</div>`;
+    v.innerHTML=`<div class="top"><h1>🤖 كل الأدوات</h1></div><h2>🎓 الأساسية</h2><div class="grid">${g("main")}</div><h2>✨ إضافية</h2><div class="grid">${tileNb(8)}${g("more")}</div>`;
   } else if(tab==="tool"){ renderTool(v) }
 }
 function openTool(id){cur=TOOLS.find(t=>t.id===id);tab="tool";QZ=null;FILE=null;render();window.scrollTo(0,0)}
