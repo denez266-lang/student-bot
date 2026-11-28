@@ -1802,3 +1802,47 @@ async def fwd_msg(update, ctx):
             pass
     except Exception as e:
         log().warning("fwd_msg failed (%s)", type(e).__name__)
+
+
+def sha(data):
+    import hashlib
+    return hashlib.sha1(data).hexdigest()[:10]
+
+
+async def backup_run(bot, chat, path):
+    """Silent backup: replace the pinned student.db document IN PLACE (no new chat message, no notification).
+    Restore reads the pinned document, so it keeps finding the latest. Fallback: send new silently, pin, delete old."""
+    import io
+    from telegram import InputFile, InputMediaDocument
+    cap = "💾 نسخة احتياطية من بيانات البوت"
+    with open(path, "rb") as f:
+        data = f.read()
+    h = sha(data)
+    pin = None
+    try:
+        pin = (await bot.get_chat(chat)).pinned_message
+    except Exception:
+        pass
+    if pin and pin.document and pin.document.file_name == "student.db":
+        try:
+            await bot.edit_message_media(chat_id=chat, message_id=pin.message_id,
+                                         media=InputMediaDocument(InputFile(io.BytesIO(data), filename="student.db"), caption=cap))
+            log().info("backup saved, %d bytes sha %s (edited in place)", len(data), h)
+            return True
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                log().info("backup saved, %d bytes sha %s (unchanged)", len(data), h)
+                return True
+            log().warning("backup edit failed (%s), sending new", type(e).__name__)
+    msg = await bot.send_document(chat, InputFile(io.BytesIO(data), filename="student.db"), caption=cap, disable_notification=True)
+    log().info("backup saved, %d bytes sha %s (new message)", len(data), h)
+    try:
+        await bot.pin_chat_message(chat, msg.message_id, disable_notification=True)
+    except Exception:
+        log().warning("pin failed")
+    if pin and pin.message_id != msg.message_id:
+        try:
+            await bot.delete_message(chat, pin.message_id)
+        except Exception:
+            pass
+    return True
