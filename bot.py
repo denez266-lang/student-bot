@@ -759,9 +759,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ask = MODE_ASKS.get(mode)
     try:
         parts, err = await content_parts(update, ctx)
-    except Exception:
-        log.exception("download failed")
-        await msg.reply_text("تعذر تنزيل الملف، حاول إرساله مرة أخرى.", reply_markup=back_markup())
+    except Exception as e:
+        log.warning("download failed (%s)", type(e).__name__)
+        big = "too big" in str(e)
+        await msg.reply_text("📦 الملف كبير جداً، الحد الأقصى 20 ميغابايت. قسّمه أو أرسل الصفحات المهمة فقط." if big else "تعذر تنزيل الملف، حاول إرساله مرة أخرى.", reply_markup=back_markup())
         return
     if err:
         await msg.reply_text(err, reply_markup=back_markup())
